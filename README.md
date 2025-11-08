@@ -37,19 +37,25 @@ Binary PAF (BPAF) format library for efficient storage and random access of sequ
 ```rust
 use lib_bpaf::BpafReader;
 
-// Open file (automatically builds .idx if missing)
+// Option 1: Open with index (for record ID access)
 let mut reader = BpafReader::open("alignments.bpaf")?;
-
 println!("Total records: {}", reader.len());
 
-// O(1) random access to full alignment record
+// O(1) random access by record ID
 let record = reader.get_alignment_record(1000)?;
-let query_name = reader.string_table().get(record.query_name_id)?;
-let target_name = reader.string_table().get(record.target_name_id)?;
-
-// O(1) optimized tracepoint-only access
 let (tracepoints, tp_type, complexity_metric, max_complexity) =
     reader.get_tracepoints(1000)?;
+
+// Option 2: Open without index (for offset-based access only)
+// Use this if you have your own offset storage (like impg)
+// Skips index loading - much faster open time
+let mut reader = BpafReader::open_without_index("alignments.bpaf")?;
+
+// Access by file offset (no index needed)
+let offset = 123456;
+let record = reader.get_alignment_record_at_offset(offset)?;
+let (tracepoints, tp_type, complexity_metric, max_complexity) =
+    reader.get_tracepoints_at_offset(offset)?;
 
 match &tracepoints {
     TracepointData::Standard(tps) => {

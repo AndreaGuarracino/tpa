@@ -1729,30 +1729,31 @@ impl BpafIndex {
 
     /// Load index from .bpaf.idx file
     pub fn load(idx_path: &str) -> io::Result<Self> {
-        let mut file = File::open(idx_path)?;
+        let file = File::open(idx_path)?;
+        let mut reader = BufReader::new(file);
 
         // Read and verify magic
         let mut magic = [0u8; 4];
-        file.read_exact(&mut magic)?;
+        reader.read_exact(&mut magic)?;
         if &magic != Self::INDEX_MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid index magic"));
         }
 
         // Read version
         let mut version = [0u8; 1];
-        file.read_exact(&mut version)?;
+        reader.read_exact(&mut version)?;
         if version[0] != 1 {
             return Err(io::Error::new(io::ErrorKind::InvalidData,
                 format!("Unsupported index version: {}", version[0])));
         }
 
         // Read number of offsets
-        let num_offsets = read_varint(&mut file)? as usize;
+        let num_offsets = read_varint(&mut reader)? as usize;
 
         // Read all offsets
         let mut offsets = Vec::with_capacity(num_offsets);
         for _ in 0..num_offsets {
-            offsets.push(read_varint(&mut file)?);
+            offsets.push(read_varint(&mut reader)?);
         }
 
         Ok(Self { offsets })
@@ -1886,14 +1887,8 @@ impl BpafReader {
             (None, None)
         };
 
-        // Seek to string table (at end of file, after all records)
-        // Calculate string table position by seeking to last record and skipping it
-        if !index.offsets.is_empty() {
-            file.seek(SeekFrom::Start(index.offsets[index.offsets.len() - 1]))?;
-            skip_record(&mut file, header.flags & FLAG_ADAPTIVE != 0)?;
-        }
-
-        let string_table = StringTable::read(&mut file)?;
+        // Lazy-load string table only when needed (expensive for large files)
+        let string_table = StringTable::new();
 
         Ok(Self {
             file,
@@ -1903,6 +1898,57 @@ impl BpafReader {
             pos_codec,
             score_codec,
         })
+    }
+
+    /// Open a BPAF file without index (for offset-based access only)
+    ///
+    /// Use this if you have your own offset storage (like impg) and only need:
+    /// - get_alignment_record_at_offset()
+    /// - get_tracepoints_at_offset()
+    ///
+    /// This skips index loading entirely - much faster open time.
+    pub fn open_without_index(bpaf_path: &str) -> io::Result<Self> {
+        // Open file and read header
+        let mut file = File::open(bpaf_path)?;
+        let header = BinaryPafHeader::read(&mut file)?;
+
+        // Load codecs if adaptive format
+        let (pos_codec, score_codec) = if header.flags & FLAG_ADAPTIVE != 0 {
+            let pos = AdaptiveCodec::read(&mut file)?;
+            let score = AdaptiveCodec::read(&mut file)?;
+            (Some(pos), Some(score))
+        } else {
+            (None, None)
+        };
+
+        // Empty index - not used for offset-based access
+        let index = BpafIndex { offsets: Vec::new() };
+        let string_table = StringTable::new();
+
+        Ok(Self {
+            file,
+            index,
+            header,
+            string_table,
+            pos_codec,
+            score_codec,
+        })
+    }
+
+    /// Load string table (call this if you need sequence names)
+    pub fn load_string_table(&mut self) -> io::Result<()> {
+        if !self.string_table.is_empty() {
+            return Ok(()); // Already loaded
+        }
+
+        // Seek to string table (at end of file, after all records)
+        if !self.index.offsets.is_empty() {
+            self.file.seek(SeekFrom::Start(self.index.offsets[self.index.offsets.len() - 1]))?;
+            skip_record(&mut self.file, self.header.flags & FLAG_ADAPTIVE != 0)?;
+        }
+
+        self.string_table = StringTable::read(&mut self.file)?;
+        Ok(())
     }
 
     /// Get number of records
@@ -1920,8 +1966,16 @@ impl BpafReader {
         &self.header
     }
 
-    /// Get string table
-    pub fn string_table(&self) -> &StringTable {
+    /// Get string table (loads on first access if needed)
+    pub fn string_table(&mut self) -> io::Result<&StringTable> {
+        if self.string_table.is_empty() {
+            self.load_string_table()?;
+        }
+        Ok(&self.string_table)
+    }
+
+    /// Get immutable reference to string table (must be loaded first with load_string_table)
+    pub fn string_table_ref(&self) -> &StringTable {
         &self.string_table
     }
 
@@ -1953,7 +2007,7 @@ impl BpafReader {
         }
     }
 
-    /// Get tracepoints only (optimized) - O(1) random access
+    /// Get tracepoints only (optimized) - O(1) random access by record ID
     /// Returns: (tracepoints, tp_type, complexity_metric, max_complexity)
     ///
     /// Optimized for tracepoint-only access:
@@ -1966,6 +2020,14 @@ impl BpafReader {
         }
 
         let offset = self.index.offsets[record_id as usize];
+        self.get_tracepoints_at_offset(offset)
+    }
+
+    /// Get tracepoints by file offset (for impg compatibility)
+    /// Returns: (tracepoints, tp_type, complexity_metric, max_complexity)
+    ///
+    /// Use this if you have stored the actual file offsets - skips index lookup.
+    pub fn get_tracepoints_at_offset(&mut self, offset: u64) -> io::Result<(TracepointData, TracepointType, ComplexityMetric, u64)> {
         self.file.seek(SeekFrom::Start(offset))?;
 
         if self.header.flags & FLAG_ADAPTIVE != 0 {

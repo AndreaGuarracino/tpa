@@ -26,7 +26,16 @@ fn main() -> std::io::Result<()> {
     }
 
     let bpaf_path = &args[1];
-    let mode = args.get(2).map(|s| s.as_str()).unwrap_or("full");
+
+    // Determine mode and where record IDs start
+    let (mode, record_ids_start) = if args.len() > 2 {
+        match args[2].as_str() {
+            "profile" | "full" | "tracepoint" | "fast" => (args[2].as_str(), 3),
+            _ => ("full", 2), // If arg[2] is not a known mode, treat it as a record ID
+        }
+    } else {
+        ("full", 2)
+    };
 
     // Open BPAF file - builds index if it doesn't exist
     println!("Opening {}...", bpaf_path);
@@ -34,13 +43,12 @@ fn main() -> std::io::Result<()> {
 
     println!("File info:");
     println!("  Total records: {}", reader.len());
-    println!("  String table: {} unique sequences", reader.string_table().len());
     println!();
 
     match mode {
         "profile" => profile_methods(&mut reader)?,
-        "full" => demo_full_access(&mut reader, &args[3..])?,
-        "tracepoint" | "fast" => demo_tracepoint_access(&mut reader, &args[3..])?, // "fast" for backward compat
+        "full" => demo_full_access(&mut reader, &args[record_ids_start..])?,
+        "tracepoint" | "fast" => demo_tracepoint_access(&mut reader, &args[record_ids_start..])?,
         _ => {
             eprintln!("Unknown mode: {}", mode);
             eprintln!("Valid modes: full, tracepoint, profile");
@@ -61,12 +69,15 @@ fn demo_full_access(reader: &mut BpafReader, args: &[String]) -> std::io::Result
     println!("=== Full Record Access ===");
     println!("Getting {} records...\n", record_ids.len());
 
+    // Load string table once for name lookups
+    reader.load_string_table()?;
+
     let start = Instant::now();
     for &record_id in &record_ids {
         match reader.get_alignment_record(record_id) {
             Ok(record) => {
-                let query_name = reader.string_table().get(record.query_name_id).unwrap();
-                let target_name = reader.string_table().get(record.target_name_id).unwrap();
+                let query_name = reader.string_table_ref().get(record.query_name_id).unwrap();
+                let target_name = reader.string_table_ref().get(record.target_name_id).unwrap();
 
                 let tp_count = match &record.tracepoints {
                     lib_bpaf::TracepointData::Standard(tps) |
