@@ -9,7 +9,6 @@
 /// - Delta encoding: positions stored as deltas from previous position
 /// - Varint encoding: variable-length integer encoding
 /// - Zstd level 3: fast compression with good ratios
-
 use flate2::read::MultiGzDecoder;
 use lib_tracepoints::{
     cigar_to_mixed_tracepoints, cigar_to_tracepoints, cigar_to_tracepoints_fastga,
@@ -808,8 +807,8 @@ fn parse_paf_with_cigar(
     let mut tags = Vec::new();
 
     for field in &fields[12..] {
-        if field.starts_with("cg:Z:") {
-            cigar = Some(&field[5..]);
+        if let Some(stripped) = field.strip_prefix("cg:Z:") {
+            cigar = Some(stripped);
         } else if !field.starts_with("tp:Z:") {
             if let Some(tag) = parse_tag(field) {
                 tags.push(tag);
@@ -892,8 +891,8 @@ fn parse_paf_with_tracepoints(line: &str, string_table: &mut StringTable) -> io:
     let mut tags = Vec::new();
 
     for field in &fields[12..] {
-        if field.starts_with("tp:Z:") {
-            tp_str = Some(&field[5..]);
+        if let Some(stripped) = field.strip_prefix("tp:Z:") {
+            tp_str = Some(stripped);
         } else if let Some(tag) = parse_tag(field) {
             tags.push(tag);
         }
