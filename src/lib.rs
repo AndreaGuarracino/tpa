@@ -14,7 +14,7 @@ use lib_tracepoints::{
     cigar_to_mixed_tracepoints, cigar_to_tracepoints, cigar_to_tracepoints_fastga,
     cigar_to_variable_tracepoints, ComplexityMetric, MixedRepresentation, TracepointType,
 };
-use log::{error, info, debug};
+use log::{debug, error, info};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -62,7 +62,10 @@ fn read_varint<R: Read>(reader: &mut R) -> io::Result<u64> {
         }
         shift += 7;
         if shift >= 64 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Varint too long"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Varint too long",
+            ));
         }
     }
     Ok(value)
@@ -178,7 +181,11 @@ impl StringTable {
             strings.push(s);
             lengths.push(seq_len);
         }
-        Ok(Self { strings, lengths, index })
+        Ok(Self {
+            strings,
+            lengths,
+            index,
+        })
     }
 }
 
@@ -380,15 +387,28 @@ impl AlignmentRecord {
             tags.push(Tag::read(reader)?);
         }
         Ok(Self {
-            query_name_id, query_start, query_end, strand,
-            target_name_id, target_start, target_end,
-            residue_matches, alignment_block_len, mapping_quality,
-            tp_type, complexity_metric, max_complexity,
-            tracepoints, tags,
+            query_name_id,
+            query_start,
+            query_end,
+            strand,
+            target_name_id,
+            target_start,
+            target_end,
+            residue_matches,
+            alignment_block_len,
+            mapping_quality,
+            tp_type,
+            complexity_metric,
+            max_complexity,
+            tracepoints,
+            tags,
         })
     }
 
-    fn read_tracepoints<R: Read>(reader: &mut R, tp_type: TracepointType) -> io::Result<TracepointData> {
+    fn read_tracepoints<R: Read>(
+        reader: &mut R,
+        tp_type: TracepointType,
+    ) -> io::Result<TracepointData> {
         let num_items = read_varint(reader)? as usize;
         match tp_type {
             TracepointType::Standard | TracepointType::Fastga => {
@@ -461,7 +481,12 @@ impl AlignmentRecord {
                             reader.read_exact(&mut op)?;
                             items.push(MixedTracepointItem::CigarOp(len, op[0] as char));
                         }
-                        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid mixed item type")),
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "Invalid mixed item type",
+                            ))
+                        }
                     }
                 }
                 Ok(TracepointData::Mixed(items))
@@ -509,9 +534,18 @@ impl Tag {
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 TagValue::String(s)
             }
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid tag type")),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid tag type",
+                ))
+            }
         };
-        Ok(Self { key, tag_type: tag_type[0], value })
+        Ok(Self {
+            key,
+            tag_type: tag_type[0],
+            value,
+        })
     }
 }
 
@@ -570,7 +604,13 @@ pub fn encode_cigar_to_binary(
         if line.trim().is_empty() || line.starts_with('#') {
             continue;
         }
-        match parse_paf_with_cigar(&line, &mut string_table, tp_type, max_complexity, complexity_metric) {
+        match parse_paf_with_cigar(
+            &line,
+            &mut string_table,
+            tp_type,
+            max_complexity,
+            complexity_metric,
+        ) {
             Ok(record) => records.push(record),
             Err(e) => {
                 error!("Line {}: {}", line_num + 1, e);
@@ -580,7 +620,11 @@ pub fn encode_cigar_to_binary(
     }
 
     write_binary(output_path, &records, &string_table)?;
-    debug!("Encoded {} records ({} unique names)", records.len(), string_table.len());
+    debug!(
+        "Encoded {} records ({} unique names)",
+        records.len(),
+        string_table.len()
+    );
     Ok(())
 }
 
@@ -592,18 +636,26 @@ pub fn decompress_paf(input_path: &str, output_path: &str) -> io::Result<()> {
     let mut reader = BufReader::new(input);
 
     let header = BinaryPafHeader::read(&mut reader)?;
-    debug!("Reading {} records ({} unique names)",
-        header.num_records, header.num_strings);
+    debug!(
+        "Reading {} records ({} unique names)",
+        header.num_records, header.num_strings
+    );
 
     if header.version != 1 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData,
-            format!("Unsupported format version: {}", header.version)));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unsupported format version: {}", header.version),
+        ));
     }
 
     decompress_default(reader, output_path, &header)
 }
 
-fn decompress_default<R: Read>(mut reader: R, output_path: &str, header: &BinaryPafHeader) -> io::Result<()> {
+fn decompress_default<R: Read>(
+    mut reader: R,
+    output_path: &str,
+    header: &BinaryPafHeader,
+) -> io::Result<()> {
     let mut records = Vec::with_capacity(header.num_records as usize);
     for _ in 0..header.num_records {
         records.push(AlignmentRecord::read(&mut reader)?);
@@ -640,14 +692,22 @@ pub fn compress_paf(input_path: &str, output_path: &str) -> io::Result<()> {
     }
 
     write_binary(output_path, &records, &string_table)?;
-    debug!("Compressed {} records ({} unique names)", records.len(), string_table.len());
+    debug!(
+        "Compressed {} records ({} unique names)",
+        records.len(),
+        string_table.len()
+    );
     Ok(())
 }
 
 /// Write records to binary PAF format
 ///
 /// Uses delta encoding, varint, and zstd compression for efficient storage.
-fn write_binary(output_path: &str, records: &[AlignmentRecord], string_table: &StringTable) -> io::Result<()> {
+fn write_binary(
+    output_path: &str,
+    records: &[AlignmentRecord],
+    string_table: &StringTable,
+) -> io::Result<()> {
     let output = File::create(output_path)?;
     let mut writer = BufWriter::new(output);
 
@@ -666,7 +726,11 @@ fn write_binary(output_path: &str, records: &[AlignmentRecord], string_table: &S
     Ok(())
 }
 
-fn write_paf_output(output_path: &str, records: &[AlignmentRecord], string_table: &StringTable) -> io::Result<()> {
+fn write_paf_output(
+    output_path: &str,
+    records: &[AlignmentRecord],
+    string_table: &StringTable,
+) -> io::Result<()> {
     let output: Box<dyn Write> = if output_path == "-" {
         Box::new(io::stdout())
     } else {
@@ -681,16 +745,32 @@ fn write_paf_output(output_path: &str, records: &[AlignmentRecord], string_table
     Ok(())
 }
 
-fn write_paf_line<W: Write>(writer: &mut W, record: &AlignmentRecord, string_table: &StringTable) -> io::Result<()> {
+fn write_paf_line<W: Write>(
+    writer: &mut W,
+    record: &AlignmentRecord,
+    string_table: &StringTable,
+) -> io::Result<()> {
     let query_name = string_table.get(record.query_name_id).unwrap();
     let target_name = string_table.get(record.target_name_id).unwrap();
     let query_len = string_table.get_length(record.query_name_id).unwrap();
     let target_len = string_table.get_length(record.target_name_id).unwrap();
 
-    write!(writer, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        query_name, query_len, record.query_start, record.query_end, record.strand,
-        target_name, target_len, record.target_start, record.target_end,
-        record.residue_matches, record.alignment_block_len, record.mapping_quality)?;
+    write!(
+        writer,
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        query_name,
+        query_len,
+        record.query_start,
+        record.query_end,
+        record.strand,
+        target_name,
+        target_len,
+        record.target_start,
+        record.target_end,
+        record.residue_matches,
+        record.alignment_block_len,
+        record.mapping_quality
+    )?;
 
     for tag in &record.tags {
         write!(writer, "\t{}", format_tag(tag))?;
@@ -739,7 +819,11 @@ fn parse_tag(field: &str) -> Option<Tag> {
         b'Z' => TagValue::String(parts[2].to_string()),
         _ => return None,
     };
-    Some(Tag { key, tag_type, value })
+    Some(Tag {
+        key,
+        tag_type,
+        value,
+    })
 }
 
 fn format_tag(tag: &Tag) -> String {
@@ -752,11 +836,21 @@ fn format_tag(tag: &Tag) -> String {
 }
 
 fn parse_usize(s: &str, field: &str) -> io::Result<u64> {
-    s.parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid {}: {}", field, s)))
+    s.parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Invalid {}: {}", field, s),
+        )
+    })
 }
 
 fn parse_u8(s: &str, field: &str) -> io::Result<u8> {
-    s.parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid {}: {}", field, s)))
+    s.parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Invalid {}: {}", field, s),
+        )
+    })
 }
 
 /// Convert ComplexityMetric to u8 for serialization
@@ -774,7 +868,10 @@ fn complexity_metric_from_u8(byte: u8) -> io::Result<ComplexityMetric> {
     match byte {
         0 => Ok(ComplexityMetric::EditDistance),
         1 => Ok(ComplexityMetric::DiagonalDistance),
-        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid complexity metric")),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid complexity metric",
+        )),
     }
 }
 
@@ -787,7 +884,10 @@ fn parse_paf_with_cigar(
 ) -> io::Result<AlignmentRecord> {
     let fields: Vec<&str> = line.split('\t').collect();
     if fields.len() < 12 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "PAF line has fewer than 12 fields"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "PAF line has fewer than 12 fields",
+        ));
     }
 
     let query_len = parse_usize(fields[1], "query_len")?;
@@ -816,7 +916,8 @@ fn parse_paf_with_cigar(
         }
     }
 
-    let cigar = cigar.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing cg:Z: tag"))?;
+    let cigar =
+        cigar.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing cg:Z: tag"))?;
 
     let tracepoints = match tp_type {
         TracepointType::Standard => {
@@ -829,14 +930,23 @@ fn parse_paf_with_cigar(
         }
         TracepointType::Variable => {
             let tps = cigar_to_variable_tracepoints(cigar, max_complexity, *complexity_metric);
-            TracepointData::Variable(tps.into_iter().map(|(a, b_opt)| (a as u64, b_opt.map(|b| b as u64))).collect())
+            TracepointData::Variable(
+                tps.into_iter()
+                    .map(|(a, b_opt)| (a as u64, b_opt.map(|b| b as u64)))
+                    .collect(),
+            )
         }
         TracepointType::Fastga => {
             let complement = strand == '-';
             let segments = cigar_to_tracepoints_fastga(
-                cigar, max_complexity,
-                query_start as usize, query_end as usize, query_len as usize,
-                target_start as usize, target_end as usize, target_len as usize,
+                cigar,
+                max_complexity,
+                query_start as usize,
+                query_end as usize,
+                query_len as usize,
+                target_start as usize,
+                target_end as usize,
+                target_len as usize,
                 complement,
             );
             if let Some((tps, _coords)) = segments.first() {
@@ -868,10 +978,16 @@ fn parse_paf_with_cigar(
     })
 }
 
-fn parse_paf_with_tracepoints(line: &str, string_table: &mut StringTable) -> io::Result<AlignmentRecord> {
+fn parse_paf_with_tracepoints(
+    line: &str,
+    string_table: &mut StringTable,
+) -> io::Result<AlignmentRecord> {
     let fields: Vec<&str> = line.split('\t').collect();
     if fields.len() < 12 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "PAF line has fewer than 12 fields"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "PAF line has fewer than 12 fields",
+        ));
     }
 
     let query_len = parse_usize(fields[1], "query_len")?;
@@ -898,7 +1014,8 @@ fn parse_paf_with_tracepoints(line: &str, string_table: &mut StringTable) -> io:
         }
     }
 
-    let tp_str = tp_str.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing tp:Z: tag"))?;
+    let tp_str =
+        tp_str.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing tp:Z: tag"))?;
     let (tracepoints, tp_type) = parse_tracepoints_auto(tp_str)?;
 
     Ok(AlignmentRecord {
@@ -922,27 +1039,44 @@ fn parse_paf_with_tracepoints(line: &str, string_table: &mut StringTable) -> io:
 
 fn parse_tracepoints_auto(tp_str: &str) -> io::Result<(TracepointData, TracepointType)> {
     if tp_str.is_empty() {
-        return Ok((TracepointData::Standard(Vec::new()), TracepointType::Standard));
+        return Ok((
+            TracepointData::Standard(Vec::new()),
+            TracepointType::Standard,
+        ));
     }
 
     let items: Vec<&str> = tp_str.split(';').collect();
     let has_cigar = items.iter().any(|s| {
-        s.chars().last().map(|c| matches!(c, 'M' | 'D' | 'I' | 'X' | '=')).unwrap_or(false)
+        s.chars()
+            .last()
+            .map(|c| matches!(c, 'M' | 'D' | 'I' | 'X' | '='))
+            .unwrap_or(false)
     });
 
     if has_cigar {
         let mut mixed = Vec::new();
         for item in items {
-            if item.chars().last().map(|c| matches!(c, 'M' | 'D' | 'I' | 'X' | '=')).unwrap_or(false) {
+            if item
+                .chars()
+                .last()
+                .map(|c| matches!(c, 'M' | 'D' | 'I' | 'X' | '='))
+                .unwrap_or(false)
+            {
                 let op = item.chars().last().unwrap();
-                let len_str = &item[..item.len()-1];
-                let len: u64 = len_str.parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid CIGAR length"))?;
+                let len_str = &item[..item.len() - 1];
+                let len: u64 = len_str.parse().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "Invalid CIGAR length")
+                })?;
                 mixed.push(MixedTracepointItem::CigarOp(len, op));
             } else {
                 let parts: Vec<&str> = item.split(',').collect();
                 if parts.len() == 2 {
-                    let a: u64 = parts[0].parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid tracepoint value"))?;
-                    let b: u64 = parts[1].parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid tracepoint value"))?;
+                    let a: u64 = parts[0].parse().map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "Invalid tracepoint value")
+                    })?;
+                    let b: u64 = parts[1].parse().map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "Invalid tracepoint value")
+                    })?;
                     mixed.push(MixedTracepointItem::Tracepoint(a, b));
                 }
             }
@@ -956,12 +1090,18 @@ fn parse_tracepoints_auto(tp_str: &str) -> io::Result<(TracepointData, Tracepoin
                 if item.contains(',') {
                     let parts: Vec<&str> = item.split(',').collect();
                     if parts.len() == 2 {
-                        let a: u64 = parts[0].parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid tracepoint value"))?;
-                        let b: u64 = parts[1].parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid tracepoint value"))?;
+                        let a: u64 = parts[0].parse().map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "Invalid tracepoint value")
+                        })?;
+                        let b: u64 = parts[1].parse().map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "Invalid tracepoint value")
+                        })?;
                         variable.push((a, Some(b)));
                     }
                 } else {
-                    let a: u64 = item.parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid tracepoint value"))?;
+                    let a: u64 = item.parse().map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "Invalid tracepoint value")
+                    })?;
                     variable.push((a, None));
                 }
             }
@@ -971,8 +1111,12 @@ fn parse_tracepoints_auto(tp_str: &str) -> io::Result<(TracepointData, Tracepoin
             for item in items {
                 let parts: Vec<&str> = item.split(',').collect();
                 if parts.len() == 2 {
-                    let a: u64 = parts[0].parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid tracepoint value"))?;
-                    let b: u64 = parts[1].parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid tracepoint value"))?;
+                    let a: u64 = parts[0].parse().map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "Invalid tracepoint value")
+                    })?;
+                    let b: u64 = parts[1].parse().map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "Invalid tracepoint value")
+                    })?;
                     pairs.push((a, b));
                 }
             }
@@ -1023,15 +1167,20 @@ impl BpafIndex {
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
         if &magic != Self::INDEX_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid index magic"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid index magic",
+            ));
         }
 
         // Read version
         let mut version = [0u8; 1];
         reader.read_exact(&mut version)?;
         if version[0] != 1 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData,
-                format!("Unsupported index version: {}", version[0])));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unsupported index version: {}", version[0]),
+            ));
         }
 
         // Read number of offsets
@@ -1118,7 +1267,12 @@ fn skip_record<R: Read + Seek>(reader: &mut R) -> io::Result<()> {
                 let len = read_varint(reader)? as usize;
                 reader.seek(SeekFrom::Current(len as i64))?
             }
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid tag type")),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid tag type",
+                ))
+            }
         };
     }
 
@@ -1178,7 +1332,9 @@ impl BpafReader {
         let header = BinaryPafHeader::read(&mut file)?;
 
         // Empty index - not used for offset-based access
-        let index = BpafIndex { offsets: Vec::new() };
+        let index = BpafIndex {
+            offsets: Vec::new(),
+        };
         let string_table = StringTable::new();
 
         Ok(Self {
@@ -1197,7 +1353,9 @@ impl BpafReader {
 
         // Seek to string table (at end of file, after all records)
         if !self.index.offsets.is_empty() {
-            self.file.seek(SeekFrom::Start(self.index.offsets[self.index.offsets.len() - 1]))?;
+            self.file.seek(SeekFrom::Start(
+                self.index.offsets[self.index.offsets.len() - 1],
+            ))?;
             skip_record(&mut self.file)?;
         }
 
@@ -1236,8 +1394,14 @@ impl BpafReader {
     /// Get full alignment record by ID - O(1) random access
     pub fn get_alignment_record(&mut self, record_id: u64) -> io::Result<AlignmentRecord> {
         if record_id >= self.index.len() as u64 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                format!("Record ID {} out of range (max: {})", record_id, self.index.len() - 1)));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Record ID {} out of range (max: {})",
+                    record_id,
+                    self.index.len() - 1
+                ),
+            ));
         }
 
         let offset = self.index.offsets[record_id as usize];
@@ -1254,10 +1418,19 @@ impl BpafReader {
     /// Returns: (tracepoints, tp_type, complexity_metric, max_complexity)
     ///
     /// Optimized for tracepoint-only access - skips unnecessary fields
-    pub fn get_tracepoints(&mut self, record_id: u64) -> io::Result<(TracepointData, TracepointType, ComplexityMetric, u64)> {
+    pub fn get_tracepoints(
+        &mut self,
+        record_id: u64,
+    ) -> io::Result<(TracepointData, TracepointType, ComplexityMetric, u64)> {
         if record_id >= self.index.len() as u64 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                format!("Record ID {} out of range (max: {})", record_id, self.index.len() - 1)));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Record ID {} out of range (max: {})",
+                    record_id,
+                    self.index.len() - 1
+                ),
+            ));
         }
 
         let offset = self.index.offsets[record_id as usize];
@@ -1268,7 +1441,10 @@ impl BpafReader {
     /// Returns: (tracepoints, tp_type, complexity_metric, max_complexity)
     ///
     /// Use this if you have stored the actual file offsets - skips index lookup.
-    pub fn get_tracepoints_at_offset(&mut self, offset: u64) -> io::Result<(TracepointData, TracepointType, ComplexityMetric, u64)> {
+    pub fn get_tracepoints_at_offset(
+        &mut self,
+        offset: u64,
+    ) -> io::Result<(TracepointData, TracepointType, ComplexityMetric, u64)> {
         self.file.seek(SeekFrom::Start(offset))?;
 
         // Skip fields we don't need

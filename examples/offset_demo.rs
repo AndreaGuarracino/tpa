@@ -27,7 +27,10 @@ fn main() -> std::io::Result<()> {
     let mut reader = BpafReader::open_without_index(bpaf_path)?;
     let open_time = start.elapsed();
 
-    println!("✓ Opened in {:.3}ms (no index loaded)", open_time.as_secs_f64() * 1000.0);
+    println!(
+        "✓ Opened in {:.3}ms (no index loaded)",
+        open_time.as_secs_f64() * 1000.0
+    );
     println!();
 
     // Access by offset
@@ -38,15 +41,20 @@ fn main() -> std::io::Result<()> {
     let read_time = start.elapsed();
 
     let tp_count = match &tracepoints {
-        lib_bpaf::TracepointData::Standard(tps) |
-        lib_bpaf::TracepointData::Fastga(tps) => tps.len(),
+        lib_bpaf::TracepointData::Standard(tps) | lib_bpaf::TracepointData::Fastga(tps) => {
+            tps.len()
+        }
         lib_bpaf::TracepointData::Variable(tps) => tps.len(),
         lib_bpaf::TracepointData::Mixed(tps) => tps.len(),
     };
 
     println!("✓ Read in {:.3}ms", read_time.as_secs_f64() * 1000.0);
     println!("  Type: {:?}", tp_type);
-    println!("  Complexity: {} (max: {})", complexity_metric_str(complexity_metric), max_complexity);
+    println!(
+        "  Complexity: {} (max: {})",
+        complexity_metric_str(complexity_metric),
+        max_complexity
+    );
     println!("  Tracepoints: {} items", tp_count);
 
     Ok(())

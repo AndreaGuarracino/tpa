@@ -77,18 +77,27 @@ fn demo_full_access(reader: &mut BpafReader, args: &[String]) -> std::io::Result
         match reader.get_alignment_record(record_id) {
             Ok(record) => {
                 let query_name = reader.string_table_ref().get(record.query_name_id).unwrap();
-                let target_name = reader.string_table_ref().get(record.target_name_id).unwrap();
+                let target_name = reader
+                    .string_table_ref()
+                    .get(record.target_name_id)
+                    .unwrap();
 
                 let tp_count = match &record.tracepoints {
-                    lib_bpaf::TracepointData::Standard(tps) |
-                    lib_bpaf::TracepointData::Fastga(tps) => tps.len(),
+                    lib_bpaf::TracepointData::Standard(tps)
+                    | lib_bpaf::TracepointData::Fastga(tps) => tps.len(),
                     lib_bpaf::TracepointData::Variable(tps) => tps.len(),
                     lib_bpaf::TracepointData::Mixed(tps) => tps.len(),
                 };
 
                 println!("Record {}:", record_id);
-                println!("  Query:  {} ({}..{})", query_name, record.query_start, record.query_end);
-                println!("  Target: {} ({}..{})", target_name, record.target_start, record.target_end);
+                println!(
+                    "  Query:  {} ({}..{})",
+                    query_name, record.query_start, record.query_end
+                );
+                println!(
+                    "  Target: {} ({}..{})",
+                    target_name, record.target_start, record.target_end
+                );
                 println!("  Strand: {}", record.strand);
                 println!("  Tracepoints: {} items", tp_count);
                 println!("  Match quality: {}", record.mapping_quality);
@@ -99,9 +108,12 @@ fn demo_full_access(reader: &mut BpafReader, args: &[String]) -> std::io::Result
     }
     let elapsed = start.elapsed();
 
-    println!("✓ Full access complete: {} records in {:.3}ms ({:.3}ms/record)",
-             record_ids.len(), elapsed.as_secs_f64() * 1000.0,
-             elapsed.as_secs_f64() * 1000.0 / record_ids.len() as f64);
+    println!(
+        "✓ Full access complete: {} records in {:.3}ms ({:.3}ms/record)",
+        record_ids.len(),
+        elapsed.as_secs_f64() * 1000.0,
+        elapsed.as_secs_f64() * 1000.0 / record_ids.len() as f64
+    );
 
     Ok(())
 }
@@ -121,15 +133,19 @@ fn demo_tracepoint_access(reader: &mut BpafReader, args: &[String]) -> std::io::
         match reader.get_tracepoints(record_id) {
             Ok((tracepoints, tp_type, complexity_metric, max_complexity)) => {
                 let tp_count = match &tracepoints {
-                    lib_bpaf::TracepointData::Standard(tps) |
-                    lib_bpaf::TracepointData::Fastga(tps) => tps.len(),
+                    lib_bpaf::TracepointData::Standard(tps)
+                    | lib_bpaf::TracepointData::Fastga(tps) => tps.len(),
                     lib_bpaf::TracepointData::Variable(tps) => tps.len(),
                     lib_bpaf::TracepointData::Mixed(tps) => tps.len(),
                 };
 
                 println!("Record {}:", record_id);
                 println!("  Type: {:?}", tp_type);
-                println!("  Complexity: {} (max: {})", complexity_metric_str(complexity_metric), max_complexity);
+                println!(
+                    "  Complexity: {} (max: {})",
+                    complexity_metric_str(complexity_metric),
+                    max_complexity
+                );
                 println!("  Tracepoints: {} items", tp_count);
                 println!();
             }
@@ -138,9 +154,12 @@ fn demo_tracepoint_access(reader: &mut BpafReader, args: &[String]) -> std::io::
     }
     let elapsed = start.elapsed();
 
-    println!("✓ Tracepoint access complete: {} records in {:.3}ms ({:.3}ms/record)",
-             record_ids.len(), elapsed.as_secs_f64() * 1000.0,
-             elapsed.as_secs_f64() * 1000.0 / record_ids.len() as f64);
+    println!(
+        "✓ Tracepoint access complete: {} records in {:.3}ms ({:.3}ms/record)",
+        record_ids.len(),
+        elapsed.as_secs_f64() * 1000.0,
+        elapsed.as_secs_f64() * 1000.0 / record_ids.len() as f64
+    );
 
     Ok(())
 }
@@ -162,7 +181,10 @@ fn profile_methods(reader: &mut BpafReader) -> std::io::Result<()> {
             .map(|i| (i * 997 + 13) % total_records) // Simple pseudo-random
             .collect();
 
-        println!("--- Testing with {} records (random access pattern) ---", size);
+        println!(
+            "--- Testing with {} records (random access pattern) ---",
+            size
+        );
 
         // Test 1: Full record access
         let start = Instant::now();
@@ -179,13 +201,17 @@ fn profile_methods(reader: &mut BpafReader) -> std::io::Result<()> {
         let tracepoint_elapsed = start.elapsed();
 
         // Report results
-        println!("  Full record access:     {:.3}ms total, {:.3}ms/record",
-                 full_elapsed.as_secs_f64() * 1000.0,
-                 full_elapsed.as_secs_f64() * 1000.0 / size as f64);
-        println!("  Tracepoint-only access: {:.3}ms total, {:.3}ms/record ({:.1}x speedup)",
-                 tracepoint_elapsed.as_secs_f64() * 1000.0,
-                 tracepoint_elapsed.as_secs_f64() * 1000.0 / size as f64,
-                 full_elapsed.as_secs_f64() / tracepoint_elapsed.as_secs_f64());
+        println!(
+            "  Full record access:     {:.3}ms total, {:.3}ms/record",
+            full_elapsed.as_secs_f64() * 1000.0,
+            full_elapsed.as_secs_f64() * 1000.0 / size as f64
+        );
+        println!(
+            "  Tracepoint-only access: {:.3}ms total, {:.3}ms/record ({:.1}x speedup)",
+            tracepoint_elapsed.as_secs_f64() * 1000.0,
+            tracepoint_elapsed.as_secs_f64() * 1000.0 / size as f64,
+            full_elapsed.as_secs_f64() / tracepoint_elapsed.as_secs_f64()
+        );
         println!();
     }
 
