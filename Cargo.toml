@@ -11,7 +11,7 @@ repository = "https://github.com/AndreaGuarracino/lib_bpaf"
 zstd = "0.13.3"
 log = "0.4"
 flate2 = "1.1.5"
-lib_tracepoints = { git = "https://github.com/AndreaGuarracino/lib_tracepoints", rev = "9ab4f6d4dcb6d772bc9ea1ae1e7077b03886d77f" }
+lib_tracepoints = { git = "https://github.com/AndreaGuarracino/lib_tracepoints" }
 
 [dev-dependencies]
 env_logger = "0.11.8"
