@@ -15,8 +15,7 @@ use lib_tracepoints::{
     cigar_to_mixed_tracepoints, cigar_to_tracepoints, cigar_to_tracepoints_fastga,
     cigar_to_variable_tracepoints, ComplexityMetric, MixedRepresentation, TracepointType,
 };
-use log::{error, info};
-use std::cmp::Ordering;
+use log::{error, info, debug};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -71,195 +70,11 @@ fn read_varint<R: Read>(reader: &mut R) -> io::Result<u64> {
 }
 
 // ============================================================================
-// HUFFMAN CODING
-// ============================================================================
-
-/// Huffman tree node
-#[derive(Clone)]
-enum HuffmanNode {
-    Leaf { value: i64, frequency: u64 },
-    Internal { left: Box<HuffmanNode>, right: Box<HuffmanNode>, frequency: u64 },
-}
-
-impl HuffmanNode {
-    fn frequency(&self) -> u64 {
-        match self {
-            Self::Leaf { frequency, .. } => *frequency,
-            Self::Internal { frequency, .. } => *frequency,
-        }
-    }
-}
-
-impl Eq for HuffmanNode {}
-impl PartialEq for HuffmanNode {
-    fn eq(&self, other: &Self) -> bool {
-        self.frequency() == other.frequency()
-    }
-}
-impl Ord for HuffmanNode {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other.frequency().cmp(&self.frequency()) // Reverse for min-heap
-    }
-}
-impl PartialOrd for HuffmanNode {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// Variable-length bit string (for backwards compatibility reading)
-#[derive(Clone, Debug)]
-struct BitString {
-    bits: Vec<bool>,
-}
-
-/// Huffman tree for decoding (backwards compatibility only)
-struct HuffmanTree {
-    root: HuffmanNode,
-    encode_table: HashMap<i64, BitString>,
-}
-
-impl HuffmanTree {
-    fn decode(&self, bits: &mut BitReader) -> io::Result<i64> {
-        let mut node = &self.root;
-        loop {
-            match node {
-                HuffmanNode::Leaf { value, .. } => return Ok(*value),
-                HuffmanNode::Internal { left, right, .. } => {
-                    let bit = bits.read_bit()?;
-                    node = if bit { right } else { left };
-                }
-            }
-        }
-    }
-
-    fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
-        let num_symbols = read_varint(reader)? as usize;
-        let mut encode_table = HashMap::new();
-
-        for _ in 0..num_symbols {
-            let zigzag = read_varint(reader)?;
-            let value = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
-
-            let mut len_buf = [0u8; 1];
-            reader.read_exact(&mut len_buf)?;
-            let bit_len = len_buf[0] as usize;
-
-            let num_bytes = (bit_len + 7) / 8;
-            let mut bytes = vec![0u8; num_bytes];
-            reader.read_exact(&mut bytes)?;
-
-            let mut bits = Vec::with_capacity(bit_len);
-            for i in 0..bit_len {
-                let byte_idx = i / 8;
-                let bit_idx = 7 - (i % 8);
-                bits.push((bytes[byte_idx] >> bit_idx) & 1 == 1);
-            }
-
-            encode_table.insert(value, BitString { bits });
-        }
-
-        let root = rebuild_tree(&encode_table);
-        Ok(Self { root, encode_table })
-    }
-
-    fn num_symbols(&self) -> usize {
-        self.encode_table.len()
-    }
-}
-
-fn rebuild_tree(encode_table: &HashMap<i64, BitString>) -> HuffmanNode {
-    if encode_table.len() == 1 {
-        let (&value, _) = encode_table.iter().next().unwrap();
-        return HuffmanNode::Leaf { value, frequency: 1 };
-    }
-
-    let mut root = HuffmanNode::Internal {
-        frequency: 0,
-        left: Box::new(HuffmanNode::Leaf { value: 0, frequency: 0 }),
-        right: Box::new(HuffmanNode::Leaf { value: 0, frequency: 0 }),
-    };
-
-    for (&value, code) in encode_table {
-        let mut node = &mut root;
-        for (i, &bit) in code.bits.iter().enumerate() {
-            let is_last = i == code.bits.len() - 1;
-            match node {
-                HuffmanNode::Internal { left, right, .. } => {
-                    let child = if bit { right.as_mut() } else { left.as_mut() };
-                    if is_last {
-                        *child = HuffmanNode::Leaf { value, frequency: 1 };
-                        break;
-                    } else {
-                        if matches!(child, HuffmanNode::Leaf { .. }) {
-                            *child = HuffmanNode::Internal {
-                                frequency: 0,
-                                left: Box::new(HuffmanNode::Leaf { value: 0, frequency: 0 }),
-                                right: Box::new(HuffmanNode::Leaf { value: 0, frequency: 0 }),
-                            };
-                        }
-                        node = child;
-                    }
-                }
-                _ => panic!("Unexpected leaf node in tree traversal"),
-            }
-        }
-    }
-    root
-}
-
-struct BitReader<'a> {
-    bytes: &'a [u8],
-    byte_pos: usize,
-    bit_pos: u8,
-}
-
-impl<'a> BitReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, byte_pos: 0, bit_pos: 0 }
-    }
-
-    fn read_bit(&mut self) -> io::Result<bool> {
-        if self.byte_pos >= self.bytes.len() {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "BitReader: end of stream"));
-        }
-        let bit = (self.bytes[self.byte_pos] >> (7 - self.bit_pos)) & 1 == 1;
-        self.bit_pos += 1;
-        if self.bit_pos == 8 {
-            self.byte_pos += 1;
-            self.bit_pos = 0;
-        }
-        Ok(bit)
-    }
-}
-
-/// Adaptive codec for decoding (backwards compatibility only)
-struct AdaptiveCodec {
-    huffman_tree: Option<HuffmanTree>,
-}
-
-impl AdaptiveCodec {
-    fn decode(&self, bits: &mut BitReader) -> io::Result<i64> {
-        self.huffman_tree.as_ref().unwrap().decode(bits)
-    }
-
-    fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
-        let huffman_tree = HuffmanTree::read(reader)?;
-        Ok(Self { huffman_tree: Some(huffman_tree) })
-    }
-
-    fn num_symbols(&self) -> usize {
-        self.huffman_tree.as_ref().map(|t| t.num_symbols()).unwrap_or(0)
-    }
-}
-
-// ============================================================================
 // BINARY PAF FORMAT
 // ============================================================================
 
 const BINARY_MAGIC: &[u8; 4] = b"BPAF";
 const FLAG_COMPRESSED: u8 = 0x01;
-const FLAG_ADAPTIVE: u8 = 0x02;
 
 /// Binary PAF header
 #[derive(Debug)]
@@ -766,7 +581,7 @@ pub fn encode_cigar_to_binary(
     }
 
     write_binary(output_path, &records, &string_table)?;
-    info!("Encoded {} records ({} unique names)", records.len(), string_table.len());
+    debug!("Encoded {} records ({} unique names)", records.len(), string_table.len());
     Ok(())
 }
 
@@ -778,16 +593,15 @@ pub fn decompress_paf(input_path: &str, output_path: &str) -> io::Result<()> {
     let mut reader = BufReader::new(input);
 
     let header = BinaryPafHeader::read(&mut reader)?;
-    let mode = if header.flags & FLAG_ADAPTIVE != 0 { "adaptive" } else { "default" };
-    info!("Reading {} records ({} unique names) [{}]",
-        header.num_records, header.num_strings, mode);
+    debug!("Reading {} records ({} unique names)",
+        header.num_records, header.num_strings);
 
-    match header.version {
-        1 => decompress_default(reader, output_path, &header),
-        2 => decompress_adaptive(reader, output_path, &header),
-        v => Err(io::Error::new(io::ErrorKind::InvalidData,
-            format!("Unsupported format version: {}", v))),
+    if header.version != 1 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("Unsupported format version: {}", header.version)));
     }
+
+    decompress_default(reader, output_path, &header)
 }
 
 fn decompress_default<R: Read>(mut reader: R, output_path: &str, header: &BinaryPafHeader) -> io::Result<()> {
@@ -797,104 +611,8 @@ fn decompress_default<R: Read>(mut reader: R, output_path: &str, header: &Binary
     }
     let string_table = StringTable::read(&mut reader)?;
     write_paf_output(output_path, &records, &string_table)?;
-    info!("Decompressed {} records", header.num_records);
+    debug!("Decompressed {} records", header.num_records);
     Ok(())
-}
-
-fn decompress_adaptive<R: Read>(mut reader: R, output_path: &str, header: &BinaryPafHeader) -> io::Result<()> {
-    let pos_codec = AdaptiveCodec::read(&mut reader)?;
-    let score_codec = AdaptiveCodec::read(&mut reader)?;
-    info!("Codecs: {} pos symbols, {} score symbols",
-          pos_codec.num_symbols(), score_codec.num_symbols());
-
-    let mut records = Vec::with_capacity(header.num_records as usize);
-    for _ in 0..header.num_records {
-        records.push(read_record_adaptive(&mut reader, &pos_codec, &score_codec)?);
-    }
-    let string_table = StringTable::read(&mut reader)?;
-    write_paf_output(output_path, &records, &string_table)?;
-    info!("Decompressed {} records", header.num_records);
-    Ok(())
-}
-
-fn read_record_adaptive<R: Read>(
-    reader: &mut R,
-    pos_codec: &AdaptiveCodec,
-    score_codec: &AdaptiveCodec,
-) -> io::Result<AlignmentRecord> {
-    let query_name_id = read_varint(reader)?;
-    let query_start = read_varint(reader)?;
-    let query_end = read_varint(reader)?;
-    let mut strand_buf = [0u8; 1];
-    reader.read_exact(&mut strand_buf)?;
-    let strand = strand_buf[0] as char;
-    let target_name_id = read_varint(reader)?;
-    let target_start = read_varint(reader)?;
-    let target_end = read_varint(reader)?;
-    let residue_matches = read_varint(reader)?;
-    let alignment_block_len = read_varint(reader)?;
-    let mut mapq_buf = [0u8; 1];
-    reader.read_exact(&mut mapq_buf)?;
-    let mapping_quality = mapq_buf[0];
-    let mut tp_type_buf = [0u8; 1];
-    reader.read_exact(&mut tp_type_buf)?;
-    let tp_type = TracepointType::from_u8(tp_type_buf[0])
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let mut metric_buf = [0u8; 1];
-    reader.read_exact(&mut metric_buf)?;
-    let complexity_metric = complexity_metric_from_u8(metric_buf[0])?;
-    let max_complexity = read_varint(reader)?;
-
-    let num_items = read_varint(reader)? as usize;
-    let tracepoints = if num_items == 0 {
-        match tp_type {
-            TracepointType::Standard => TracepointData::Standard(Vec::new()),
-            _ => TracepointData::Fastga(Vec::new()),
-        }
-    } else {
-        let pos_len = read_varint(reader)? as usize;
-        let mut pos_compressed = vec![0u8; pos_len];
-        reader.read_exact(&mut pos_compressed)?;
-        let score_len = read_varint(reader)? as usize;
-        let mut score_compressed = vec![0u8; score_len];
-        reader.read_exact(&mut score_compressed)?;
-
-        let pos_bytes = zstd::decode_all(&pos_compressed[..])?;
-        let score_bytes = zstd::decode_all(&score_compressed[..])?;
-
-        let mut pos_reader = BitReader::new(&pos_bytes);
-        let mut pos_deltas = Vec::with_capacity(num_items);
-        for _ in 0..num_items {
-            pos_deltas.push(pos_codec.decode(&mut pos_reader)?);
-        }
-        let positions = delta_decode(&pos_deltas);
-
-        let mut score_reader = BitReader::new(&score_bytes);
-        let mut scores = Vec::with_capacity(num_items);
-        for _ in 0..num_items {
-            scores.push(score_codec.decode(&mut score_reader)? as u64);
-        }
-
-        let tps: Vec<(u64, u64)> = positions.into_iter().zip(scores).collect();
-        match tp_type {
-            TracepointType::Standard => TracepointData::Standard(tps),
-            _ => TracepointData::Fastga(tps),
-        }
-    };
-
-    let num_tags = read_varint(reader)? as usize;
-    let mut tags = Vec::with_capacity(num_tags);
-    for _ in 0..num_tags {
-        tags.push(Tag::read(reader)?);
-    }
-
-    Ok(AlignmentRecord {
-        query_name_id, query_start, query_end, strand,
-        target_name_id, target_start, target_end,
-        residue_matches, alignment_block_len, mapping_quality,
-        tp_type, complexity_metric, max_complexity,
-        tracepoints, tags,
-    })
 }
 
 /// Compress PAF with tracepoints to binary format
@@ -923,7 +641,7 @@ pub fn compress_paf(input_path: &str, output_path: &str) -> io::Result<()> {
     }
 
     write_binary(output_path, &records, &string_table)?;
-    info!("Compressed {} records ({} unique names)", records.len(), string_table.len());
+    debug!("Compressed {} records ({} unique names)", records.len(), string_table.len());
     Ok(())
 }
 
@@ -1349,26 +1067,18 @@ pub fn build_index(bpaf_path: &str) -> io::Result<BpafIndex> {
 
     let mut offsets = Vec::with_capacity(header.num_records as usize);
 
-    // Skip codecs if adaptive format
-    if header.flags & FLAG_ADAPTIVE != 0 {
-        // Skip position codec
-        AdaptiveCodec::read(&mut file)?;
-        // Skip score codec
-        AdaptiveCodec::read(&mut file)?;
-    }
-
     // Record offset of each record
     for _ in 0..header.num_records {
         offsets.push(file.stream_position()?);
-        skip_record(&mut file, header.flags & FLAG_ADAPTIVE != 0)?;
+        skip_record(&mut file)?;
     }
 
-    info!("Index built: {} records", offsets.len());
+    debug!("Index built: {} records", offsets.len());
     Ok(BpafIndex { offsets })
 }
 
 /// Skip a record without parsing (for building index)
-fn skip_record<R: Read + Seek>(reader: &mut R, _is_adaptive: bool) -> io::Result<()> {
+fn skip_record<R: Read + Seek>(reader: &mut R) -> io::Result<()> {
     // Skip core PAF fields (varints)
     read_varint(reader)?; // query_name_id
     read_varint(reader)?; // query_start
@@ -1422,9 +1132,6 @@ pub struct BpafReader {
     index: BpafIndex,
     header: BinaryPafHeader,
     string_table: StringTable,
-    // Adaptive format codecs (if applicable)
-    pos_codec: Option<AdaptiveCodec>,
-    score_codec: Option<AdaptiveCodec>,
 }
 
 impl BpafReader {
@@ -1440,22 +1147,13 @@ impl BpafReader {
             info!("No index found, building...");
             let idx = build_index(bpaf_path)?;
             idx.save(&idx_path)?;
-            info!("Index saved to {}", idx_path);
+            debug!("Index saved to {}", idx_path);
             idx
         };
 
         // Open file and read header
         let mut file = File::open(bpaf_path)?;
         let header = BinaryPafHeader::read(&mut file)?;
-
-        // Load codecs if adaptive format
-        let (pos_codec, score_codec) = if header.flags & FLAG_ADAPTIVE != 0 {
-            let pos = AdaptiveCodec::read(&mut file)?;
-            let score = AdaptiveCodec::read(&mut file)?;
-            (Some(pos), Some(score))
-        } else {
-            (None, None)
-        };
 
         // Lazy-load string table only when needed (expensive for large files)
         let string_table = StringTable::new();
@@ -1465,8 +1163,6 @@ impl BpafReader {
             index,
             header,
             string_table,
-            pos_codec,
-            score_codec,
         })
     }
 
@@ -1482,15 +1178,6 @@ impl BpafReader {
         let mut file = File::open(bpaf_path)?;
         let header = BinaryPafHeader::read(&mut file)?;
 
-        // Load codecs if adaptive format
-        let (pos_codec, score_codec) = if header.flags & FLAG_ADAPTIVE != 0 {
-            let pos = AdaptiveCodec::read(&mut file)?;
-            let score = AdaptiveCodec::read(&mut file)?;
-            (Some(pos), Some(score))
-        } else {
-            (None, None)
-        };
-
         // Empty index - not used for offset-based access
         let index = BpafIndex { offsets: Vec::new() };
         let string_table = StringTable::new();
@@ -1500,8 +1187,6 @@ impl BpafReader {
             index,
             header,
             string_table,
-            pos_codec,
-            score_codec,
         })
     }
 
@@ -1514,7 +1199,7 @@ impl BpafReader {
         // Seek to string table (at end of file, after all records)
         if !self.index.offsets.is_empty() {
             self.file.seek(SeekFrom::Start(self.index.offsets[self.index.offsets.len() - 1]))?;
-            skip_record(&mut self.file, self.header.flags & FLAG_ADAPTIVE != 0)?;
+            skip_record(&mut self.file)?;
         }
 
         self.string_table = StringTable::read(&mut self.file)?;
@@ -1563,26 +1248,13 @@ impl BpafReader {
     /// Get alignment record by file offset (for impg compatibility)
     pub fn get_alignment_record_at_offset(&mut self, offset: u64) -> io::Result<AlignmentRecord> {
         self.file.seek(SeekFrom::Start(offset))?;
-
-        if self.header.flags & FLAG_ADAPTIVE != 0 {
-            // Adaptive format - use Huffman decompression
-            read_record_adaptive(
-                &mut self.file,
-                self.pos_codec.as_ref().unwrap(),
-                self.score_codec.as_ref().unwrap(),
-            )
-        } else {
-            // Default format - standard decompression
-            AlignmentRecord::read(&mut self.file)
-        }
+        AlignmentRecord::read(&mut self.file)
     }
 
     /// Get tracepoints only (optimized) - O(1) random access by record ID
     /// Returns: (tracepoints, tp_type, complexity_metric, max_complexity)
     ///
-    /// Optimized for tracepoint-only access:
-    /// - Default compression: skips unnecessary fields
-    /// - Adaptive compression: reads full record but avoids field extraction overhead
+    /// Optimized for tracepoint-only access - skips unnecessary fields
     pub fn get_tracepoints(&mut self, record_id: u64) -> io::Result<(TracepointData, TracepointType, ComplexityMetric, u64)> {
         if record_id >= self.index.len() as u64 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput,
@@ -1600,44 +1272,34 @@ impl BpafReader {
     pub fn get_tracepoints_at_offset(&mut self, offset: u64) -> io::Result<(TracepointData, TracepointType, ComplexityMetric, u64)> {
         self.file.seek(SeekFrom::Start(offset))?;
 
-        if self.header.flags & FLAG_ADAPTIVE != 0 {
-            // Adaptive format - must read full record due to Huffman encoding
-            let record = read_record_adaptive(
-                &mut self.file,
-                self.pos_codec.as_ref().unwrap(),
-                self.score_codec.as_ref().unwrap(),
-            )?;
-            Ok((record.tracepoints, record.tp_type, record.complexity_metric, record.max_complexity))
-        } else {
-            // Default format - can skip fields
-            read_varint(&mut self.file)?; // query_name_id - SKIP
-            read_varint(&mut self.file)?; // query_start - SKIP
-            read_varint(&mut self.file)?; // query_end - SKIP
-            self.file.seek(SeekFrom::Current(1))?; // strand - SKIP
-            read_varint(&mut self.file)?; // target_name_id - SKIP
-            read_varint(&mut self.file)?; // target_start - SKIP
-            read_varint(&mut self.file)?; // target_end - SKIP
-            read_varint(&mut self.file)?; // residue_matches - SKIP
-            read_varint(&mut self.file)?; // alignment_block_len - SKIP
-            self.file.seek(SeekFrom::Current(1))?; // mapping_quality - SKIP
+        // Skip fields we don't need
+        read_varint(&mut self.file)?; // query_name_id - SKIP
+        read_varint(&mut self.file)?; // query_start - SKIP
+        read_varint(&mut self.file)?; // query_end - SKIP
+        self.file.seek(SeekFrom::Current(1))?; // strand - SKIP
+        read_varint(&mut self.file)?; // target_name_id - SKIP
+        read_varint(&mut self.file)?; // target_start - SKIP
+        read_varint(&mut self.file)?; // target_end - SKIP
+        read_varint(&mut self.file)?; // residue_matches - SKIP
+        read_varint(&mut self.file)?; // alignment_block_len - SKIP
+        self.file.seek(SeekFrom::Current(1))?; // mapping_quality - SKIP
 
-            // Read only what we need
-            let mut tp_type_buf = [0u8; 1];
-            self.file.read_exact(&mut tp_type_buf)?;
-            let tp_type = TracepointType::from_u8(tp_type_buf[0])
+        // Read only what we need
+        let mut tp_type_buf = [0u8; 1];
+        self.file.read_exact(&mut tp_type_buf)?;
+        let tp_type = TracepointType::from_u8(tp_type_buf[0])
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-            let mut metric_buf = [0u8; 1];
-            self.file.read_exact(&mut metric_buf)?;
-            let complexity_metric = complexity_metric_from_u8(metric_buf[0])?;
+        let mut metric_buf = [0u8; 1];
+        self.file.read_exact(&mut metric_buf)?;
+        let complexity_metric = complexity_metric_from_u8(metric_buf[0])?;
 
-            let max_complexity = read_varint(&mut self.file)?;
+        let max_complexity = read_varint(&mut self.file)?;
 
-            // Read tracepoints
-            let tracepoints = AlignmentRecord::read_tracepoints(&mut self.file, tp_type)?;
+        // Read tracepoints
+        let tracepoints = AlignmentRecord::read_tracepoints(&mut self.file, tp_type)?;
 
-            Ok((tracepoints, tp_type, complexity_metric, max_complexity))
-        }
+        Ok((tracepoints, tp_type, complexity_metric, max_complexity))
     }
 
     /// Iterator over all records (sequential access)

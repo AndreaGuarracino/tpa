@@ -8,7 +8,6 @@ Efficient binary storage and random access for genomic sequence alignments with 
 - **O(1) random access**: External index for instant record lookup
 - **Tracepoint support**: Standard, Mixed, Variable, and FastGA representations
 - **String deduplication**: Shared sequence name table
-- **Backwards compatible**: Reads all format versions
 
 ## Format
 
