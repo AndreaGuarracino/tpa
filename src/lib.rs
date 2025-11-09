@@ -5,17 +5,10 @@
 /// - Records: Core PAF fields + compressed tracepoints
 /// - StringTable: Deduplicated sequence names with lengths
 ///
-/// Adaptive compression (--training):
-/// - Huffman coding trained on data + delta encoding + zstd
-/// - Two-pass: training + encoding
-/// - Codecs embedded in file header
-/// - Expected: 4.5 MB (10.7x compression) - maximum compression!
-///
-/// Default compression:
-/// - Component separation: positions and scores stored separately
+/// Compression strategy:
 /// - Delta encoding: positions stored as deltas from previous position
-/// - Zstd compression: each tracepoint block compressed independently
-/// - Expected: 5.6 MB (8.6x compression)
+/// - Varint encoding: variable-length integer encoding
+/// - Zstd level 3: fast compression with good ratios
 
 use lib_tracepoints::{
     cigar_to_mixed_tracepoints, cigar_to_tracepoints, cigar_to_tracepoints_fastga,
@@ -23,7 +16,7 @@ use lib_tracepoints::{
 };
 use log::{error, info};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -113,72 +106,19 @@ impl PartialOrd for HuffmanNode {
     }
 }
 
-/// Variable-length bit string
+/// Variable-length bit string (for backwards compatibility reading)
 #[derive(Clone, Debug)]
 struct BitString {
     bits: Vec<bool>,
 }
 
-impl BitString {
-    fn new() -> Self {
-        Self { bits: Vec::new() }
-    }
-
-    fn len(&self) -> usize {
-        self.bits.len()
-    }
-
-    fn push(&mut self, bit: bool) {
-        self.bits.push(bit);
-    }
-}
-
-/// Huffman tree for encoding/decoding
+/// Huffman tree for decoding (backwards compatibility only)
 struct HuffmanTree {
     root: HuffmanNode,
     encode_table: HashMap<i64, BitString>,
 }
 
 impl HuffmanTree {
-    fn from_frequencies(freq: &HashMap<i64, u64>) -> Self {
-        if freq.is_empty() {
-            panic!("Cannot build Huffman tree from empty frequency table");
-        }
-
-        // Special case: single symbol
-        if freq.len() == 1 {
-            let (&value, &frequency) = freq.iter().next().unwrap();
-            let root = HuffmanNode::Leaf { value, frequency };
-            let mut encode_table = HashMap::new();
-            encode_table.insert(value, BitString { bits: vec![false] });
-            return Self { root, encode_table };
-        }
-
-        // Build Huffman tree with priority queue
-        let mut heap = BinaryHeap::new();
-        for (&value, &frequency) in freq {
-            heap.push(HuffmanNode::Leaf { value, frequency });
-        }
-
-        while heap.len() > 1 {
-            let left = heap.pop().unwrap();
-            let right = heap.pop().unwrap();
-            heap.push(HuffmanNode::Internal {
-                frequency: left.frequency() + right.frequency(),
-                left: Box::new(left),
-                right: Box::new(right),
-            });
-        }
-
-        let root = heap.pop().unwrap();
-        let encode_table = build_encode_table(&root);
-        Self { root, encode_table }
-    }
-
-    fn encode(&self, value: i64) -> &BitString {
-        &self.encode_table[&value]
-    }
-
     fn decode(&self, bits: &mut BitReader) -> io::Result<i64> {
         let mut node = &self.root;
         loop {
@@ -190,36 +130,6 @@ impl HuffmanTree {
                 }
             }
         }
-    }
-
-    fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        write_varint(writer, self.encode_table.len() as u64)?;
-        for (&value, bits) in &self.encode_table {
-            let zigzag = ((value << 1) ^ (value >> 63)) as u64;
-            write_varint(writer, zigzag)?;
-            writer.write_all(&[bits.len() as u8])?;
-
-            // Pack bits into bytes
-            let mut bytes = Vec::new();
-            let mut current_byte = 0u8;
-            let mut bit_pos = 0;
-            for &bit in &bits.bits {
-                if bit {
-                    current_byte |= 1 << (7 - bit_pos);
-                }
-                bit_pos += 1;
-                if bit_pos == 8 {
-                    bytes.push(current_byte);
-                    current_byte = 0;
-                    bit_pos = 0;
-                }
-            }
-            if bit_pos > 0 {
-                bytes.push(current_byte);
-            }
-            writer.write_all(&bytes)?;
-        }
-        Ok(())
     }
 
     fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
@@ -255,27 +165,6 @@ impl HuffmanTree {
     fn num_symbols(&self) -> usize {
         self.encode_table.len()
     }
-}
-
-fn build_encode_table(node: &HuffmanNode) -> HashMap<i64, BitString> {
-    let mut table = HashMap::new();
-    fn dfs(node: &HuffmanNode, prefix: &mut BitString, table: &mut HashMap<i64, BitString>) {
-        match node {
-            HuffmanNode::Leaf { value, .. } => {
-                table.insert(*value, prefix.clone());
-            }
-            HuffmanNode::Internal { left, right, .. } => {
-                prefix.push(false);
-                dfs(left, prefix, table);
-                prefix.bits.pop();
-                prefix.push(true);
-                dfs(right, prefix, table);
-                prefix.bits.pop();
-            }
-        }
-    }
-    dfs(node, &mut BitString::new(), &mut table);
-    table
 }
 
 fn rebuild_tree(encode_table: &HashMap<i64, BitString>) -> HuffmanNode {
@@ -318,39 +207,6 @@ fn rebuild_tree(encode_table: &HashMap<i64, BitString>) -> HuffmanNode {
     root
 }
 
-struct BitWriter {
-    bytes: Vec<u8>,
-    current_byte: u8,
-    bit_pos: u8,
-}
-
-impl BitWriter {
-    fn new() -> Self {
-        Self { bytes: Vec::new(), current_byte: 0, bit_pos: 0 }
-    }
-
-    fn write_bits(&mut self, bits: &BitString) {
-        for &bit in &bits.bits {
-            if bit {
-                self.current_byte |= 1 << (7 - self.bit_pos);
-            }
-            self.bit_pos += 1;
-            if self.bit_pos == 8 {
-                self.bytes.push(self.current_byte);
-                self.current_byte = 0;
-                self.bit_pos = 0;
-            }
-        }
-    }
-
-    fn finish(mut self) -> Vec<u8> {
-        if self.bit_pos > 0 {
-            self.bytes.push(self.current_byte);
-        }
-        self.bytes
-    }
-}
-
 struct BitReader<'a> {
     bytes: &'a [u8],
     byte_pos: usize,
@@ -376,39 +232,19 @@ impl<'a> BitReader<'a> {
     }
 }
 
+/// Adaptive codec for decoding (backwards compatibility only)
 struct AdaptiveCodec {
-    frequencies: HashMap<i64, u64>,
     huffman_tree: Option<HuffmanTree>,
 }
 
 impl AdaptiveCodec {
-    fn new() -> Self {
-        Self { frequencies: HashMap::new(), huffman_tree: None }
-    }
-
-    fn train(&mut self, value: i64) {
-        *self.frequencies.entry(value).or_insert(0) += 1;
-    }
-
-    fn build(&mut self) {
-        self.huffman_tree = Some(HuffmanTree::from_frequencies(&self.frequencies));
-    }
-
-    fn encode(&self, value: i64) -> &BitString {
-        self.huffman_tree.as_ref().unwrap().encode(value)
-    }
-
     fn decode(&self, bits: &mut BitReader) -> io::Result<i64> {
         self.huffman_tree.as_ref().unwrap().decode(bits)
     }
 
-    fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        self.huffman_tree.as_ref().unwrap().write(writer)
-    }
-
     fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
         let huffman_tree = HuffmanTree::read(reader)?;
-        Ok(Self { frequencies: HashMap::new(), huffman_tree: Some(huffman_tree) })
+        Ok(Self { huffman_tree: Some(huffman_tree) })
     }
 
     fn num_symbols(&self) -> usize {
@@ -656,10 +492,7 @@ impl AlignmentRecord {
         write_varint(writer, self.alignment_block_len)?;
         writer.write_all(&[self.mapping_quality])?;
         writer.write_all(&[self.tp_type.to_u8()])?;
-        writer.write_all(&[match self.complexity_metric {
-            ComplexityMetric::EditDistance => 0,
-            ComplexityMetric::DiagonalDistance => 1,
-        }])?;
+        writer.write_all(&[complexity_metric_to_u8(&self.complexity_metric)])?;
         write_varint(writer, self.max_complexity)?;
         self.write_tracepoints(writer)?;
         write_varint(writer, self.tags.len() as u64)?;
@@ -751,11 +584,7 @@ impl AlignmentRecord {
         let tp_type = TracepointType::from_u8(tp_type_buf[0])?;
         let mut metric_buf = [0u8; 1];
         reader.read_exact(&mut metric_buf)?;
-        let complexity_metric = match metric_buf[0] {
-            0 => ComplexityMetric::EditDistance,
-            1 => ComplexityMetric::DiagonalDistance,
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid metric")),
-        };
+        let complexity_metric = complexity_metric_from_u8(metric_buf[0])?;
         let max_complexity = read_varint(reader)?;
         let tracepoints = Self::read_tracepoints(reader, tp_type)?;
         let num_tags = read_varint(reader)? as usize;
@@ -948,7 +777,6 @@ pub fn encode_cigar_to_binary(
     tp_type: &TpType,
     max_complexity: usize,
     complexity_metric: &ComplexityMetric,
-    use_training: bool,
 ) -> io::Result<()> {
     info!("Encoding CIGAR to tracepoints and writing binary format...");
 
@@ -975,15 +803,7 @@ pub fn encode_cigar_to_binary(
         }
     }
 
-    if use_training {
-        let (pos_codec, score_codec) = train_codecs_from_records(&records)?;
-        info!("Training complete: {} position symbols, {} score symbols",
-              pos_codec.num_symbols(), score_codec.num_symbols());
-        write_binary_adaptive(output_path, &records, &string_table, &pos_codec, &score_codec)?;
-    } else {
-        write_binary_default(output_path, &records, &string_table)?;
-    }
-
+    write_binary(output_path, &records, &string_table)?;
     info!("Encoded {} records ({} unique names)", records.len(), string_table.len());
     Ok(())
 }
@@ -1059,11 +879,7 @@ fn read_record_adaptive<R: Read>(
     let tp_type = TracepointType::from_u8(tp_type_buf[0])?;
     let mut metric_buf = [0u8; 1];
     reader.read_exact(&mut metric_buf)?;
-    let complexity_metric = match metric_buf[0] {
-        0 => ComplexityMetric::EditDistance,
-        1 => ComplexityMetric::DiagonalDistance,
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid metric")),
-    };
+    let complexity_metric = complexity_metric_from_u8(metric_buf[0])?;
     let max_complexity = read_varint(reader)?;
 
     let num_items = read_varint(reader)? as usize;
@@ -1106,31 +922,7 @@ fn read_record_adaptive<R: Read>(
     let num_tags = read_varint(reader)? as usize;
     let mut tags = Vec::with_capacity(num_tags);
     for _ in 0..num_tags {
-        let mut key = [0u8; 2];
-        reader.read_exact(&mut key)?;
-        let mut tag_type = [0u8; 1];
-        reader.read_exact(&mut tag_type)?;
-        let value = match tag_type[0] {
-            b'i' => {
-                let mut buf = [0u8; 8];
-                reader.read_exact(&mut buf)?;
-                TagValue::Int(i64::from_le_bytes(buf))
-            }
-            b'f' => {
-                let mut buf = [0u8; 4];
-                reader.read_exact(&mut buf)?;
-                TagValue::Float(f32::from_le_bytes(buf))
-            }
-            b'Z' => {
-                let len = read_varint(reader)? as usize;
-                let mut buf = vec![0u8; len];
-                reader.read_exact(&mut buf)?;
-                TagValue::String(String::from_utf8(buf)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?)
-            }
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid tag type")),
-        };
-        tags.push(Tag { key, tag_type: tag_type[0], value });
+        tags.push(Tag::read(reader)?);
     }
 
     Ok(AlignmentRecord {
@@ -1143,15 +935,10 @@ fn read_record_adaptive<R: Read>(
 }
 
 /// Compress PAF with tracepoints to binary format
-pub fn compress_paf(input_path: &str, output_path: &str, use_training: bool) -> io::Result<()> {
-    if use_training {
-        compress_paf_adaptive(input_path, output_path)
-    } else {
-        compress_paf_default(input_path, output_path)
-    }
-}
-
-fn compress_paf_default(input_path: &str, output_path: &str) -> io::Result<()> {
+///
+/// Uses delta encoding + varint + zstd compression for optimal balance
+/// of speed and compression ratio on genomic alignment data.
+pub fn compress_paf(input_path: &str, output_path: &str) -> io::Result<()> {
     info!("Compressing PAF with tracepoints to binary format...");
 
     let input: Box<dyn BufRead> = if input_path == "-" {
@@ -1177,121 +964,20 @@ fn compress_paf_default(input_path: &str, output_path: &str) -> io::Result<()> {
         }
     }
 
-    write_binary_default(output_path, &records, &string_table)?;
+    write_binary(output_path, &records, &string_table)?;
     info!("Compressed {} records ({} unique names)", records.len(), string_table.len());
     Ok(())
 }
 
-fn compress_paf_adaptive(input_path: &str, output_path: &str) -> io::Result<()> {
-    info!("Adaptive compression: training phase...");
-
-    let (pos_codec, score_codec) = train_codecs(input_path)?;
-    info!("Training complete: {} position symbols, {} score symbols",
-          pos_codec.num_symbols(), score_codec.num_symbols());
-
-    info!("Encoding phase: compressing with adaptive codecs...");
-
-    let input: Box<dyn BufRead> = if input_path == "-" {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput,
-            "Cannot use stdin with --training (requires two passes)"));
-    } else {
-        Box::new(BufReader::new(File::open(input_path)?))
-    };
-
-    let mut string_table = StringTable::new();
-    let mut records = Vec::new();
-
-    for (line_num, line_result) in input.lines().enumerate() {
-        let line = line_result?;
-        if line.trim().is_empty() || line.starts_with('#') {
-            continue;
-        }
-        match parse_paf_with_tracepoints(&line, &mut string_table) {
-            Ok(record) => records.push(record),
-            Err(e) => {
-                error!("Line {}: {}", line_num + 1, e);
-                return Err(e);
-            }
-        }
-    }
-
-    write_binary_adaptive(output_path, &records, &string_table, &pos_codec, &score_codec)?;
-    info!("Compressed {} records ({} unique names)", records.len(), string_table.len());
-    Ok(())
-}
-
-fn train_codecs(input_path: &str) -> io::Result<(AdaptiveCodec, AdaptiveCodec)> {
-    let input: Box<dyn BufRead> = if input_path == "-" {
-        Box::new(BufReader::new(io::stdin()))
-    } else {
-        Box::new(BufReader::new(File::open(input_path)?))
-    };
-
-    let mut pos_codec = AdaptiveCodec::new();
-    let mut score_codec = AdaptiveCodec::new();
-    let mut string_table = StringTable::new();
-
-    for line_result in input.lines() {
-        let line = line_result?;
-        if line.trim().is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let record = parse_paf_with_tracepoints(&line, &mut string_table)?;
-        match &record.tracepoints {
-            TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
-                if !tps.is_empty() {
-                    let (positions, scores): (Vec<u64>, Vec<u64>) = tps.iter().copied().unzip();
-                    let pos_deltas = delta_encode(&positions);
-                    for &delta in &pos_deltas {
-                        pos_codec.train(delta);
-                    }
-                    for &score in &scores {
-                        score_codec.train(score as i64);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    pos_codec.build();
-    score_codec.build();
-    Ok((pos_codec, score_codec))
-}
-
-fn train_codecs_from_records(records: &[AlignmentRecord]) -> io::Result<(AdaptiveCodec, AdaptiveCodec)> {
-    let mut pos_codec = AdaptiveCodec::new();
-    let mut score_codec = AdaptiveCodec::new();
-
-    for record in records {
-        match &record.tracepoints {
-            TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
-                if !tps.is_empty() {
-                    let (positions, scores): (Vec<u64>, Vec<u64>) = tps.iter().copied().unzip();
-                    let pos_deltas = delta_encode(&positions);
-                    for &delta in &pos_deltas {
-                        pos_codec.train(delta);
-                    }
-                    for &score in &scores {
-                        score_codec.train(score as i64);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    pos_codec.build();
-    score_codec.build();
-    Ok((pos_codec, score_codec))
-}
-
-fn write_binary_default(output_path: &str, records: &[AlignmentRecord], string_table: &StringTable) -> io::Result<()> {
+/// Write records to binary PAF format
+///
+/// Uses delta encoding, varint, and zstd compression for efficient storage.
+fn write_binary(output_path: &str, records: &[AlignmentRecord], string_table: &StringTable) -> io::Result<()> {
     let output = File::create(output_path)?;
     let mut writer = BufWriter::new(output);
 
     let header = BinaryPafHeader {
-        version: 1,  // Default compression
+        version: 1,
         flags: FLAG_COMPRESSED,
         num_records: records.len() as u64,
         num_strings: string_table.len() as u64,
@@ -1302,113 +988,6 @@ fn write_binary_default(output_path: &str, records: &[AlignmentRecord], string_t
         record.write(&mut writer)?;
     }
     string_table.write(&mut writer)?;
-    Ok(())
-}
-
-fn write_binary_adaptive(
-    output_path: &str,
-    records: &[AlignmentRecord],
-    string_table: &StringTable,
-    pos_codec: &AdaptiveCodec,
-    score_codec: &AdaptiveCodec,
-) -> io::Result<()> {
-    let output = File::create(output_path)?;
-    let mut writer = BufWriter::new(output);
-
-    let header = BinaryPafHeader {
-        version: 2,  // Adaptive compression
-        flags: FLAG_COMPRESSED | FLAG_ADAPTIVE,
-        num_records: records.len() as u64,
-        num_strings: string_table.len() as u64,
-    };
-
-    header.write(&mut writer)?;
-    pos_codec.write(&mut writer)?;
-    score_codec.write(&mut writer)?;
-
-    for record in records {
-        write_record_adaptive(&mut writer, record, pos_codec, score_codec)?;
-    }
-
-    string_table.write(&mut writer)?;
-    Ok(())
-}
-
-fn write_record_adaptive<W: Write>(
-    writer: &mut W,
-    record: &AlignmentRecord,
-    pos_codec: &AdaptiveCodec,
-    score_codec: &AdaptiveCodec,
-) -> io::Result<()> {
-    write_varint(writer, record.query_name_id)?;
-    write_varint(writer, record.query_start)?;
-    write_varint(writer, record.query_end)?;
-    writer.write_all(&[record.strand as u8])?;
-    write_varint(writer, record.target_name_id)?;
-    write_varint(writer, record.target_start)?;
-    write_varint(writer, record.target_end)?;
-    write_varint(writer, record.residue_matches)?;
-    write_varint(writer, record.alignment_block_len)?;
-    writer.write_all(&[record.mapping_quality])?;
-    writer.write_all(&[record.tp_type.to_u8()])?;
-    writer.write_all(&[match record.complexity_metric {
-        ComplexityMetric::EditDistance => 0,
-        ComplexityMetric::DiagonalDistance => 1,
-    }])?;
-    write_varint(writer, record.max_complexity)?;
-
-    match &record.tracepoints {
-        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
-            write_varint(writer, tps.len() as u64)?;
-            if !tps.is_empty() {
-                let (positions, scores): (Vec<u64>, Vec<u64>) = tps.iter().copied().unzip();
-                let pos_deltas = delta_encode(&positions);
-
-                let mut pos_bits = BitWriter::new();
-                for &delta in &pos_deltas {
-                    pos_bits.write_bits(pos_codec.encode(delta));
-                }
-                let pos_bytes = pos_bits.finish();
-
-                let mut score_bits = BitWriter::new();
-                for &score in &scores {
-                    score_bits.write_bits(score_codec.encode(score as i64));
-                }
-                let score_bytes = score_bits.finish();
-
-                let pos_compressed = zstd::encode_all(&pos_bytes[..], 3)?;
-                let score_compressed = zstd::encode_all(&score_bytes[..], 3)?;
-
-                write_varint(writer, pos_compressed.len() as u64)?;
-                writer.write_all(&pos_compressed)?;
-                write_varint(writer, score_compressed.len() as u64)?;
-                writer.write_all(&score_compressed)?;
-            }
-        }
-        _ => {
-            return Err(io::Error::new(io::ErrorKind::Unsupported,
-                "Adaptive compression only supports Standard/Fastga tracepoints"));
-        }
-    }
-
-    write_varint(writer, record.tags.len() as u64)?;
-    for tag in &record.tags {
-        write_tag(writer, tag)?;
-    }
-    Ok(())
-}
-
-fn write_tag<W: Write>(writer: &mut W, tag: &Tag) -> io::Result<()> {
-    writer.write_all(&tag.key)?;
-    writer.write_all(&[tag.tag_type])?;
-    match &tag.value {
-        TagValue::Int(v) => writer.write_all(&v.to_le_bytes())?,
-        TagValue::Float(v) => writer.write_all(&v.to_le_bytes())?,
-        TagValue::String(s) => {
-            write_varint(writer, s.len() as u64)?;
-            writer.write_all(s.as_bytes())?;
-        }
-    }
     Ok(())
 }
 
@@ -1505,6 +1084,25 @@ fn parse_u8(s: &str, field: &str) -> io::Result<u8> {
     s.parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid {}: {}", field, s)))
 }
 
+/// Convert ComplexityMetric to u8 for serialization
+#[inline]
+fn complexity_metric_to_u8(metric: &ComplexityMetric) -> u8 {
+    match metric {
+        ComplexityMetric::EditDistance => 0,
+        ComplexityMetric::DiagonalDistance => 1,
+    }
+}
+
+/// Convert u8 to ComplexityMetric for deserialization
+#[inline]
+fn complexity_metric_from_u8(byte: u8) -> io::Result<ComplexityMetric> {
+    match byte {
+        0 => Ok(ComplexityMetric::EditDistance),
+        1 => Ok(ComplexityMetric::DiagonalDistance),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid complexity metric")),
+    }
+}
+
 fn parse_paf_with_cigar(
     line: &str,
     string_table: &mut StringTable,
@@ -1582,11 +1180,21 @@ fn parse_paf_with_cigar(
     };
 
     Ok(AlignmentRecord {
-        query_name_id, query_start, query_end, strand,
-        target_name_id, target_start, target_end,
-        residue_matches, alignment_block_len, mapping_quality,
-        tp_type: tp_type_enum, complexity_metric: *complexity_metric,
-        max_complexity: max_complexity as u64, tracepoints, tags,
+        query_name_id,
+        query_start,
+        query_end,
+        strand,
+        target_name_id,
+        target_start,
+        target_end,
+        residue_matches,
+        alignment_block_len,
+        mapping_quality,
+        tp_type: tp_type_enum,
+        complexity_metric: *complexity_metric,
+        max_complexity: max_complexity as u64,
+        tracepoints,
+        tags,
     })
 }
 
@@ -1624,12 +1232,21 @@ fn parse_paf_with_tracepoints(line: &str, string_table: &mut StringTable) -> io:
     let (tracepoints, tp_type) = parse_tracepoints_auto(tp_str)?;
 
     Ok(AlignmentRecord {
-        query_name_id, query_start, query_end, strand,
-        target_name_id, target_start, target_end,
-        residue_matches, alignment_block_len, mapping_quality,
-        tp_type, complexity_metric: ComplexityMetric::EditDistance,
+        query_name_id,
+        query_start,
+        query_end,
+        strand,
+        target_name_id,
+        target_start,
+        target_end,
+        residue_matches,
+        alignment_block_len,
+        mapping_quality,
+        tp_type,
+        complexity_metric: ComplexityMetric::EditDistance,
         max_complexity: 100,
-        tracepoints, tags,
+        tracepoints,
+        tags,
     })
 }
 
@@ -2058,11 +1675,7 @@ impl BpafReader {
 
             let mut metric_buf = [0u8; 1];
             self.file.read_exact(&mut metric_buf)?;
-            let complexity_metric = match metric_buf[0] {
-                0 => ComplexityMetric::EditDistance,
-                1 => ComplexityMetric::DiagonalDistance,
-                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid metric")),
-            };
+            let complexity_metric = complexity_metric_from_u8(metric_buf[0])?;
 
             let max_complexity = read_varint(&mut self.file)?;
 
