@@ -10,9 +10,10 @@
 /// - Varint encoding: variable-length integer encoding
 /// - Zstd level 3: fast compression with good ratios
 
+use flate2::read::MultiGzDecoder;
 use lib_tracepoints::{
     cigar_to_mixed_tracepoints, cigar_to_tracepoints, cigar_to_tracepoints_fastga,
-    cigar_to_variable_tracepoints, ComplexityMetric, MixedRepresentation,
+    cigar_to_variable_tracepoints, ComplexityMetric, MixedRepresentation, TracepointType,
 };
 use log::{error, info};
 use std::cmp::Ordering;
@@ -367,35 +368,6 @@ impl StringTable {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TracepointType {
-    Standard,
-    Mixed,
-    Variable,
-    Fastga,
-}
-
-impl TracepointType {
-    fn to_u8(self) -> u8 {
-        match self {
-            Self::Standard => 0,
-            Self::Mixed => 1,
-            Self::Variable => 2,
-            Self::Fastga => 3,
-        }
-    }
-
-    fn from_u8(v: u8) -> io::Result<Self> {
-        match v {
-            0 => Ok(Self::Standard),
-            1 => Ok(Self::Mixed),
-            2 => Ok(Self::Variable),
-            3 => Ok(Self::Fastga),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid tracepoint type")),
-        }
-    }
-}
-
 pub struct AlignmentRecord {
     pub query_name_id: u64,
     pub query_start: u64,
@@ -581,7 +553,8 @@ impl AlignmentRecord {
         let mapping_quality = mapq_buf[0];
         let mut tp_type_buf = [0u8; 1];
         reader.read_exact(&mut tp_type_buf)?;
-        let tp_type = TracepointType::from_u8(tp_type_buf[0])?;
+        let tp_type = TracepointType::from_u8(tp_type_buf[0])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut metric_buf = [0u8; 1];
         reader.read_exact(&mut metric_buf)?;
         let complexity_metric = complexity_metric_from_u8(metric_buf[0])?;
@@ -746,27 +719,21 @@ pub fn is_binary_paf(path: &str) -> io::Result<bool> {
     }
 }
 
-/// Tracepoint representation type
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TpType {
-    /// Standard tracepoints
-    Standard,
-    /// Mixed representation (preserves S/H/P/N CIGAR operations)
-    Mixed,
-    /// Variable tracepoints representation
-    Variable,
-    /// FastGA tracepoints representation
-    Fastga,
-}
-
-impl std::fmt::Display for TpType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TpType::Standard => write!(f, "standard"),
-            TpType::Mixed => write!(f, "mixed"),
-            TpType::Variable => write!(f, "variable"),
-            TpType::Fastga => write!(f, "fastga"),
-        }
+/// Open PAF file for reading, supporting plain text, gzip, and bgzip formats
+///
+/// Handles three input types:
+/// - `-`: Read from stdin
+/// - `.gz` or `.bgz` files: Decompress with gzip decoder
+/// - Plain text: Read directly
+fn open_paf_reader(input_path: &str) -> io::Result<Box<dyn BufRead>> {
+    if input_path == "-" {
+        Ok(Box::new(BufReader::new(io::stdin())))
+    } else if input_path.ends_with(".gz") || input_path.ends_with(".bgz") {
+        let file = File::open(input_path)?;
+        let decoder = MultiGzDecoder::new(file);
+        Ok(Box::new(BufReader::new(decoder)))
+    } else {
+        Ok(Box::new(BufReader::new(File::open(input_path)?)))
     }
 }
 
@@ -774,18 +741,13 @@ impl std::fmt::Display for TpType {
 pub fn encode_cigar_to_binary(
     input_path: &str,
     output_path: &str,
-    tp_type: &TpType,
+    tp_type: &TracepointType,
     max_complexity: usize,
     complexity_metric: &ComplexityMetric,
 ) -> io::Result<()> {
     info!("Encoding CIGAR to tracepoints and writing binary format...");
 
-    let input: Box<dyn BufRead> = if input_path == "-" {
-        Box::new(BufReader::new(io::stdin()))
-    } else {
-        Box::new(BufReader::new(File::open(input_path)?))
-    };
-
+    let input = open_paf_reader(input_path)?;
     let mut string_table = StringTable::new();
     let mut records = Vec::new();
 
@@ -876,7 +838,8 @@ fn read_record_adaptive<R: Read>(
     let mapping_quality = mapq_buf[0];
     let mut tp_type_buf = [0u8; 1];
     reader.read_exact(&mut tp_type_buf)?;
-    let tp_type = TracepointType::from_u8(tp_type_buf[0])?;
+    let tp_type = TracepointType::from_u8(tp_type_buf[0])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let mut metric_buf = [0u8; 1];
     reader.read_exact(&mut metric_buf)?;
     let complexity_metric = complexity_metric_from_u8(metric_buf[0])?;
@@ -941,12 +904,7 @@ fn read_record_adaptive<R: Read>(
 pub fn compress_paf(input_path: &str, output_path: &str) -> io::Result<()> {
     info!("Compressing PAF with tracepoints to binary format...");
 
-    let input: Box<dyn BufRead> = if input_path == "-" {
-        Box::new(BufReader::new(io::stdin()))
-    } else {
-        Box::new(BufReader::new(File::open(input_path)?))
-    };
-
+    let input = open_paf_reader(input_path)?;
     let mut string_table = StringTable::new();
     let mut records = Vec::new();
 
@@ -1106,7 +1064,7 @@ fn complexity_metric_from_u8(byte: u8) -> io::Result<ComplexityMetric> {
 fn parse_paf_with_cigar(
     line: &str,
     string_table: &mut StringTable,
-    tp_type: &TpType,
+    tp_type: &TracepointType,
     max_complexity: usize,
     complexity_metric: &ComplexityMetric,
 ) -> io::Result<AlignmentRecord> {
@@ -1144,19 +1102,19 @@ fn parse_paf_with_cigar(
     let cigar = cigar.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing cg:Z: tag"))?;
 
     let tracepoints = match tp_type {
-        TpType::Standard => {
+        TracepointType::Standard => {
             let tps = cigar_to_tracepoints(cigar, max_complexity, *complexity_metric);
             TracepointData::Standard(tps.into_iter().map(|(a, b)| (a as u64, b as u64)).collect())
         }
-        TpType::Mixed => {
+        TracepointType::Mixed => {
             let tps = cigar_to_mixed_tracepoints(cigar, max_complexity, *complexity_metric);
             TracepointData::Mixed(tps.iter().map(|item| MixedTracepointItem::from(item)).collect())
         }
-        TpType::Variable => {
+        TracepointType::Variable => {
             let tps = cigar_to_variable_tracepoints(cigar, max_complexity, *complexity_metric);
             TracepointData::Variable(tps.into_iter().map(|(a, b_opt)| (a as u64, b_opt.map(|b| b as u64))).collect())
         }
-        TpType::Fastga => {
+        TracepointType::Fastga => {
             let complement = strand == '-';
             let segments = cigar_to_tracepoints_fastga(
                 cigar, max_complexity,
@@ -1172,12 +1130,7 @@ fn parse_paf_with_cigar(
         }
     };
 
-    let tp_type_enum = match tp_type {
-        TpType::Standard => TracepointType::Standard,
-        TpType::Mixed => TracepointType::Mixed,
-        TpType::Variable => TracepointType::Variable,
-        TpType::Fastga => TracepointType::Fastga,
-    };
+    let tp_type_enum = *tp_type;
 
     Ok(AlignmentRecord {
         query_name_id,
@@ -1671,7 +1624,8 @@ impl BpafReader {
             // Read only what we need
             let mut tp_type_buf = [0u8; 1];
             self.file.read_exact(&mut tp_type_buf)?;
-            let tp_type = TracepointType::from_u8(tp_type_buf[0])?;
+            let tp_type = TracepointType::from_u8(tp_type_buf[0])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
             let mut metric_buf = [0u8; 1];
             self.file.read_exact(&mut metric_buf)?;
