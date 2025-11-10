@@ -207,6 +207,7 @@ pub struct BinaryPafHeader {
     flags: u8,
     num_records: u64,
     num_strings: u64,
+    string_table_offset: u64,
 }
 
 impl BinaryPafHeader {
@@ -217,6 +218,7 @@ impl BinaryPafHeader {
         strategy: CompressionStrategy,
         use_delta_first: bool,
         use_delta_second: bool,
+        string_table_offset: u64,
     ) -> Self {
         let mut flags = strategy.to_code() & 0x07; // Strategy in bits 0-2
         if matches!(strategy, CompressionStrategy::Automatic(_)) {
@@ -232,6 +234,7 @@ impl BinaryPafHeader {
             flags,
             num_records,
             num_strings,
+            string_table_offset,
         }
     }
 
@@ -255,6 +258,7 @@ impl BinaryPafHeader {
         writer.write_all(&[self.version, self.flags])?;
         write_varint(writer, self.num_records)?;
         write_varint(writer, self.num_strings)?;
+        writer.write_all(&self.string_table_offset.to_le_bytes())?; // Fixed-size u64
         Ok(())
     }
 
@@ -266,17 +270,22 @@ impl BinaryPafHeader {
         }
         let mut ver_flags = [0u8; 2];
         reader.read_exact(&mut ver_flags)?;
+        let num_records = read_varint(reader)?;
+        let num_strings = read_varint(reader)?;
+        let mut offset_bytes = [0u8; 8];
+        reader.read_exact(&mut offset_bytes)?;
         Ok(Self {
             version: ver_flags[0],
             flags: ver_flags[1],
-            num_records: read_varint(reader)?,
-            num_strings: read_varint(reader)?,
+            num_records,
+            num_strings,
+            string_table_offset: u64::from_le_bytes(offset_bytes),
         })
     }
 }
 
 /// String table for deduplicating sequence names
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct StringTable {
     strings: Vec<String>,
     lengths: Vec<u64>,
@@ -1119,37 +1128,57 @@ pub fn decompress_paf(input_path: &str, output_path: &str) -> io::Result<()> {
     decompress_varint(reader, output_path, &header, strategy)
 }
 
-/// Decompress varint-encoded records
-fn decompress_varint<R: Read>(
+/// Decompress varint-encoded records (streaming with direct seek)
+fn decompress_varint<R: Read + Seek>(
     mut reader: R,
     output_path: &str,
     header: &BinaryPafHeader,
     strategy: CompressionStrategy,
 ) -> io::Result<()> {
-    let mut records = Vec::with_capacity(header.num_records as usize);
+    // Remember position after header for later
+    let records_start = reader.stream_position()?;
+
+    // Seek directly to string table using offset from header
+    reader.seek(std::io::SeekFrom::Start(header.string_table_offset))?;
+    let string_table = StringTable::read(&mut reader)?;
+
+    // Seek back to start of records
+    reader.seek(std::io::SeekFrom::Start(records_start))?;
+
+    // Stream write records
+    let output: Box<dyn Write> = if output_path == "-" {
+        Box::new(io::stdout())
+    } else {
+        Box::new(File::create(output_path).map_err(|e| {
+            io::Error::new(e.kind(), format!("Failed to create output file '{}': {}", output_path, e))
+        })?)
+    };
+    let mut writer = BufWriter::new(output);
 
     match strategy {
         CompressionStrategy::Automatic(_) => {
             let use_delta_first = header.use_delta_first();
             let use_delta_second = header.use_delta_second();
             for _ in 0..header.num_records {
-                records.push(read_record_automatic(&mut reader, use_delta_first, use_delta_second)?);
+                let record = read_record_automatic(&mut reader, use_delta_first, use_delta_second)?;
+                write_paf_line(&mut writer, &record, &string_table)?;
             }
         }
         CompressionStrategy::VarintZstd(_) => {
             for _ in 0..header.num_records {
-                records.push(read_record_varint(&mut reader, false)?);
+                let record = read_record_varint(&mut reader, false)?;
+                write_paf_line(&mut writer, &record, &string_table)?;
             }
         }
         CompressionStrategy::DeltaVarintZstd(_) => {
             for _ in 0..header.num_records {
-                records.push(AlignmentRecord::read(&mut reader)?);
+                let record = AlignmentRecord::read(&mut reader)?;
+                write_paf_line(&mut writer, &record, &string_table)?;
             }
         }
     }
+    writer.flush()?;
 
-    let string_table = StringTable::read(&mut reader)?;
-    write_paf_output(output_path, &records, &string_table)?;
     info!("Decompressed {} records", header.num_records);
     Ok(())
 }
@@ -1394,32 +1423,65 @@ fn read_tracepoints_automatic<R: Read>(
 pub fn compress_paf(input_path: &str, output_path: &str, strategy: CompressionStrategy) -> io::Result<()> {
     info!("Compressing PAF with {} strategy...", strategy);
 
-    let input = open_paf_reader(input_path)?;
+    // Pass 1: Build string table + collect sample for analysis
     let mut string_table = StringTable::new();
-    let mut records = Vec::new();
+    let mut sample = Vec::new();
+    let mut record_count = 0u64;
 
+    let input = open_paf_reader(input_path)?;
     for (line_num, line_result) in input.lines().enumerate() {
         let line = line_result?;
-        if line.trim().is_empty() || line.starts_with('#') {
-            continue;
-        }
-        match parse_paf_with_tracepoints(&line, &mut string_table) {
-            Ok(record) => records.push(record),
-            Err(e) => {
-                error!("Line {}: {}", line_num + 1, e);
-                return Err(e);
-            }
-        }
+        if line.trim().is_empty() || line.starts_with('#') { continue; }
+
+        let record = parse_paf_with_tracepoints(&line, &mut string_table)
+            .map_err(|e| { error!("Line {}: {}", line_num + 1, e); e })?;
+
+        if sample.len() < 1000 { sample.push(record); }
+        record_count += 1;
     }
 
-    write_binary(output_path, &records, &string_table, strategy)?;
+    // Analyze sample for Automatic mode
+    let (use_delta_first, use_delta_second) = match strategy {
+        CompressionStrategy::Automatic(_) => analyze_smart_light_compression(&sample),
+        _ => (false, false),
+    };
 
-    info!(
-        "Compressed {} records ({} unique names) with {} strategy",
-        records.len(),
-        string_table.len(),
-        strategy
-    );
+    // Pass 2: Stream write records with string table offset tracking
+    let mut output = File::create(output_path).map_err(|e| {
+        io::Error::new(e.kind(), format!("Failed to create output file '{}': {}", output_path, e))
+    })?;
+
+    // Write header with placeholder offset
+    let header = BinaryPafHeader::new(record_count, string_table.len() as u64, strategy, use_delta_first, use_delta_second, 0);
+    header.write(&mut output)?;
+
+    let string_table_offset = {
+        let mut writer = BufWriter::new(&mut output);
+        let input = open_paf_reader(input_path)?;
+        let mut temp_table = string_table.clone();
+        for line_result in input.lines() {
+            let line = line_result?;
+            if line.trim().is_empty() || line.starts_with('#') { continue; }
+
+            let record = parse_paf_with_tracepoints(&line, &mut temp_table)?;
+            match strategy {
+                CompressionStrategy::Automatic(_) => record.write_automatic(&mut writer, use_delta_first, use_delta_second, strategy)?,
+                CompressionStrategy::VarintZstd(_) => record.write(&mut writer, false, strategy)?,
+                CompressionStrategy::DeltaVarintZstd(_) => record.write(&mut writer, true, strategy)?,
+            }
+        }
+        writer.flush()?;
+        drop(writer);
+        output.stream_position()?
+    };
+
+    string_table.write(&mut output)?;
+
+    // Update header with actual offset
+    output.seek(std::io::SeekFrom::Start(0))?;
+    let header = BinaryPafHeader::new(record_count, string_table.len() as u64, strategy, use_delta_first, use_delta_second, string_table_offset);
+    header.write(&mut output)?;
+    info!("Compressed {} records ({} unique names) with {} strategy", record_count, string_table.len(), strategy);
     Ok(())
 }
 
@@ -1430,13 +1492,12 @@ fn write_binary(
     string_table: &StringTable,
     strategy: CompressionStrategy,
 ) -> io::Result<()> {
-    let output = File::create(output_path).map_err(|e| {
+    let mut output = File::create(output_path).map_err(|e| {
         io::Error::new(
             e.kind(),
             format!("Failed to create output file '{}': {}", output_path, e),
         )
     })?;
-    let mut writer = BufWriter::new(output);
 
     // Analyze data for Automatic mode
     let (use_delta_first, use_delta_second) = match strategy {
@@ -1444,33 +1505,55 @@ fn write_binary(
         _ => (false, false),
     };
 
+    // Write header with placeholder offset
     let header = BinaryPafHeader::new(
         records.len() as u64,
         string_table.len() as u64,
         strategy,
         use_delta_first,
         use_delta_second,
+        0,
     );
+    header.write(&mut output)?;
 
-    header.write(&mut writer)?;
-    match strategy {
-        CompressionStrategy::Automatic(_) => {
-            for record in records {
-                record.write_automatic(&mut writer, use_delta_first, use_delta_second, strategy)?;
+    let string_table_offset = {
+        let mut writer = BufWriter::new(&mut output);
+        match strategy {
+            CompressionStrategy::Automatic(_) => {
+                for record in records {
+                    record.write_automatic(&mut writer, use_delta_first, use_delta_second, strategy)?;
+                }
+            }
+            CompressionStrategy::VarintZstd(_) => {
+                for record in records {
+                    record.write(&mut writer, false, strategy)?;
+                }
+            }
+            CompressionStrategy::DeltaVarintZstd(_) => {
+                for record in records {
+                    record.write(&mut writer, true, strategy)?;
+                }
             }
         }
-        CompressionStrategy::VarintZstd(_) => {
-            for record in records {
-                record.write(&mut writer, false, strategy)?;
-            }
-        }
-        CompressionStrategy::DeltaVarintZstd(_) => {
-            for record in records {
-                record.write(&mut writer, true, strategy)?;
-            }
-        }
-    }
-    string_table.write(&mut writer)?;
+        writer.flush()?;
+        drop(writer);
+        output.stream_position()?
+    };
+
+    string_table.write(&mut output)?;
+
+    // Update header with actual offset
+    output.seek(std::io::SeekFrom::Start(0))?;
+    let header = BinaryPafHeader::new(
+        records.len() as u64,
+        string_table.len() as u64,
+        strategy,
+        use_delta_first,
+        use_delta_second,
+        string_table_offset,
+    );
+    header.write(&mut output)?;
+
     Ok(())
 }
 
