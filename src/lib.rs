@@ -171,6 +171,7 @@ fn write_varint<W: Write>(writer: &mut W, value: u64) -> io::Result<usize> {
 }
 
 /// Read a varint from a reader
+#[inline]
 fn read_varint<R: Read>(reader: &mut R) -> io::Result<u64> {
     let mut value: u64 = 0;
     let mut shift = 0;
@@ -207,7 +208,6 @@ pub struct BinaryPafHeader {
     flags: u8,
     num_records: u64,
     num_strings: u64,
-    string_table_offset: u64,
     tracepoint_type: TracepointType,
     complexity_metric: ComplexityMetric,
     max_complexity: u64,
@@ -221,7 +221,6 @@ impl BinaryPafHeader {
         strategy: CompressionStrategy,
         use_delta_first: bool,
         use_delta_second: bool,
-        string_table_offset: u64,
         tracepoint_type: TracepointType,
         complexity_metric: ComplexityMetric,
         max_complexity: u64,
@@ -240,7 +239,6 @@ impl BinaryPafHeader {
             flags,
             num_records,
             num_strings,
-            string_table_offset,
             tracepoint_type,
             complexity_metric,
             max_complexity,
@@ -267,7 +265,6 @@ impl BinaryPafHeader {
         writer.write_all(&[self.version, self.flags])?;
         write_varint(writer, self.num_records)?;
         write_varint(writer, self.num_strings)?;
-        writer.write_all(&self.string_table_offset.to_le_bytes())?; // Fixed-size u64
         writer.write_all(&[self.tracepoint_type.to_u8()])?;
         writer.write_all(&[complexity_metric_to_u8(&self.complexity_metric)])?;
         write_varint(writer, self.max_complexity)?;
@@ -287,9 +284,6 @@ impl BinaryPafHeader {
 
         let num_records = read_varint(reader)?;
         let num_strings = read_varint(reader)?;
-        let mut offset_bytes = [0u8; 8];
-        reader.read_exact(&mut offset_bytes)?;
-        let string_table_offset = u64::from_le_bytes(offset_bytes);
 
         // Read tracepoint metadata from header
         let mut tp_type_buf = [0u8; 1];
@@ -308,7 +302,6 @@ impl BinaryPafHeader {
             flags,
             num_records,
             num_strings,
-            string_table_offset,
             tracepoint_type,
             complexity_metric,
             max_complexity,
@@ -1152,21 +1145,14 @@ pub fn decompress_paf(input_path: &str, output_path: &str) -> io::Result<()> {
 }
 
 /// Decompress varint-encoded records (streaming with direct seek)
-fn decompress_varint<R: Read + Seek>(
+fn decompress_varint<R: Read>(
     mut reader: R,
     output_path: &str,
     header: &BinaryPafHeader,
     strategy: CompressionStrategy,
 ) -> io::Result<()> {
-    // Remember position after header for later
-    let records_start = reader.stream_position()?;
-
-    // Seek directly to string table using offset from header
-    reader.seek(std::io::SeekFrom::Start(header.string_table_offset))?;
+    // Read string table
     let string_table = StringTable::read(&mut reader)?;
-
-    // Seek back to start of records
-    reader.seek(std::io::SeekFrom::Start(records_start))?;
 
     // Stream write records
     let output: Box<dyn Write> = if output_path == "-" {
@@ -1485,41 +1471,35 @@ pub fn compress_paf(input_path: &str, output_path: &str, strategy: CompressionSt
         _ => (false, false),
     };
 
-    // Pass 2: Stream write records with string table offset tracking
+    // Pass 2: Stream write - Header → StringTable → Records
     let mut output = File::create(output_path).map_err(|e| {
         io::Error::new(e.kind(), format!("Failed to create output file '{}': {}", output_path, e))
     })?;
 
-    // Write header with placeholder offset
-    let header = BinaryPafHeader::new(record_count, string_table.len() as u64, strategy, use_delta_first, use_delta_second, 0, tp_type, complexity_metric, max_complexity);
+    // Write header
+    let header = BinaryPafHeader::new(record_count, string_table.len() as u64, strategy, use_delta_first, use_delta_second, tp_type, complexity_metric, max_complexity);
     header.write(&mut output)?;
 
-    let string_table_offset = {
-        let mut writer = BufWriter::new(&mut output);
-        let input = open_paf_reader(input_path)?;
-        let mut temp_table = string_table.clone();
-        for line_result in input.lines() {
-            let line = line_result?;
-            if line.trim().is_empty() || line.starts_with('#') { continue; }
-
-            let record = parse_paf_with_tracepoints(&line, &mut temp_table)?;
-            match strategy {
-                CompressionStrategy::Automatic(_) => record.write_automatic(&mut writer, use_delta_first, use_delta_second, strategy)?,
-                CompressionStrategy::VarintZstd(_) => record.write(&mut writer, false, strategy)?,
-                CompressionStrategy::DeltaVarintZstd(_) => record.write(&mut writer, true, strategy)?,
-            }
-        }
-        writer.flush()?;
-        drop(writer);
-        output.stream_position()?
-    };
-
+    // Write string table
     string_table.write(&mut output)?;
 
-    // Update header with actual offset
-    output.seek(std::io::SeekFrom::Start(0))?;
-    let header = BinaryPafHeader::new(record_count, string_table.len() as u64, strategy, use_delta_first, use_delta_second, string_table_offset, tp_type, complexity_metric, max_complexity);
-    header.write(&mut output)?;
+    // Write records
+    let mut writer = BufWriter::new(&mut output);
+    let input = open_paf_reader(input_path)?;
+    let mut temp_table = string_table.clone();
+    for line_result in input.lines() {
+        let line = line_result?;
+        if line.trim().is_empty() || line.starts_with('#') { continue; }
+
+        let record = parse_paf_with_tracepoints(&line, &mut temp_table)?;
+        match strategy {
+            CompressionStrategy::Automatic(_) => record.write_automatic(&mut writer, use_delta_first, use_delta_second, strategy)?,
+            CompressionStrategy::VarintZstd(_) => record.write(&mut writer, false, strategy)?,
+            CompressionStrategy::DeltaVarintZstd(_) => record.write(&mut writer, true, strategy)?,
+        }
+    }
+    writer.flush()?;
+
     info!("Compressed {} records ({} unique names) with {} strategy", record_count, string_table.len(), strategy);
     Ok(())
 }
@@ -1552,60 +1532,42 @@ fn write_binary(
         _ => (false, false),
     };
 
-    // Write header with placeholder offset
+    // Write header
     let header = BinaryPafHeader::new(
         records.len() as u64,
         string_table.len() as u64,
         strategy,
         use_delta_first,
         use_delta_second,
-        0,
         tp_type,
         complexity_metric,
         max_complexity,
     );
     header.write(&mut output)?;
 
-    let string_table_offset = {
-        let mut writer = BufWriter::new(&mut output);
-        match strategy {
-            CompressionStrategy::Automatic(_) => {
-                for record in records {
-                    record.write_automatic(&mut writer, use_delta_first, use_delta_second, strategy)?;
-                }
-            }
-            CompressionStrategy::VarintZstd(_) => {
-                for record in records {
-                    record.write(&mut writer, false, strategy)?;
-                }
-            }
-            CompressionStrategy::DeltaVarintZstd(_) => {
-                for record in records {
-                    record.write(&mut writer, true, strategy)?;
-                }
-            }
-        }
-        writer.flush()?;
-        drop(writer);
-        output.stream_position()?
-    };
-
+    // Write string table
     string_table.write(&mut output)?;
 
-    // Update header with actual offset
-    output.seek(std::io::SeekFrom::Start(0))?;
-    let header = BinaryPafHeader::new(
-        records.len() as u64,
-        string_table.len() as u64,
-        strategy,
-        use_delta_first,
-        use_delta_second,
-        string_table_offset,
-        tp_type,
-        complexity_metric,
-        max_complexity,
-    );
-    header.write(&mut output)?;
+    // Write records
+    let mut writer = BufWriter::new(&mut output);
+    match strategy {
+        CompressionStrategy::Automatic(_) => {
+            for record in records {
+                record.write_automatic(&mut writer, use_delta_first, use_delta_second, strategy)?;
+            }
+        }
+        CompressionStrategy::VarintZstd(_) => {
+            for record in records {
+                record.write(&mut writer, false, strategy)?;
+            }
+        }
+        CompressionStrategy::DeltaVarintZstd(_) => {
+            for record in records {
+                record.write(&mut writer, true, strategy)?;
+            }
+        }
+    }
+    writer.flush()?;
 
     Ok(())
 }
@@ -2095,20 +2057,20 @@ impl BpafIndex {
     }
 }
 
-/// Build index by scanning through BPAF file
+/// Build index by scanning through BPAF file (for existing files without .idx)
 pub fn build_index(bpaf_path: &str) -> io::Result<BpafIndex> {
     info!("Building index for {}", bpaf_path);
 
-    let mut file = File::open(bpaf_path)?;
-    let header = BinaryPafHeader::read(&mut file)?;
+    let file = File::open(bpaf_path)?;
+    let mut reader = BufReader::with_capacity(131072, file); // 128KB buffer)
+
+    let header = BinaryPafHeader::read(&mut reader)?;
+    StringTable::read(&mut reader)?; // Read string table to advance past it
 
     let mut offsets = Vec::with_capacity(header.num_records as usize);
-
-
-    // Record offset of each record
     for _ in 0..header.num_records {
-        offsets.push(file.stream_position()?);
-        skip_record(&mut file, false)?;
+        offsets.push(reader.stream_position()?);
+        skip_record(&mut reader, false)?;
     }
 
     info!("Index built: {} records", offsets.len());
@@ -2116,6 +2078,7 @@ pub fn build_index(bpaf_path: &str) -> io::Result<BpafIndex> {
 }
 
 /// Skip a record without parsing (for building index)
+#[inline]
 fn skip_record<R: Read + Seek>(reader: &mut R, _is_adaptive: bool) -> io::Result<()> {
     // Skip core PAF fields (varints)
     read_varint(reader)?; // query_name_id
@@ -2240,14 +2203,9 @@ impl BpafReader {
             return Ok(()); // Already loaded
         }
 
-        // Seek to string table (at end of file, after all records)
-        if !self.index.offsets.is_empty() {
-            self.file.seek(SeekFrom::Start(
-                self.index.offsets[self.index.offsets.len() - 1],
-            ))?;
-            skip_record(&mut self.file, false)?;
-        }
-
+        // Seek to string table (immediately after header at start of file)
+        self.file.seek(SeekFrom::Start(0))?;
+        BinaryPafHeader::read(&mut self.file)?; // Skip header
         self.string_table = StringTable::read(&mut self.file)?;
         Ok(())
     }
