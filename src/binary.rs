@@ -1848,28 +1848,40 @@ impl BpafReader {
             ));
         }
 
-        let offset = self.index.offsets[record_id as usize];
-        self.get_tracepoints_at_offset(offset)
+        let tracepoint_offset = self.get_tracepoint_offset(record_id)?;
+        self.get_tracepoints_at_offset(tracepoint_offset)
     }
 
-    /// Get tracepoints by file offset (for impg compatibility)
+    /// Get tracepoint offset for a specific record ID
+    /// Returns the byte offset where tracepoint data starts within the record
+    /// Use this to build external indexes that store tracepoint offsets for fastest access
+    pub fn get_tracepoint_offset(&mut self, record_id: u64) -> io::Result<u64> {
+        let record_offset = self.index.offsets[record_id as usize];
+        self.file.seek(SeekFrom::Start(record_offset))?;
+
+        // Skip 7 varints + 2 single bytes to reach tracepoint data
+        read_varint(&mut self.file)?; // query_name_id
+        read_varint(&mut self.file)?; // query_start
+        read_varint(&mut self.file)?; // query_end
+        self.file.seek(SeekFrom::Current(1))?; // strand
+        read_varint(&mut self.file)?; // target_name_id
+        read_varint(&mut self.file)?; // target_start
+        read_varint(&mut self.file)?; // target_end
+        read_varint(&mut self.file)?; // residue_matches
+        read_varint(&mut self.file)?; // alignment_block_len
+        self.file.seek(SeekFrom::Current(1))?; // mapping_quality
+
+        self.file.stream_position()
+    }
+
+    /// Get tracepoints by tracepoint offset (fastest access)
+    /// Seeks directly to tracepoint data within a record
+    /// Use this when your external index stores tracepoint offsets for O(1) access
     pub fn get_tracepoints_at_offset(
         &mut self,
-        offset: u64,
+        tracepoint_offset: u64,
     ) -> io::Result<(TracepointData, TracepointType, ComplexityMetric, u64)> {
-        self.file.seek(SeekFrom::Start(offset))?;
-
-        // Skip core PAF fields
-        read_varint(&mut self.file)?;
-        read_varint(&mut self.file)?;
-        read_varint(&mut self.file)?;
-        self.file.seek(SeekFrom::Current(1))?;
-        read_varint(&mut self.file)?;
-        read_varint(&mut self.file)?;
-        read_varint(&mut self.file)?;
-        read_varint(&mut self.file)?;
-        read_varint(&mut self.file)?;
-        self.file.seek(SeekFrom::Current(1))?;
+        self.file.seek(SeekFrom::Start(tracepoint_offset))?;
 
         let tp_type = self.header.tracepoint_type;
         let complexity_metric = self.header.complexity_metric;

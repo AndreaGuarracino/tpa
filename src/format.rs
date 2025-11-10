@@ -6,7 +6,7 @@ use lib_tracepoints::{TracepointType, ComplexityMetric, MixedRepresentation};
 use crate::{Distance, utils::*};
 use crate::binary::{BINARY_MAGIC, complexity_metric_to_u8, complexity_metric_from_u8};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum CompressionStrategy {
     /// Automatic encoding decision + Zstd
     /// - Analyze first 1000 records to decide delta vs raw encoding

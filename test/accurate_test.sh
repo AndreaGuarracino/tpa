@@ -165,11 +165,28 @@ rustc --edition 2021 -O /tmp/seek_test.rs \
     --extern lib_bpaf=target/release/liblib_bpaf.rlib \
     -o /tmp/seek_test 2>/dev/null
 
-# Build O(1) seek test program (without index, using offset-based access)
-cat > /tmp/seek_test_no_index.rs << 'RUST_EOF'
+# Build O(1) seek test program (Mode B - direct tracepoint offset access)
+cat > /tmp/seek_test_tracepoint_offset.rs << 'RUST_EOF'
 use std::env;
 use std::time::Instant;
+use std::io::{Read, Seek, SeekFrom};
 use lib_bpaf::{BpafReader, build_index};
+
+fn read_varint<R: Read>(reader: &mut R) -> std::io::Result<u64> {
+    let mut value: u64 = 0;
+    let mut shift = 0;
+    loop {
+        let mut byte_buf = [0u8; 1];
+        reader.read_exact(&mut byte_buf)?;
+        let byte = byte_buf[0];
+        value |= ((byte & 0x7F) as u64) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    Ok(value)
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -182,14 +199,34 @@ fn main() {
     let record_id: u64 = args[2].parse().expect("Invalid record_id");
     let iterations: usize = args[3].parse().expect("Invalid iterations");
 
-    // Pre-build index to get the offset we need (not timed)
+    // Pre-build index to get record offset (not timed)
     let index = build_index(bpaf_path).expect("Failed to build index");
-    let offset = index.get_offset(record_id).expect("Record ID out of range");
+    let record_offset = index.get_offset(record_id).expect("Record ID out of range");
 
-    // Warmup (open without index, use offset-based access)
+    // Calculate tracepoint offset by skipping PAF fields (not timed)
+    let mut reader = BpafReader::open_without_index(bpaf_path).expect("Failed to open BPAF");
+    let mut file = std::fs::File::open(bpaf_path).expect("Failed to open file");
+    file.seek(SeekFrom::Start(record_offset)).expect("Failed to seek");
+
+    // Skip 7 varints + 2 single bytes to reach tracepoint data
+    read_varint(&mut file).expect("query_name_id");
+    read_varint(&mut file).expect("query_start");
+    read_varint(&mut file).expect("query_end");
+    file.seek(SeekFrom::Current(1)).expect("strand");
+    read_varint(&mut file).expect("target_name_id");
+    read_varint(&mut file).expect("target_start");
+    read_varint(&mut file).expect("target_end");
+    read_varint(&mut file).expect("residue_matches");
+    read_varint(&mut file).expect("alignment_block_len");
+    file.seek(SeekFrom::Current(1)).expect("mapping_quality");
+
+    let tracepoint_offset = file.stream_position().expect("Failed to get position");
+    drop(file);
+
+    // Warmup (open without index, use direct tracepoint offset access)
     for _ in 0..3 {
         let mut reader = BpafReader::open_without_index(bpaf_path).expect("Failed to open BPAF");
-        let _ = reader.get_tracepoints_at_offset(offset).expect("Failed to fetch");
+        let _ = reader.get_tracepoints_at_offset(tracepoint_offset).expect("Failed to fetch");
     }
 
     // Benchmark - measure components separately
@@ -203,9 +240,9 @@ fn main() {
         let open_elapsed = open_start.elapsed().as_micros() as f64;
         total_open_us += open_elapsed;
 
-        // Measure offset seek + decompress
+        // Measure direct tracepoint offset seek + decompress
         let seek_start = Instant::now();
-        let _ = reader.get_tracepoints_at_offset(offset).expect("Failed to fetch");
+        let _ = reader.get_tracepoints_at_offset(tracepoint_offset).expect("Failed to fetch");
         let seek_elapsed = seek_start.elapsed().as_micros() as f64;
         total_seek_us += seek_elapsed;
     }
@@ -216,15 +253,15 @@ fn main() {
 
     println!("Mode B breakdown:");
     println!("  Open (header): {:.2} μs", avg_open_us);
-    println!("  OffsetSeek+Decompress: {:.2} μs", avg_seek_us);
+    println!("  DirectTracepointSeek+Decompress: {:.2} μs", avg_seek_us);
     println!("  Total: {:.2} μs", avg_total_us);
 }
 RUST_EOF
 
-rustc --edition 2021 -O /tmp/seek_test_no_index.rs \
+rustc --edition 2021 -O /tmp/seek_test_tracepoint_offset.rs \
     -L target/release/deps \
     --extern lib_bpaf=target/release/liblib_bpaf.rlib \
-    -o /tmp/seek_test_no_index 2>/dev/null
+    -o /tmp/seek_test_tracepoint_offset 2>/dev/null
 
 echo "✓ Build complete"
 echo
@@ -378,19 +415,19 @@ for POS in "${SEEK_POSITIONS[@]}"; do
 done
 
 echo
-echo "--- Mode B: WITHOUT INDEX ---"
+echo "--- Mode B: DIRECT TRACEPOINT OFFSET ---"
 
 for POS in "${SEEK_POSITIONS[@]}"; do
     if [ $POS -ge $TOTAL_RECORDS ]; then
         continue
     fi
 
-    /usr/bin/time -v /tmp/seek_test_no_index "$OUTPUT_1T" $POS $SEEK_ITERATIONS 2>&1 | tee /tmp/seek_no_index_${POS}.log | grep -E "(Mode B|Open \(header\)|OffsetSeek\+Decompress|Total|Maximum resident)"
+    /usr/bin/time -v /tmp/seek_test_tracepoint_offset "$OUTPUT_1T" $POS $SEEK_ITERATIONS 2>&1 | tee /tmp/seek_tp_offset_${POS}.log | grep -E "(Mode B|Open \(header\)|DirectTracepointSeek\+Decompress|Total|Maximum resident)"
 
-    OPEN_TIME=$(grep "Open (header):" /tmp/seek_no_index_${POS}.log | awk '{print $3}')
-    SEEK_TIME=$(grep "OffsetSeek+Decompress:" /tmp/seek_no_index_${POS}.log | awk '{print $2}')
-    TOTAL_TIME=$(grep "Total:" /tmp/seek_no_index_${POS}.log | awk '{print $2}')
-    SEEK_MEM=$(grep "Maximum resident" /tmp/seek_no_index_${POS}.log | awk '{print $6}')
+    OPEN_TIME=$(grep "Open (header):" /tmp/seek_tp_offset_${POS}.log | awk '{print $3}')
+    SEEK_TIME=$(grep "DirectTracepointSeek+Decompress:" /tmp/seek_tp_offset_${POS}.log | awk '{print $2}')
+    TOTAL_TIME=$(grep "Total:" /tmp/seek_tp_offset_${POS}.log | awk '{print $2}')
+    SEEK_MEM=$(grep "Maximum resident" /tmp/seek_tp_offset_${POS}.log | awk '{print $6}')
 
     printf "Position %6d: Open=%s | Seek=%s | Total=%s μs | Mem=%s KB\n" $POS "$OPEN_TIME" "$SEEK_TIME" "$TOTAL_TIME" "$SEEK_MEM"
 done
