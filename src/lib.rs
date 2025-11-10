@@ -208,6 +208,9 @@ pub struct BinaryPafHeader {
     num_records: u64,
     num_strings: u64,
     string_table_offset: u64,
+    tracepoint_type: TracepointType,
+    complexity_metric: ComplexityMetric,
+    max_complexity: u64,
 }
 
 impl BinaryPafHeader {
@@ -219,6 +222,9 @@ impl BinaryPafHeader {
         use_delta_first: bool,
         use_delta_second: bool,
         string_table_offset: u64,
+        tracepoint_type: TracepointType,
+        complexity_metric: ComplexityMetric,
+        max_complexity: u64,
     ) -> Self {
         let mut flags = strategy.to_code() & 0x07; // Strategy in bits 0-2
         if matches!(strategy, CompressionStrategy::Automatic(_)) {
@@ -235,6 +241,9 @@ impl BinaryPafHeader {
             num_records,
             num_strings,
             string_table_offset,
+            tracepoint_type,
+            complexity_metric,
+            max_complexity,
         }
     }
 
@@ -259,6 +268,9 @@ impl BinaryPafHeader {
         write_varint(writer, self.num_records)?;
         write_varint(writer, self.num_strings)?;
         writer.write_all(&self.string_table_offset.to_le_bytes())?; // Fixed-size u64
+        writer.write_all(&[self.tracepoint_type.to_u8()])?;
+        writer.write_all(&[complexity_metric_to_u8(&self.complexity_metric)])?;
+        write_varint(writer, self.max_complexity)?;
         Ok(())
     }
 
@@ -270,16 +282,36 @@ impl BinaryPafHeader {
         }
         let mut ver_flags = [0u8; 2];
         reader.read_exact(&mut ver_flags)?;
+        let version = ver_flags[0];
+        let flags = ver_flags[1];
+
         let num_records = read_varint(reader)?;
         let num_strings = read_varint(reader)?;
         let mut offset_bytes = [0u8; 8];
         reader.read_exact(&mut offset_bytes)?;
+        let string_table_offset = u64::from_le_bytes(offset_bytes);
+
+        // Read tracepoint metadata from header
+        let mut tp_type_buf = [0u8; 1];
+        reader.read_exact(&mut tp_type_buf)?;
+        let tracepoint_type = TracepointType::from_u8(tp_type_buf[0])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let mut metric_buf = [0u8; 1];
+        reader.read_exact(&mut metric_buf)?;
+        let complexity_metric = complexity_metric_from_u8(metric_buf[0])?;
+
+        let max_complexity = read_varint(reader)?;
+
         Ok(Self {
-            version: ver_flags[0],
-            flags: ver_flags[1],
+            version,
+            flags,
             num_records,
             num_strings,
-            string_table_offset: u64::from_le_bytes(offset_bytes),
+            string_table_offset,
+            tracepoint_type,
+            complexity_metric,
+            max_complexity,
         })
     }
 }
@@ -543,9 +575,6 @@ impl AlignmentRecord {
         write_varint(writer, self.residue_matches)?;
         write_varint(writer, self.alignment_block_len)?;
         writer.write_all(&[self.mapping_quality])?;
-        writer.write_all(&[self.tp_type.to_u8()])?;
-        writer.write_all(&[complexity_metric_to_u8(&self.complexity_metric)])?;
-        write_varint(writer, self.max_complexity)?;
         if use_delta {
             self.write_tracepoints(writer, strategy)?;
         } else {
@@ -575,9 +604,6 @@ impl AlignmentRecord {
         write_varint(writer, self.residue_matches)?;
         write_varint(writer, self.alignment_block_len)?;
         writer.write_all(&[self.mapping_quality])?;
-        writer.write_all(&[self.tp_type.to_u8()])?;
-        writer.write_all(&[complexity_metric_to_u8(&self.complexity_metric)])?;
-        write_varint(writer, self.max_complexity)?;
         self.write_tracepoints_automatic(writer, use_delta_first, use_delta_second, strategy)?;
         write_varint(writer, self.tags.len() as u64)?;
         for tag in &self.tags {
@@ -804,7 +830,12 @@ impl AlignmentRecord {
         Ok(())
     }
 
-    fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
+    fn read<R: Read>(
+        reader: &mut R,
+        tp_type: TracepointType,
+        complexity_metric: ComplexityMetric,
+        max_complexity: u64,
+    ) -> io::Result<Self> {
         let query_name_id = read_varint(reader)?;
         let query_start = read_varint(reader)?;
         let query_end = read_varint(reader)?;
@@ -819,14 +850,6 @@ impl AlignmentRecord {
         let mut mapq_buf = [0u8; 1];
         reader.read_exact(&mut mapq_buf)?;
         let mapping_quality = mapq_buf[0];
-        let mut tp_type_buf = [0u8; 1];
-        reader.read_exact(&mut tp_type_buf)?;
-        let tp_type = TracepointType::from_u8(tp_type_buf[0])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let mut metric_buf = [0u8; 1];
-        reader.read_exact(&mut metric_buf)?;
-        let complexity_metric = complexity_metric_from_u8(metric_buf[0])?;
-        let max_complexity = read_varint(reader)?;
         let tracepoints = Self::read_tracepoints(reader, tp_type)?;
         let num_tags = read_varint(reader)? as usize;
         let mut tags = Vec::with_capacity(num_tags);
@@ -1160,19 +1183,37 @@ fn decompress_varint<R: Read + Seek>(
             let use_delta_first = header.use_delta_first();
             let use_delta_second = header.use_delta_second();
             for _ in 0..header.num_records {
-                let record = read_record_automatic(&mut reader, use_delta_first, use_delta_second)?;
+                let record = read_record_automatic(
+                    &mut reader,
+                    use_delta_first,
+                    use_delta_second,
+                    header.tracepoint_type,
+                    header.complexity_metric,
+                    header.max_complexity,
+                )?;
                 write_paf_line(&mut writer, &record, &string_table)?;
             }
         }
         CompressionStrategy::VarintZstd(_) => {
             for _ in 0..header.num_records {
-                let record = read_record_varint(&mut reader, false)?;
+                let record = read_record_varint(
+                    &mut reader,
+                    false,
+                    header.tracepoint_type,
+                    header.complexity_metric,
+                    header.max_complexity,
+                )?;
                 write_paf_line(&mut writer, &record, &string_table)?;
             }
         }
         CompressionStrategy::DeltaVarintZstd(_) => {
             for _ in 0..header.num_records {
-                let record = AlignmentRecord::read(&mut reader)?;
+                let record = AlignmentRecord::read(
+                    &mut reader,
+                    header.tracepoint_type,
+                    header.complexity_metric,
+                    header.max_complexity,
+                )?;
                 write_paf_line(&mut writer, &record, &string_table)?;
             }
         }
@@ -1189,6 +1230,9 @@ fn decompress_varint<R: Read + Seek>(
 fn read_record_varint<R: Read>(
     reader: &mut R,
     _use_delta: bool, // Parameter for consistency, always false for VarintRaw
+    tp_type: TracepointType,
+    complexity_metric: ComplexityMetric,
+    max_complexity: u64,
 ) -> io::Result<AlignmentRecord> {
     // Read PAF fields (same as version 1)
     let query_name_id = read_varint(reader)?;
@@ -1205,14 +1249,6 @@ fn read_record_varint<R: Read>(
     let mut mapq_buf = [0u8; 1];
     reader.read_exact(&mut mapq_buf)?;
     let mapping_quality = mapq_buf[0];
-    let mut tp_type_buf = [0u8; 1];
-    reader.read_exact(&mut tp_type_buf)?;
-    let tp_type = TracepointType::from_u8(tp_type_buf[0])
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let mut metric_buf = [0u8; 1];
-    reader.read_exact(&mut metric_buf)?;
-    let complexity_metric = complexity_metric_from_u8(metric_buf[0])?;
-    let max_complexity = read_varint(reader)?;
 
     // Read tracepoints (raw, no delta)
     let tracepoints = read_tracepoints_raw(reader, tp_type)?;
@@ -1247,6 +1283,9 @@ fn read_record_automatic<R: Read>(
     reader: &mut R,
     use_delta_first: bool,
     use_delta_second: bool,
+    tp_type: TracepointType,
+    complexity_metric: ComplexityMetric,
+    max_complexity: u64,
 ) -> io::Result<AlignmentRecord> {
     let query_name_id = read_varint(reader)?;
     let query_start = read_varint(reader)?;
@@ -1262,14 +1301,6 @@ fn read_record_automatic<R: Read>(
     let mut mapq_buf = [0u8; 1];
     reader.read_exact(&mut mapq_buf)?;
     let mapping_quality = mapq_buf[0];
-    let mut tp_type_buf = [0u8; 1];
-    reader.read_exact(&mut tp_type_buf)?;
-    let tp_type = TracepointType::from_u8(tp_type_buf[0])
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let mut metric_buf = [0u8; 1];
-    reader.read_exact(&mut metric_buf)?;
-    let complexity_metric = complexity_metric_from_u8(metric_buf[0])?;
-    let max_complexity = read_varint(reader)?;
 
     // Read tracepoints with automatic encoding
     let tracepoints = read_tracepoints_automatic(reader, tp_type, use_delta_first, use_delta_second)?;
@@ -1440,6 +1471,14 @@ pub fn compress_paf(input_path: &str, output_path: &str, strategy: CompressionSt
         record_count += 1;
     }
 
+    // Extract tracepoint metadata from first record (assuming homogeneous file)
+    if sample.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "No records found in PAF file"));
+    }
+    let tp_type = sample[0].tp_type;
+    let complexity_metric = sample[0].complexity_metric;
+    let max_complexity = sample[0].max_complexity;
+
     // Analyze sample for Automatic mode
     let (use_delta_first, use_delta_second) = match strategy {
         CompressionStrategy::Automatic(_) => analyze_smart_light_compression(&sample),
@@ -1452,7 +1491,7 @@ pub fn compress_paf(input_path: &str, output_path: &str, strategy: CompressionSt
     })?;
 
     // Write header with placeholder offset
-    let header = BinaryPafHeader::new(record_count, string_table.len() as u64, strategy, use_delta_first, use_delta_second, 0);
+    let header = BinaryPafHeader::new(record_count, string_table.len() as u64, strategy, use_delta_first, use_delta_second, 0, tp_type, complexity_metric, max_complexity);
     header.write(&mut output)?;
 
     let string_table_offset = {
@@ -1479,7 +1518,7 @@ pub fn compress_paf(input_path: &str, output_path: &str, strategy: CompressionSt
 
     // Update header with actual offset
     output.seek(std::io::SeekFrom::Start(0))?;
-    let header = BinaryPafHeader::new(record_count, string_table.len() as u64, strategy, use_delta_first, use_delta_second, string_table_offset);
+    let header = BinaryPafHeader::new(record_count, string_table.len() as u64, strategy, use_delta_first, use_delta_second, string_table_offset, tp_type, complexity_metric, max_complexity);
     header.write(&mut output)?;
     info!("Compressed {} records ({} unique names) with {} strategy", record_count, string_table.len(), strategy);
     Ok(())
@@ -1499,6 +1538,14 @@ fn write_binary(
         )
     })?;
 
+    // Extract tracepoint metadata from first record (assuming homogeneous file)
+    if records.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "No records provided"));
+    }
+    let tp_type = records[0].tp_type;
+    let complexity_metric = records[0].complexity_metric;
+    let max_complexity = records[0].max_complexity;
+
     // Analyze data for Automatic mode
     let (use_delta_first, use_delta_second) = match strategy {
         CompressionStrategy::Automatic(_) => analyze_smart_light_compression(records),
@@ -1513,6 +1560,9 @@ fn write_binary(
         use_delta_first,
         use_delta_second,
         0,
+        tp_type,
+        complexity_metric,
+        max_complexity,
     );
     header.write(&mut output)?;
 
@@ -1551,6 +1601,9 @@ fn write_binary(
         use_delta_first,
         use_delta_second,
         string_table_offset,
+        tp_type,
+        complexity_metric,
+        max_complexity,
     );
     header.write(&mut output)?;
 
@@ -2075,9 +2128,6 @@ fn skip_record<R: Read + Seek>(reader: &mut R, _is_adaptive: bool) -> io::Result
     read_varint(reader)?; // residue_matches
     read_varint(reader)?; // alignment_block_len
     reader.seek(SeekFrom::Current(1))?; // mapping_quality
-    reader.seek(SeekFrom::Current(1))?; // tp_type
-    reader.seek(SeekFrom::Current(1))?; // complexity_metric
-    read_varint(reader)?; // max_complexity
 
     // Skip tracepoints
     let num_items = read_varint(reader)? as usize;
@@ -2256,10 +2306,28 @@ impl BpafReader {
             CompressionStrategy::Automatic(_) => {
                 let use_delta_first = self.header.use_delta_first();
                 let use_delta_second = self.header.use_delta_second();
-                read_record_automatic(&mut self.file, use_delta_first, use_delta_second)
+                read_record_automatic(
+                    &mut self.file,
+                    use_delta_first,
+                    use_delta_second,
+                    self.header.tracepoint_type,
+                    self.header.complexity_metric,
+                    self.header.max_complexity,
+                )
             }
-            CompressionStrategy::VarintZstd(_) => read_record_varint(&mut self.file, false),
-            CompressionStrategy::DeltaVarintZstd(_) => AlignmentRecord::read(&mut self.file),
+            CompressionStrategy::VarintZstd(_) => read_record_varint(
+                &mut self.file,
+                false,
+                self.header.tracepoint_type,
+                self.header.complexity_metric,
+                self.header.max_complexity,
+            ),
+            CompressionStrategy::DeltaVarintZstd(_) => AlignmentRecord::read(
+                &mut self.file,
+                self.header.tracepoint_type,
+                self.header.complexity_metric,
+                self.header.max_complexity,
+            ),
         }
     }
 
@@ -2298,7 +2366,7 @@ impl BpafReader {
     ) -> io::Result<(TracepointData, TracepointType, ComplexityMetric, u64)> {
         self.file.seek(SeekFrom::Start(offset))?;
 
-        // Varint-only strategies - can skip fields
+        // Skip core PAF fields
         read_varint(&mut self.file)?; // query_name_id - SKIP
         read_varint(&mut self.file)?; // query_start - SKIP
         read_varint(&mut self.file)?; // query_end - SKIP
@@ -2309,18 +2377,10 @@ impl BpafReader {
         read_varint(&mut self.file)?; // residue_matches - SKIP
         read_varint(&mut self.file)?; // alignment_block_len - SKIP
         self.file.seek(SeekFrom::Current(1))?; // mapping_quality - SKIP
-
-        // Read only what we need
-        let mut tp_type_buf = [0u8; 1];
-        self.file.read_exact(&mut tp_type_buf)?;
-        let tp_type = TracepointType::from_u8(tp_type_buf[0])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        let mut metric_buf = [0u8; 1];
-        self.file.read_exact(&mut metric_buf)?;
-        let complexity_metric = complexity_metric_from_u8(metric_buf[0])?;
-
-        let max_complexity = read_varint(&mut self.file)?;
+        // Get metadata from header
+        let tp_type = self.header.tracepoint_type;
+        let complexity_metric = self.header.complexity_metric;
+        let max_complexity = self.header.max_complexity;
 
         // Read tracepoints - dispatch based on strategy
         let tracepoints = match self.header.strategy()? {
