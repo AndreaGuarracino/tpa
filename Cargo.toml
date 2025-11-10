@@ -2,16 +2,17 @@
 name = "lib_bpaf"
 version = "0.1.0"
 edition = "2021"
-authors = ["Andrea Guarracino"]
+authors = ["Andrea Guarracino <aguarra1@uthsc.edu>"]
 description = "Binary PAF (BPAF) format library for efficient storage and random access of sequence alignments with tracepoints"
 license = "MIT"
 repository = "https://github.com/AndreaGuarracino/lib_bpaf"
 
 [dependencies]
 zstd = "0.13.3"
-log = "0.4"
+log = "0.4.28"
 flate2 = "1.1.5"
 lib_tracepoints = { git = "https://github.com/AndreaGuarracino/lib_tracepoints" }
+lib_wfa2 = { git = "https://github.com/AndreaGuarracino/lib_wfa2" }
 
 [dev-dependencies]
 env_logger = "0.11.8"

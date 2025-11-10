@@ -198,6 +198,7 @@ dependencies = [
  "env_logger",
  "flate2",
  "lib_tracepoints",
+ "lib_wfa2",
  "log",
  "zstd",
 ]
@@ -213,7 +214,7 @@ dependencies = [
 [[package]]
 name = "lib_wfa2"
 version = "0.1.0"
-source = "git+https://github.com/AndreaGuarracino/lib_wfa2#e8c77c44ece02197e0e4e9072438c7dbdabe97f1"
+source = "git+https://github.com/AndreaGuarracino/lib_wfa2#ecfb9d8d219fadc73531f84b7e99d2a98fec57c4"
 
 [[package]]
 name = "libc"
@@ -357,9 +358,9 @@ checksum = "d66dc143e6b11c1eddc06d5c423cfc97062865baf299914ab64caa38182078fe"
 
 [[package]]
 name = "syn"
-version = "2.0.109"
+version = "2.0.110"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f17c7e013e88258aa9543dcbe81aca68a667a9ac37cd69c9fbc07858bfe0e2f"
+checksum = "a99801b5bd34ede4cf3fc688c5919368fea4e4814a4664359503e6015b280aea"
 dependencies = [
  "proc-macro2",
  "quote",

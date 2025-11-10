@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+pub use lib_wfa2::affine_wavefront::Distance;
 
 // ============================================================================
 // COMPRESSION STRATEGY
@@ -143,6 +144,86 @@ impl std::fmt::Display for CompressionStrategy {
 }
 
 // ============================================================================
+// DISTANCE SERIALIZATION (for lib_wfa2::Distance)
+// ============================================================================
+
+/// Write Distance to binary format
+fn write_distance<W: Write>(writer: &mut W, distance: &Distance) -> io::Result<()> {
+    writer.write_all(&[distance.to_u8()])?;
+    match distance {
+        Distance::Edit => {}
+        Distance::GapAffine {
+            mismatch,
+            gap_opening,
+            gap_extension,
+        } => {
+            writer.write_all(&mismatch.to_le_bytes())?;
+            writer.write_all(&gap_opening.to_le_bytes())?;
+            writer.write_all(&gap_extension.to_le_bytes())?;
+        }
+        Distance::GapAffine2p {
+            mismatch,
+            gap_opening1,
+            gap_extension1,
+            gap_opening2,
+            gap_extension2,
+        } => {
+            writer.write_all(&mismatch.to_le_bytes())?;
+            writer.write_all(&gap_opening1.to_le_bytes())?;
+            writer.write_all(&gap_extension1.to_le_bytes())?;
+            writer.write_all(&gap_opening2.to_le_bytes())?;
+            writer.write_all(&gap_extension2.to_le_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+/// Read Distance from binary format
+fn read_distance<R: Read>(reader: &mut R) -> io::Result<Distance> {
+    let mut code = [0u8; 1];
+    reader.read_exact(&mut code)?;
+    let mut distance = Distance::from_u8(code[0])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    match &mut distance {
+        Distance::Edit => {}
+        Distance::GapAffine {
+            mismatch,
+            gap_opening,
+            gap_extension,
+        } => {
+            let mut buf = [0u8; 4];
+            reader.read_exact(&mut buf)?;
+            *mismatch = i32::from_le_bytes(buf);
+            reader.read_exact(&mut buf)?;
+            *gap_opening = i32::from_le_bytes(buf);
+            reader.read_exact(&mut buf)?;
+            *gap_extension = i32::from_le_bytes(buf);
+        }
+        Distance::GapAffine2p {
+            mismatch,
+            gap_opening1,
+            gap_extension1,
+            gap_opening2,
+            gap_extension2,
+        } => {
+            let mut buf = [0u8; 4];
+            reader.read_exact(&mut buf)?;
+            *mismatch = i32::from_le_bytes(buf);
+            reader.read_exact(&mut buf)?;
+            *gap_opening1 = i32::from_le_bytes(buf);
+            reader.read_exact(&mut buf)?;
+            *gap_extension1 = i32::from_le_bytes(buf);
+            reader.read_exact(&mut buf)?;
+            *gap_opening2 = i32::from_le_bytes(buf);
+            reader.read_exact(&mut buf)?;
+            *gap_extension2 = i32::from_le_bytes(buf);
+        }
+    }
+    Ok(distance)
+}
+
+// ============================================================================
 // VARINT ENCODING (LEB128)
 // ============================================================================
 
@@ -210,7 +291,8 @@ pub struct BinaryPafHeader {
     num_strings: u64,
     tracepoint_type: TracepointType,
     complexity_metric: ComplexityMetric,
-    max_complexity: u64,
+    max_complexity: u64, // For Standard/Mixed/Variable: max_value; For FASTGA: trace_spacing
+    distance: Distance,
 }
 
 impl BinaryPafHeader {
@@ -224,6 +306,7 @@ impl BinaryPafHeader {
         tracepoint_type: TracepointType,
         complexity_metric: ComplexityMetric,
         max_complexity: u64,
+        distance: Distance,
     ) -> Self {
         let mut flags = strategy.to_code() & 0x07; // Strategy in bits 0-2
         if matches!(strategy, CompressionStrategy::Automatic(_)) {
@@ -242,6 +325,7 @@ impl BinaryPafHeader {
             tracepoint_type,
             complexity_metric,
             max_complexity,
+            distance,
         }
     }
 
@@ -268,6 +352,7 @@ impl BinaryPafHeader {
         writer.write_all(&[self.tracepoint_type.to_u8()])?;
         writer.write_all(&[complexity_metric_to_u8(&self.complexity_metric)])?;
         write_varint(writer, self.max_complexity)?;
+        write_distance(writer, &self.distance)?;
         Ok(())
     }
 
@@ -297,6 +382,8 @@ impl BinaryPafHeader {
 
         let max_complexity = read_varint(reader)?;
 
+        let distance = read_distance(reader)?;
+
         Ok(Self {
             version,
             flags,
@@ -305,6 +392,7 @@ impl BinaryPafHeader {
             tracepoint_type,
             complexity_metric,
             max_complexity,
+            distance,
         })
     }
 }
@@ -1075,6 +1163,7 @@ pub fn encode_cigar_to_binary(
     tp_type: &TracepointType,
     max_complexity: usize,
     complexity_metric: &ComplexityMetric,
+    distance: Distance,
     strategy: CompressionStrategy,
 ) -> io::Result<()> {
     info!("Encoding CIGAR with {} strategy...", strategy);
@@ -1103,7 +1192,7 @@ pub fn encode_cigar_to_binary(
         }
     }
 
-    write_binary(output_path, &records, &string_table, strategy)?;
+    write_binary(output_path, &records, &string_table, strategy, *tp_type, max_complexity as u64, *complexity_metric, distance)?;
 
     info!(
         "Encoded {} records ({} unique names) with {} strategy",
@@ -1437,7 +1526,15 @@ fn read_tracepoints_automatic<R: Read>(
 /// Uses delta encoding + varint + zstd compression for optimal balance
 /// of speed and compression ratio on genomic alignment data.
 /// Compress PAF with tracepoints to binary format
-pub fn compress_paf(input_path: &str, output_path: &str, strategy: CompressionStrategy) -> io::Result<()> {
+pub fn compress_paf(
+    input_path: &str,
+    output_path: &str,
+    strategy: CompressionStrategy,
+    tp_type: TracepointType,
+    max_complexity: u64,
+    complexity_metric: ComplexityMetric,
+    distance: Distance,
+) -> io::Result<()> {
     info!("Compressing PAF with {} strategy...", strategy);
 
     // Pass 1: Build string table + collect sample for analysis
@@ -1457,13 +1554,10 @@ pub fn compress_paf(input_path: &str, output_path: &str, strategy: CompressionSt
         record_count += 1;
     }
 
-    // Extract tracepoint metadata from first record (assuming homogeneous file)
+    // Verify file is not empty
     if sample.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "No records found in PAF file"));
     }
-    let tp_type = sample[0].tp_type;
-    let complexity_metric = sample[0].complexity_metric;
-    let max_complexity = sample[0].max_complexity;
 
     // Analyze sample for Automatic mode
     let (use_delta_first, use_delta_second) = match strategy {
@@ -1477,7 +1571,7 @@ pub fn compress_paf(input_path: &str, output_path: &str, strategy: CompressionSt
     })?;
 
     // Write header
-    let header = BinaryPafHeader::new(record_count, string_table.len() as u64, strategy, use_delta_first, use_delta_second, tp_type, complexity_metric, max_complexity);
+    let header = BinaryPafHeader::new(record_count, string_table.len() as u64, strategy, use_delta_first, use_delta_second, tp_type, complexity_metric, max_complexity, distance);
     header.write(&mut output)?;
 
     // Write string table
@@ -1510,6 +1604,10 @@ fn write_binary(
     records: &[AlignmentRecord],
     string_table: &StringTable,
     strategy: CompressionStrategy,
+    tp_type: TracepointType,
+    max_complexity: u64,
+    complexity_metric: ComplexityMetric,
+    distance: Distance,
 ) -> io::Result<()> {
     let mut output = File::create(output_path).map_err(|e| {
         io::Error::new(
@@ -1518,13 +1616,10 @@ fn write_binary(
         )
     })?;
 
-    // Extract tracepoint metadata from first record (assuming homogeneous file)
+    // Verify records is not empty
     if records.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "No records provided"));
     }
-    let tp_type = records[0].tp_type;
-    let complexity_metric = records[0].complexity_metric;
-    let max_complexity = records[0].max_complexity;
 
     // Analyze data for Automatic mode
     let (use_delta_first, use_delta_second) = match strategy {
@@ -1542,6 +1637,7 @@ fn write_binary(
         tp_type,
         complexity_metric,
         max_complexity,
+        distance,
     );
     header.write(&mut output)?;
 
