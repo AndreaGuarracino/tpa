@@ -1,4 +1,4 @@
-use lib_bpaf::{BpafReader, TracepointData, MixedTracepointItem};
+use lib_bpaf::{BpafReader, MixedTracepointItem, TracepointData};
 use std::env;
 use std::io::{self, Write};
 use std::process;
@@ -14,33 +14,30 @@ fn print_usage() {
 
 fn format_tracepoints(tp_data: &TracepointData) -> String {
     match tp_data {
-        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
-            tps.iter()
-                .map(|(a, b)| format!("{},{}", a, b))
-                .collect::<Vec<_>>()
-                .join(";")
-        }
-        TracepointData::Variable(tps) => {
-            tps.iter()
-                .map(|(a, b_opt)| {
-                    if let Some(b) = b_opt {
-                        format!("{},{}", a, b)
-                    } else {
-                        format!("{}", a)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(";")
-        }
-        TracepointData::Mixed(items) => {
-            items.iter()
-                .map(|item| match item {
-                    MixedTracepointItem::Tracepoint(a, b) => format!("{},{}", a, b),
-                    MixedTracepointItem::CigarOp(len, op) => format!("{}{}", len, op),
-                })
-                .collect::<Vec<_>>()
-                .join(";")
-        }
+        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => tps
+            .iter()
+            .map(|(a, b)| format!("{},{}", a, b))
+            .collect::<Vec<_>>()
+            .join(";"),
+        TracepointData::Variable(tps) => tps
+            .iter()
+            .map(|(a, b_opt)| {
+                if let Some(b) = b_opt {
+                    format!("{},{}", a, b)
+                } else {
+                    format!("{}", a)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(";"),
+        TracepointData::Mixed(items) => items
+            .iter()
+            .map(|item| match item {
+                MixedTracepointItem::Tracepoint(a, b) => format!("{},{}", a, b),
+                MixedTracepointItem::CigarOp(len, op) => format!("{}{}", len, op),
+            })
+            .collect::<Vec<_>>()
+            .join(";"),
     }
 }
 
@@ -105,13 +102,17 @@ fn main() -> io::Result<()> {
     for record_id in 0..header.num_records() {
         let record = reader.get_alignment_record(record_id)?;
 
-        let query_name = string_table.get(record.query_name_id)
+        let query_name = string_table
+            .get(record.query_name_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid query name ID"))?;
-        let query_len = string_table.get_length(record.query_name_id)
+        let query_len = string_table
+            .get_length(record.query_name_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid query length"))?;
-        let target_name = string_table.get(record.target_name_id)
+        let target_name = string_table
+            .get(record.target_name_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid target name ID"))?;
-        let target_len = string_table.get_length(record.target_name_id)
+        let target_len = string_table
+            .get_length(record.target_name_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid target length"))?;
 
         // Write standard PAF fields

@@ -28,9 +28,7 @@ pub use format::{
 use crate::format::parse_tag;
 use crate::utils::{parse_u8, parse_usize};
 
-pub use binary::{
-    build_index, BpafIndex, BpafReader, RecordIterator, BINARY_MAGIC,
-};
+pub use binary::{build_index, BpafIndex, BpafReader, RecordIterator, BINARY_MAGIC};
 
 use crate::binary::{analyze_smart_compression, decompress_varint};
 
@@ -276,7 +274,14 @@ fn parse_paf_with_cigar(
     max_complexity: usize,
     complexity_metric: &ComplexityMetric,
 ) -> io::Result<AlignmentRecord> {
-    parse_paf(line, string_table, true, *tp_type, max_complexity, *complexity_metric)
+    parse_paf(
+        line,
+        string_table,
+        true,
+        *tp_type,
+        max_complexity,
+        *complexity_metric,
+    )
 }
 
 fn parse_paf_with_tracepoints(
@@ -286,7 +291,14 @@ fn parse_paf_with_tracepoints(
     max_complexity: usize,
     complexity_metric: &ComplexityMetric,
 ) -> io::Result<AlignmentRecord> {
-    parse_paf(line, string_table, false, *tp_type, max_complexity, *complexity_metric)
+    parse_paf(
+        line,
+        string_table,
+        false,
+        *tp_type,
+        max_complexity,
+        *complexity_metric,
+    )
 }
 
 fn parse_paf(
@@ -359,7 +371,8 @@ fn parse_paf(
                 TracepointData::Standard(tps)
             }
             TracepointType::Mixed => {
-                let mixed = cigar_to_mixed_tracepoints(cigar_str, max_complexity, complexity_metric);
+                let mixed =
+                    cigar_to_mixed_tracepoints(cigar_str, max_complexity, complexity_metric);
                 TracepointData::Mixed(
                     mixed
                         .into_iter()
@@ -368,10 +381,11 @@ fn parse_paf(
                 )
             }
             TracepointType::Variable => {
-                let tps = cigar_to_variable_tracepoints(cigar_str, max_complexity, complexity_metric)
-                    .into_iter()
-                    .map(|(a, b)| (a as u64, b.map(|v| v as u64)))
-                    .collect();
+                let tps =
+                    cigar_to_variable_tracepoints(cigar_str, max_complexity, complexity_metric)
+                        .into_iter()
+                        .map(|(a, b)| (a as u64, b.map(|v| v as u64)))
+                        .collect();
                 TracepointData::Variable(tps)
             }
             TracepointType::Fastga => {
@@ -416,21 +430,23 @@ fn parse_paf(
 }
 
 fn parse_tracepoints(tp_str: &str, tp_type: TracepointType) -> io::Result<TracepointData> {
-    let parts: Vec<&str> = tp_str.split(';').collect();
+    let segments: Vec<&str> = tp_str
+        .split(';')
+        .collect();
 
     match tp_type {
         TracepointType::Mixed => {
             // Parse as Mixed tracepoints
             let mut items = Vec::new();
 
-            for part in parts {
+            for part in segments {
                 if part.contains(',') {
                     // Standard tracepoint
                     let coords: Vec<&str> = part.split(',').collect();
                     if coords.len() != 2 {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("Invalid mixed tracepoint format: {}", part),
+                            format!("Invalid mixed tracepoint format: '{}'", part),
                         ));
                     }
                     let first = coords[0].parse::<u64>().map_err(|_| {
@@ -442,10 +458,27 @@ fn parse_tracepoints(tp_str: &str, tp_type: TracepointType) -> io::Result<Tracep
                     items.push(MixedTracepointItem::Tracepoint(first, second));
                 } else {
                     // CIGAR operation
-                    let len = part[..part.len() - 1].parse::<u64>().map_err(|_| {
+                    let op = part.chars().last().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Mixed tracepoint entry missing operation",
+                        )
+                    })?;
+                    let len_str = part.strip_suffix(op).map(str::trim).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Invalid mixed tracepoint: '{}'", part),
+                        )
+                    })?;
+                    if len_str.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Mixed tracepoint entry missing length",
+                        ));
+                    }
+                    let len = len_str.parse::<u64>().map_err(|_| {
                         io::Error::new(io::ErrorKind::InvalidData, "Invalid CIGAR length")
                     })?;
-                    let op = part.chars().last().unwrap();
                     items.push(MixedTracepointItem::CigarOp(len, op));
                 }
             }
@@ -455,7 +488,7 @@ fn parse_tracepoints(tp_str: &str, tp_type: TracepointType) -> io::Result<Tracep
         TracepointType::Variable => {
             // Parse as Variable tracepoints
             let mut tps = Vec::new();
-            for part in parts {
+            for part in segments {
                 if part.contains(',') {
                     let coords: Vec<&str> = part.split(',').collect();
                     let first = coords[0].parse::<u64>().map_err(|_| {
@@ -477,14 +510,8 @@ fn parse_tracepoints(tp_str: &str, tp_type: TracepointType) -> io::Result<Tracep
         TracepointType::Standard | TracepointType::Fastga => {
             // Parse as Standard/FASTGA tracepoints
             let mut tps = Vec::new();
-            for part in parts {
+            for part in segments {
                 let coords: Vec<&str> = part.split(',').collect();
-                if coords.len() != 2 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("Invalid tracepoint format: {}", part),
-                    ));
-                }
                 let first = coords[0].parse::<u64>().map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "Invalid first value")
                 })?;

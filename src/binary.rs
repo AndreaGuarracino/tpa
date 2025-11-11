@@ -2,6 +2,7 @@
 
 use lib_tracepoints::{ComplexityMetric, TracepointType};
 use log::{debug, info};
+use std::convert::TryFrom;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -381,7 +382,7 @@ fn read_record_automatic<R: Read>(
     let mapping_quality = mapq_buf[0];
 
     let tracepoints =
-        read_tracepoints_automatic(reader, tp_type, use_delta_first, use_delta_second)?;
+        read_tracepoints_automatic(reader, tp_type, Some(use_delta_first), Some(use_delta_second))?;
 
     let num_tags = read_varint(reader)? as usize;
     let mut tags = Vec::with_capacity(num_tags);
@@ -412,108 +413,184 @@ fn read_tracepoints_raw<R: Read>(
     reader: &mut R,
     tp_type: TracepointType,
 ) -> io::Result<TracepointData> {
-    let num_items = read_varint(reader)? as usize;
-    if num_items == 0 {
-        return Ok(match tp_type {
-            TracepointType::Standard => TracepointData::Standard(Vec::new()),
-            _ => TracepointData::Fastga(Vec::new()),
-        });
-    }
-
-    let pos_len = read_varint(reader)? as usize;
-    let mut pos_compressed = vec![0u8; pos_len];
-    reader.read_exact(&mut pos_compressed)?;
-    let score_len = read_varint(reader)? as usize;
-    let mut score_compressed = vec![0u8; score_len];
-    reader.read_exact(&mut score_compressed)?;
-
-    let pos_buf = zstd::decode_all(&pos_compressed[..])?;
-    let score_buf = zstd::decode_all(&score_compressed[..])?;
-
-    let mut pos_reader = &pos_buf[..];
-    let mut positions = Vec::with_capacity(num_items);
-    for _ in 0..num_items {
-        positions.push(read_varint(&mut pos_reader)?);
-    }
-
-    let mut score_reader = &score_buf[..];
-    let mut scores = Vec::with_capacity(num_items);
-    for _ in 0..num_items {
-        scores.push(read_varint(&mut score_reader)?);
-    }
-
-    let tps: Vec<(u64, u64)> = positions.into_iter().zip(scores).collect();
-    Ok(match tp_type {
-        TracepointType::Standard => TracepointData::Standard(tps),
-        _ => TracepointData::Fastga(tps),
-    })
+    // Raw encoding uses no zigzag or delta
+    read_tracepoints_automatic(reader, tp_type, None, None)
 }
 
+fn read_tracepoints_delta<R: Read>(
+    reader: &mut R,
+    tp_type: TracepointType,
+) -> io::Result<TracepointData> {
+    // DeltaVarintZstd strategy encoding:
+    // - Standard: zigzag + delta on first, raw on second
+    // - Fastga: zigzag only on first, raw on second
+    let encoding_first = match tp_type {
+        TracepointType::Standard => Some(true),  // zigzag + delta
+        TracepointType::Fastga => Some(false),   // zigzag only
+        _ => None,                               // not applicable
+    };
+    read_tracepoints_automatic(reader, tp_type, encoding_first, None)
+}
+
+/// Read tracepoints with configurable encoding per component.
+/// Encoding modes: None = raw varints, Some(false) = zigzag only, Some(true) = zigzag + delta
 fn read_tracepoints_automatic<R: Read>(
     reader: &mut R,
     tp_type: TracepointType,
-    use_delta_first: bool,
-    use_delta_second: bool,
+    encoding_first: Option<bool>,
+    encoding_second: Option<bool>,
 ) -> io::Result<TracepointData> {
     let num_items = read_varint(reader)? as usize;
-    if num_items == 0 {
-        return Ok(match tp_type {
-            TracepointType::Standard => TracepointData::Standard(Vec::new()),
-            _ => TracepointData::Fastga(Vec::new()),
-        });
+    match tp_type {
+        TracepointType::Standard | TracepointType::Fastga => {
+            if num_items == 0 {
+                return Ok(match tp_type {
+                    TracepointType::Standard => TracepointData::Standard(Vec::new()),
+                    _ => TracepointData::Fastga(Vec::new()),
+                });
+            }
+
+            let first_len = read_varint(reader)? as usize;
+            let mut first_compressed = vec![0u8; first_len];
+            reader.read_exact(&mut first_compressed)?;
+            let second_len = read_varint(reader)? as usize;
+            let mut second_compressed = vec![0u8; second_len];
+            reader.read_exact(&mut second_compressed)?;
+
+            let first_buf = zstd::decode_all(&first_compressed[..])?;
+            let second_buf = zstd::decode_all(&second_compressed[..])?;
+
+            // Decode first values
+            let mut first_reader = &first_buf[..];
+            let first_vals = match encoding_first {
+                Some(true) => {
+                    // Zigzag + delta
+                    let mut deltas = Vec::with_capacity(num_items);
+                    for _ in 0..num_items {
+                        let zigzag = read_varint(&mut first_reader)?;
+                        let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+                        deltas.push(val);
+                    }
+                    delta_decode(&deltas)
+                }
+                Some(false) => {
+                    // Zigzag only (no delta) - for Fastga
+                    let mut zigzag_vals = Vec::with_capacity(num_items);
+                    for _ in 0..num_items {
+                        let zigzag = read_varint(&mut first_reader)?;
+                        let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+                        zigzag_vals.push(val as u64);
+                    }
+                    zigzag_vals
+                }
+                None => {
+                    // Raw varints (no zigzag, no delta)
+                    let mut vals = Vec::with_capacity(num_items);
+                    for _ in 0..num_items {
+                        vals.push(read_varint(&mut first_reader)?);
+                    }
+                    vals
+                }
+            };
+
+            // Decode second values
+            let mut second_reader = &second_buf[..];
+            let second_vals = match encoding_second {
+                Some(true) => {
+                    // Zigzag + delta
+                    let mut deltas = Vec::with_capacity(num_items);
+                    for _ in 0..num_items {
+                        let zigzag = read_varint(&mut second_reader)?;
+                        let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+                        deltas.push(val);
+                    }
+                    delta_decode(&deltas)
+                }
+                Some(false) => {
+                    // Zigzag only (no delta)
+                    let mut zigzag_vals = Vec::with_capacity(num_items);
+                    for _ in 0..num_items {
+                        let zigzag = read_varint(&mut second_reader)?;
+                        let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+                        zigzag_vals.push(val as u64);
+                    }
+                    zigzag_vals
+                }
+                None => {
+                    // Raw varints (no zigzag, no delta)
+                    let mut vals = Vec::with_capacity(num_items);
+                    for _ in 0..num_items {
+                        vals.push(read_varint(&mut second_reader)?);
+                    }
+                    vals
+                }
+            };
+
+            let tps: Vec<(u64, u64)> = first_vals.into_iter().zip(second_vals).collect();
+            Ok(match tp_type {
+                TracepointType::Standard => TracepointData::Standard(tps),
+                _ => TracepointData::Fastga(tps),
+            })
+        }
+        TracepointType::Variable => {
+            let tps = read_variable_tracepoint_items(reader, num_items)?;
+            Ok(TracepointData::Variable(tps))
+        }
+        TracepointType::Mixed => {
+            let items = read_mixed_tracepoint_items(reader, num_items)?;
+            Ok(TracepointData::Mixed(items))
+        }
     }
+}
 
-    let first_len = read_varint(reader)? as usize;
-    let mut first_compressed = vec![0u8; first_len];
-    reader.read_exact(&mut first_compressed)?;
-    let second_len = read_varint(reader)? as usize;
-    let mut second_compressed = vec![0u8; second_len];
-    reader.read_exact(&mut second_compressed)?;
+fn read_variable_tracepoint_items<R: Read>(
+    reader: &mut R,
+    num_items: usize,
+) -> io::Result<Vec<(u64, Option<u64>)>> {
+    let mut tps = Vec::with_capacity(num_items);
+    for _ in 0..num_items {
+        let a = read_varint(reader)?;
+        let mut flag = [0u8; 1];
+        reader.read_exact(&mut flag)?;
+        let b_opt = if flag[0] == 1 {
+            Some(read_varint(reader)?)
+        } else {
+            None
+        };
+        tps.push((a, b_opt));
+    }
+    Ok(tps)
+}
 
-    let first_buf = zstd::decode_all(&first_compressed[..])?;
-    let second_buf = zstd::decode_all(&second_compressed[..])?;
-
-    // Decode first values (delta or raw)
-    let mut first_reader = &first_buf[..];
-    let first_vals = if use_delta_first {
-        let mut deltas = Vec::with_capacity(num_items);
-        for _ in 0..num_items {
-            let zigzag = read_varint(&mut first_reader)?;
-            let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
-            deltas.push(val);
+fn read_mixed_tracepoint_items<R: Read>(
+    reader: &mut R,
+    num_items: usize,
+) -> io::Result<Vec<MixedTracepointItem>> {
+    let mut items = Vec::with_capacity(num_items);
+    for _ in 0..num_items {
+        let mut item_type = [0u8; 1];
+        reader.read_exact(&mut item_type)?;
+        match item_type[0] {
+            0 => {
+                let a = read_varint(reader)?;
+                let b = read_varint(reader)?;
+                items.push(MixedTracepointItem::Tracepoint(a, b));
+            }
+            1 => {
+                let len = read_varint(reader)?;
+                let mut op = [0u8; 1];
+                reader.read_exact(&mut op)?;
+                items.push(MixedTracepointItem::CigarOp(len, op[0] as char));
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid mixed item type",
+                ))
+            }
         }
-        delta_decode(&deltas)
-    } else {
-        let mut vals = Vec::with_capacity(num_items);
-        for _ in 0..num_items {
-            vals.push(read_varint(&mut first_reader)?);
-        }
-        vals
-    };
-
-    // Decode second values (delta or raw)
-    let mut second_reader = &second_buf[..];
-    let second_vals = if use_delta_second {
-        let mut deltas = Vec::with_capacity(num_items);
-        for _ in 0..num_items {
-            let zigzag = read_varint(&mut second_reader)?;
-            let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
-            deltas.push(val);
-        }
-        delta_decode(&deltas)
-    } else {
-        let mut vals = Vec::with_capacity(num_items);
-        for _ in 0..num_items {
-            vals.push(read_varint(&mut second_reader)?);
-        }
-        vals
-    };
-
-    let tps: Vec<(u64, u64)> = first_vals.into_iter().zip(second_vals).collect();
-    Ok(match tp_type {
-        TracepointType::Standard => TracepointData::Standard(tps),
-        _ => TracepointData::Fastga(tps),
-    })
+    }
+    Ok(items)
 }
 
 // ============================================================================
@@ -815,7 +892,7 @@ impl AlignmentRecord {
         let mut mapq_buf = [0u8; 1];
         reader.read_exact(&mut mapq_buf)?;
         let mapping_quality = mapq_buf[0];
-        let tracepoints = Self::read_tracepoints(reader, tp_type)?;
+        let tracepoints = read_tracepoints_delta(reader, tp_type)?;
         let num_tags = read_varint(reader)? as usize;
         let mut tags = Vec::with_capacity(num_tags);
         for _ in 0..num_tags {
@@ -838,100 +915,6 @@ impl AlignmentRecord {
             tracepoints,
             tags,
         })
-    }
-
-    pub(crate) fn read_tracepoints<R: Read>(
-        reader: &mut R,
-        tp_type: TracepointType,
-    ) -> io::Result<TracepointData> {
-        let num_items = read_varint(reader)? as usize;
-        match tp_type {
-            TracepointType::Standard | TracepointType::Fastga => {
-                if num_items == 0 {
-                    return Ok(match tp_type {
-                        TracepointType::Standard => TracepointData::Standard(Vec::new()),
-                        _ => TracepointData::Fastga(Vec::new()),
-                    });
-                }
-                let pos_len = read_varint(reader)? as usize;
-                let mut pos_compressed = vec![0u8; pos_len];
-                reader.read_exact(&mut pos_compressed)?;
-                let score_len = read_varint(reader)? as usize;
-                let mut score_compressed = vec![0u8; score_len];
-                reader.read_exact(&mut score_compressed)?;
-
-                let pos_buf = zstd::decode_all(&pos_compressed[..])?;
-                let score_buf = zstd::decode_all(&score_compressed[..])?;
-
-                let mut pos_reader = &pos_buf[..];
-                let mut pos_values = Vec::with_capacity(num_items);
-                for _ in 0..num_items {
-                    let zigzag = read_varint(&mut pos_reader)?;
-                    let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
-                    pos_values.push(val);
-                }
-
-                let positions: Vec<u64> = if matches!(tp_type, TracepointType::Fastga) {
-                    pos_values.iter().map(|&v| v as u64).collect()
-                } else {
-                    delta_decode(&pos_values)
-                };
-
-                let mut score_reader = &score_buf[..];
-                let mut scores = Vec::with_capacity(num_items);
-                for _ in 0..num_items {
-                    scores.push(read_varint(&mut score_reader)?);
-                }
-
-                let tps: Vec<(u64, u64)> = positions.into_iter().zip(scores).collect();
-                Ok(match tp_type {
-                    TracepointType::Standard => TracepointData::Standard(tps),
-                    _ => TracepointData::Fastga(tps),
-                })
-            }
-            TracepointType::Variable => {
-                let mut tps = Vec::with_capacity(num_items);
-                for _ in 0..num_items {
-                    let a = read_varint(reader)?;
-                    let mut flag = [0u8; 1];
-                    reader.read_exact(&mut flag)?;
-                    let b_opt = if flag[0] == 1 {
-                        Some(read_varint(reader)?)
-                    } else {
-                        None
-                    };
-                    tps.push((a, b_opt));
-                }
-                Ok(TracepointData::Variable(tps))
-            }
-            TracepointType::Mixed => {
-                let mut items = Vec::with_capacity(num_items);
-                for _ in 0..num_items {
-                    let mut item_type = [0u8; 1];
-                    reader.read_exact(&mut item_type)?;
-                    match item_type[0] {
-                        0 => {
-                            let a = read_varint(reader)?;
-                            let b = read_varint(reader)?;
-                            items.push(MixedTracepointItem::Tracepoint(a, b));
-                        }
-                        1 => {
-                            let len = read_varint(reader)?;
-                            let mut op = [0u8; 1];
-                            reader.read_exact(&mut op)?;
-                            items.push(MixedTracepointItem::CigarOp(len, op[0] as char));
-                        }
-                        _ => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "Invalid mixed item type",
-                            ))
-                        }
-                    }
-                }
-                Ok(TracepointData::Mixed(items))
-            }
-        }
     }
 }
 
@@ -1021,10 +1004,11 @@ pub fn build_index(bpaf_path: &str) -> io::Result<BpafIndex> {
     let header = BinaryPafHeader::read(&mut reader)?;
     StringTable::read(&mut reader)?;
 
+    let tp_type = header.tracepoint_type;
     let mut offsets = Vec::with_capacity(header.num_records as usize);
     for _ in 0..header.num_records {
         offsets.push(reader.stream_position()?);
-        skip_record(&mut reader, false)?;
+        skip_record(&mut reader, tp_type)?;
     }
 
     info!("Index built: {} records", offsets.len());
@@ -1032,7 +1016,7 @@ pub fn build_index(bpaf_path: &str) -> io::Result<BpafIndex> {
 }
 
 #[inline]
-fn skip_record<R: Read + Seek>(reader: &mut R, _is_adaptive: bool) -> io::Result<()> {
+fn skip_record<R: Read + Seek>(reader: &mut R, tp_type: TracepointType) -> io::Result<()> {
     read_varint(reader)?; // query_name_id
     read_varint(reader)?; // query_start
     read_varint(reader)?; // query_end
@@ -1044,15 +1028,7 @@ fn skip_record<R: Read + Seek>(reader: &mut R, _is_adaptive: bool) -> io::Result
     read_varint(reader)?; // alignment_block_len
     reader.seek(SeekFrom::Current(1))?; // mapping_quality
 
-    // Skip tracepoints
-    let num_items = read_varint(reader)? as usize;
-    if num_items > 0 {
-        let pos_len = read_varint(reader)? as usize;
-        reader.seek(SeekFrom::Current(pos_len as i64))?;
-
-        let score_len = read_varint(reader)? as usize;
-        reader.seek(SeekFrom::Current(score_len as i64))?;
-    }
+    skip_tracepoints(reader, tp_type)?;
 
     // Skip tags
     let num_tags = read_varint(reader)? as usize;
@@ -1070,12 +1046,79 @@ fn skip_record<R: Read + Seek>(reader: &mut R, _is_adaptive: bool) -> io::Result
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("Invalid tag type: '{}' (byte: {})", tag_type[0] as char, tag_type[0]),
+                    format!(
+                        "Invalid tag type: '{}' (byte: {})",
+                        tag_type[0] as char, tag_type[0]
+                    ),
                 ))
             }
         };
     }
 
+    Ok(())
+}
+
+fn skip_tracepoints<R: Read + Seek>(reader: &mut R, tp_type: TracepointType) -> io::Result<()> {
+    let num_items = read_varint(reader)? as usize;
+    match tp_type {
+        TracepointType::Standard | TracepointType::Fastga => {
+            if num_items == 0 {
+                return Ok(());
+            }
+            // Read first_len and skip first_data
+            let first_len = read_varint(reader)?;
+            let first_len = i64::try_from(first_len).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Compressed block too large to skip",
+                )
+            })?;
+            reader.seek(SeekFrom::Current(first_len))?;
+
+            // Read second_len and skip second_data
+            let second_len = read_varint(reader)?;
+            let second_len = i64::try_from(second_len).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Compressed block too large to skip",
+                )
+            })?;
+            reader.seek(SeekFrom::Current(second_len))?;
+        }
+        TracepointType::Variable => {
+            for _ in 0..num_items {
+                read_varint(reader)?;
+                let mut flag = [0u8; 1];
+                reader.read_exact(&mut flag)?;
+                if flag[0] == 1 {
+                    read_varint(reader)?;
+                }
+            }
+        }
+        TracepointType::Mixed => {
+            for _ in 0..num_items {
+                let mut item_type = [0u8; 1];
+                reader.read_exact(&mut item_type)?;
+                match item_type[0] {
+                    0 => {
+                        read_varint(reader)?;
+                        read_varint(reader)?;
+                    }
+                    1 => {
+                        read_varint(reader)?;
+                        let mut op = [0u8; 1];
+                        reader.read_exact(&mut op)?;
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Invalid mixed item type",
+                        ))
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1283,12 +1326,12 @@ impl BpafReader {
             CompressionStrategy::Automatic(_) => read_tracepoints_automatic(
                 &mut self.file,
                 tp_type,
-                self.header.use_delta_first(),
-                self.header.use_delta_second(),
+                Some(self.header.use_delta_first()),
+                Some(self.header.use_delta_second()),
             )?,
             CompressionStrategy::VarintZstd(_) => read_tracepoints_raw(&mut self.file, tp_type)?,
             CompressionStrategy::DeltaVarintZstd(_) => {
-                AlignmentRecord::read_tracepoints(&mut self.file, tp_type)?
+                read_tracepoints_delta(&mut self.file, tp_type)?
             }
         };
 
