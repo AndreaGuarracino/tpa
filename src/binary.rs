@@ -1,13 +1,9 @@
 //! Binary I/O operations for BPAF format
 
-use lib_tracepoints::{
-    cigar_to_mixed_tracepoints, cigar_to_tracepoints,
-    cigar_to_variable_tracepoints, ComplexityMetric, TracepointType,
-};
-use lib_wfa2::affine_wavefront::Distance;
-use log::{debug, error, info};
+use lib_tracepoints::{ComplexityMetric, TracepointType};
+use log::{debug, info};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::format::*;
@@ -38,24 +34,6 @@ pub fn complexity_metric_from_u8(byte: u8) -> io::Result<ComplexityMetric> {
             io::ErrorKind::InvalidData,
             format!("Invalid complexity metric code: {}", byte),
         )),
-    }
-}
-
-// ============================================================================
-// DETECTION
-// ============================================================================
-
-/// Detect if file is binary PAF
-pub fn is_binary_paf(path: &str) -> io::Result<bool> {
-    if path == "-" {
-        return Ok(false);
-    }
-    let mut file = File::open(path)?;
-    let mut magic = [0u8; 4];
-    match file.read_exact(&mut magic) {
-        Ok(()) => Ok(&magic == BINARY_MAGIC),
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
-        Err(e) => Err(e),
     }
 }
 
@@ -130,8 +108,8 @@ fn should_use_delta(values: &[u64]) -> bool {
     let delta_ratio = avg_delta as f64 / avg_value.max(1) as f64;
     let max_delta_ratio = max_delta as f64 / avg_delta.max(1) as f64;
 
-    let use_delta = monotonic
-        || (negative_ratio < 0.1 && delta_ratio < 0.5 && max_delta_ratio < 10.0);
+    let use_delta =
+        monotonic || (negative_ratio < 0.1 && delta_ratio < 0.5 && max_delta_ratio < 10.0);
 
     debug!(
         "Delta heuristic: mono={}, neg_ratio={:.2}, delta_ratio={:.2}, max_ratio={:.2} -> {}",
@@ -141,7 +119,7 @@ fn should_use_delta(values: &[u64]) -> bool {
     use_delta
 }
 
-fn analyze_smart_light_compression(records: &[AlignmentRecord]) -> (bool, bool) {
+pub(crate) fn analyze_smart_compression(records: &[AlignmentRecord]) -> (bool, bool) {
     const SAMPLE_SIZE: usize = 1000;
 
     let mut all_first_vals = Vec::new();
@@ -178,299 +156,10 @@ fn analyze_smart_light_compression(records: &[AlignmentRecord]) -> (bool, bool) 
 }
 
 // ============================================================================
-// PAF PARSING
-// ============================================================================
-
-fn parse_paf_with_cigar(
-    line: &str,
-    string_table: &mut StringTable,
-    tp_type: &TracepointType,
-    max_complexity: usize,
-    complexity_metric: &ComplexityMetric,
-) -> io::Result<AlignmentRecord> {
-    let fields: Vec<&str> = line.split('\t').collect();
-    if fields.len() < 12 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("PAF line has {} fields, expected at least 12", fields.len()),
-        ));
-    }
-
-    let query_name = fields[0];
-    let query_len = parse_usize(fields[1], "query_len")?;
-    let query_start = parse_usize(fields[2], "query_start")?;
-    let query_end = parse_usize(fields[3], "query_end")?;
-    let strand = fields[4].chars().next().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "Empty strand field")
-    })?;
-    let target_name = fields[5];
-    let target_len = parse_usize(fields[6], "target_len")?;
-    let target_start = parse_usize(fields[7], "target_start")?;
-    let target_end = parse_usize(fields[8], "target_end")?;
-    let residue_matches = parse_usize(fields[9], "residue_matches")?;
-    let alignment_block_len = parse_usize(fields[10], "alignment_block_len")?;
-    let mapping_quality = parse_u8(fields[11], "mapping_quality")?;
-
-    // Intern strings
-    let query_name_id = string_table.intern(query_name, query_len);
-    let target_name_id = string_table.intern(target_name, target_len);
-
-    // Extract CIGAR and other tags
-    let mut cigar = None;
-    let mut tags = Vec::new();
-
-    for field in fields.iter().skip(12) {
-        if field.starts_with("cg:Z:") {
-            cigar = Some(field.strip_prefix("cg:Z:").unwrap());
-        } else if let Some(tag) = parse_tag(field) {
-            tags.push(tag);
-        }
-    }
-
-    let cigar_str = cigar.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "PAF line missing CIGAR string (cg:Z: tag)",
-        )
-    })?;
-
-    // Convert CIGAR to tracepoints based on type
-    let tracepoints = match tp_type {
-        TracepointType::Standard => {
-            let tps = cigar_to_tracepoints(cigar_str, max_complexity, *complexity_metric)
-                .into_iter()
-                .map(|(a, b)| (a as u64, b as u64))
-                .collect();
-            TracepointData::Standard(tps)
-        }
-        TracepointType::Mixed => {
-            let mixed = cigar_to_mixed_tracepoints(cigar_str, max_complexity, *complexity_metric);
-            TracepointData::Mixed(
-                mixed
-                    .into_iter()
-                    .map(|item| MixedTracepointItem::from(&item))
-                    .collect(),
-            )
-        }
-        TracepointType::Variable => {
-            let tps = cigar_to_variable_tracepoints(cigar_str, max_complexity, *complexity_metric)
-                .into_iter()
-                .map(|(a, b)| (a as u64, b.map(|v| v as u64)))
-                .collect();
-            TracepointData::Variable(tps)
-        }
-        TracepointType::Fastga => {
-            // FASTGA requires sequence information which we don't have here
-            // Fall back to Standard tracepoints
-            let tps = cigar_to_tracepoints(cigar_str, max_complexity, *complexity_metric)
-                .into_iter()
-                .map(|(a, b)| (a as u64, b as u64))
-                .collect();
-            TracepointData::Fastga(tps)
-        }
-    };
-
-    Ok(AlignmentRecord {
-        query_name_id,
-        query_start,
-        query_end,
-        strand,
-        target_name_id,
-        target_start,
-        target_end,
-        residue_matches,
-        alignment_block_len,
-        mapping_quality,
-        tp_type: *tp_type,
-        complexity_metric: *complexity_metric,
-        max_complexity: max_complexity as u64,
-        tracepoints,
-        tags,
-    })
-}
-
-pub fn parse_paf_with_tracepoints(
-    line: &str,
-    string_table: &mut StringTable,
-) -> io::Result<AlignmentRecord> {
-    let fields: Vec<&str> = line.split('\t').collect();
-    if fields.len() < 12 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("PAF line has {} fields, expected at least 12", fields.len()),
-        ));
-    }
-
-    let query_name = fields[0];
-    let query_len = parse_usize(fields[1], "query_len")?;
-    let query_start = parse_usize(fields[2], "query_start")?;
-    let query_end = parse_usize(fields[3], "query_end")?;
-    let strand = fields[4].chars().next().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "Empty strand field")
-    })?;
-    let target_name = fields[5];
-    let target_len = parse_usize(fields[6], "target_len")?;
-    let target_start = parse_usize(fields[7], "target_start")?;
-    let target_end = parse_usize(fields[8], "target_end")?;
-    let residue_matches = parse_usize(fields[9], "residue_matches")?;
-    let alignment_block_len = parse_usize(fields[10], "alignment_block_len")?;
-    let mapping_quality = parse_u8(fields[11], "mapping_quality")?;
-
-    // Intern strings
-    let query_name_id = string_table.intern(query_name, query_len);
-    let target_name_id = string_table.intern(target_name, target_len);
-
-    // Extract tp:Z: and other tags
-    let mut tp_str = None;
-    let mut tags = Vec::new();
-
-    for field in fields.iter().skip(12) {
-        if field.starts_with("tp:Z:") {
-            tp_str = Some(field.strip_prefix("tp:Z:").unwrap());
-        } else if let Some(tag) = parse_tag(field) {
-            tags.push(tag);
-        }
-    }
-
-    let tp_data = tp_str.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "PAF line missing tracepoints (tp:Z: tag)",
-        )
-    })?;
-
-    // Parse tracepoints string
-    let (tracepoints, tp_type) = parse_tracepoints_auto(tp_data)?;
-
-    // Infer complexity metric and max value from tracepoints
-    let (complexity_metric, max_complexity) = match &tracepoints {
-        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
-            let max_second = tps.iter().map(|(_, s)| *s).max().unwrap_or(0);
-            (ComplexityMetric::EditDistance, max_second)
-        }
-        TracepointData::Variable(tps) => {
-            let max_second = tps.iter().filter_map(|(_, s)| *s).max().unwrap_or(0);
-            (ComplexityMetric::EditDistance, max_second)
-        }
-        TracepointData::Mixed(_) => {
-            // For Mixed, we don't have a clear max_complexity
-            (ComplexityMetric::EditDistance, 0)
-        }
-    };
-
-    Ok(AlignmentRecord {
-        query_name_id,
-        query_start,
-        query_end,
-        strand,
-        target_name_id,
-        target_start,
-        target_end,
-        residue_matches,
-        alignment_block_len,
-        mapping_quality,
-        tp_type,
-        complexity_metric,
-        max_complexity,
-        tracepoints,
-        tags,
-    })
-}
-
-fn parse_tracepoints_auto(tp_str: &str) -> io::Result<(TracepointData, TracepointType)> {
-    // Check if it's mixed format (contains letters for CIGAR ops)
-    let has_letters = tp_str.contains(|c: char| c.is_alphabetic());
-
-    if has_letters {
-        // Parse as Mixed tracepoints
-        let parts: Vec<&str> = tp_str.split(';').collect();
-        let mut items = Vec::new();
-
-        for part in parts {
-            if part.contains(',') {
-                // Standard tracepoint
-                let coords: Vec<&str> = part.split(',').collect();
-                if coords.len() != 2 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("Invalid mixed tracepoint format: {}", part),
-                    ));
-                }
-                let first = coords[0].parse::<u64>().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Invalid first value")
-                })?;
-                let second = coords[1].parse::<u64>().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Invalid second value")
-                })?;
-                items.push(MixedTracepointItem::Tracepoint(first, second));
-            } else {
-                // CIGAR operation
-                let len = part[..part.len() - 1].parse::<u64>().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Invalid CIGAR length")
-                })?;
-                let op = part.chars().last().unwrap();
-                items.push(MixedTracepointItem::CigarOp(len, op));
-            }
-        }
-
-        Ok((TracepointData::Mixed(items), TracepointType::Mixed))
-    } else {
-        // Check if it's variable format (some second values missing)
-        let parts: Vec<&str> = tp_str.split(';').collect();
-        let has_single_values = parts.iter().any(|p| !p.contains(','));
-
-        if has_single_values {
-            // Variable tracepoints
-            let mut tps = Vec::new();
-            for part in parts {
-                if part.contains(',') {
-                    let coords: Vec<&str> = part.split(',').collect();
-                    let first = coords[0].parse::<u64>().map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "Invalid first value")
-                    })?;
-                    let second = coords[1].parse::<u64>().map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "Invalid second value")
-                    })?;
-                    tps.push((first, Some(second)));
-                } else {
-                    let first = part.parse::<u64>().map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "Invalid first value")
-                    })?;
-                    tps.push((first, None));
-                }
-            }
-            Ok((TracepointData::Variable(tps), TracepointType::Variable))
-        } else {
-            // Standard or FASTGA tracepoints
-            let mut tps = Vec::new();
-            for part in parts {
-                let coords: Vec<&str> = part.split(',').collect();
-                if coords.len() != 2 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("Invalid tracepoint format: {}", part),
-                    ));
-                }
-                let first = coords[0].parse::<u64>().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Invalid first value")
-                })?;
-                let second = coords[1].parse::<u64>().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Invalid second value")
-                })?;
-                tps.push((first, second));
-            }
-
-            // Assume Standard for now (FASTGA detection would require spacing info)
-            Ok((TracepointData::Standard(tps), TracepointType::Standard))
-        }
-    }
-}
-
-// ============================================================================
 // PAF WRITING
 // ============================================================================
 
-pub fn write_paf_line<W: Write>(
+pub fn write_paf_line_with_tracepoints<W: Write>(
     writer: &mut W,
     record: &AlignmentRecord,
     string_table: &StringTable,
@@ -518,7 +207,7 @@ pub fn write_paf_line<W: Write>(
     Ok(())
 }
 
-pub fn format_tracepoints(tps: &TracepointData) -> String {
+fn format_tracepoints(tps: &TracepointData) -> String {
     match tps {
         TracepointData::Standard(tps) | TracepointData::Fastga(tps) => tps
             .iter()
@@ -548,327 +237,10 @@ pub fn format_tracepoints(tps: &TracepointData) -> String {
 }
 
 // ============================================================================
-// COMPRESSION
-// ============================================================================
-
-/// Encode PAF with CIGAR to binary with tracepoints
-pub fn encode_cigar_to_binary(
-    input_path: &str,
-    output_path: &str,
-    tp_type: &TracepointType,
-    max_complexity: usize,
-    complexity_metric: &ComplexityMetric,
-    distance: Distance,
-    strategy: CompressionStrategy,
-) -> io::Result<()> {
-    info!("Encoding CIGAR with {} strategy...", strategy);
-
-    let input = open_paf_reader(input_path)?;
-    let mut string_table = StringTable::new();
-    let mut records = Vec::new();
-
-    for (line_num, line_result) in input.lines().enumerate() {
-        let line = line_result?;
-        if line.trim().is_empty() || line.starts_with('#') {
-            continue;
-        }
-        match parse_paf_with_cigar(
-            &line,
-            &mut string_table,
-            tp_type,
-            max_complexity,
-            complexity_metric,
-        ) {
-            Ok(record) => records.push(record),
-            Err(e) => {
-                error!("Line {}: {}", line_num + 1, e);
-                return Err(e);
-            }
-        }
-    }
-
-    write_binary(output_path, &records, &string_table, strategy, *tp_type, max_complexity as u64, *complexity_metric, distance)?;
-
-    info!(
-        "Encoded {} records ({} unique names) with {} strategy",
-        records.len(),
-        string_table.len(),
-        strategy
-    );
-    Ok(())
-}
-
-pub fn compress_paf(
-    input_path: &str,
-    output_path: &str,
-    strategy: CompressionStrategy,
-    tp_type: TracepointType,
-    max_complexity: u64,
-    complexity_metric: ComplexityMetric,
-    distance: Distance,
-) -> io::Result<()> {
-    info!("Compressing PAF with {} strategy...", strategy);
-
-    // Pass 1: Build string table + collect sample for analysis
-    let mut string_table = StringTable::new();
-    let mut sample = Vec::new();
-    let mut record_count = 0u64;
-
-    let input = open_paf_reader(input_path)?;
-    for (line_num, line_result) in input.lines().enumerate() {
-        let line = line_result?;
-        if line.trim().is_empty() || line.starts_with('#') { continue; }
-
-        let record = parse_paf_with_tracepoints(&line, &mut string_table)
-            .map_err(|e| { error!("Line {}: {}", line_num + 1, e); e })?;
-
-        if sample.len() < 1000 { sample.push(record); }
-        record_count += 1;
-    }
-
-    // Verify file is not empty
-    if sample.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "No records found in PAF file"));
-    }
-
-    // Analyze sample for Automatic mode
-    let (use_delta_first, use_delta_second) = match strategy {
-        CompressionStrategy::Automatic(_) => analyze_smart_light_compression(&sample),
-        _ => (false, false),
-    };
-
-    // Pass 2: Stream write - Header → StringTable → Records
-    let mut output = File::create(output_path).map_err(|e| {
-        io::Error::new(e.kind(), format!("Failed to create output file '{}': {}", output_path, e))
-    })?;
-
-    // Write header
-    let header = BinaryPafHeader::new(record_count, string_table.len() as u64, strategy, use_delta_first, use_delta_second, tp_type, complexity_metric, max_complexity, distance);
-    header.write(&mut output)?;
-
-    // Write string table
-    string_table.write(&mut output)?;
-
-    // Write records
-    let mut writer = BufWriter::new(&mut output);
-    let input = open_paf_reader(input_path)?;
-    let mut temp_table = string_table.clone();
-    for line_result in input.lines() {
-        let line = line_result?;
-        if line.trim().is_empty() || line.starts_with('#') { continue; }
-
-        let record = parse_paf_with_tracepoints(&line, &mut temp_table)?;
-        match strategy {
-            CompressionStrategy::Automatic(_) => record.write_automatic(&mut writer, use_delta_first, use_delta_second, strategy)?,
-            CompressionStrategy::VarintZstd(_) => record.write(&mut writer, false, strategy)?,
-            CompressionStrategy::DeltaVarintZstd(_) => record.write(&mut writer, true, strategy)?,
-        }
-    }
-    writer.flush()?;
-
-    info!("Compressed {} records ({} unique names) with {} strategy", record_count, string_table.len(), strategy);
-    Ok(())
-}
-
-pub fn compress_paf_with_cigar(
-    input_path: &str,
-    output_path: &str,
-    strategy: CompressionStrategy,
-    tp_type: TracepointType,
-    max_complexity: u64,
-    complexity_metric: ComplexityMetric,
-    distance: Distance,
-) -> io::Result<()> {
-    info!("Compressing PAF with CIGAR using {} strategy...", strategy);
-
-    // Pass 1: Build string table + collect sample for analysis
-    let mut string_table = StringTable::new();
-    let mut sample = Vec::new();
-    let mut record_count = 0u64;
-
-    let input = open_paf_reader(input_path)?;
-    for (line_num, line_result) in input.lines().enumerate() {
-        let line = line_result?;
-        if line.trim().is_empty() || line.starts_with('#') { continue; }
-
-        let record = parse_paf_with_cigar(&line, &mut string_table, &tp_type, max_complexity as usize, &complexity_metric)
-            .map_err(|e| { error!("Line {}: {}", line_num + 1, e); e })?;
-
-        if sample.len() < 1000 { sample.push(record); }
-        record_count += 1;
-    }
-
-    // Verify file is not empty
-    if sample.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "No records found in PAF file"));
-    }
-
-    // Analyze sample for Automatic mode
-    let (use_delta_first, use_delta_second) = match strategy {
-        CompressionStrategy::Automatic(_) => analyze_smart_light_compression(&sample),
-        _ => (false, false),
-    };
-
-    // Pass 2: Stream write - Header → StringTable → Records
-    let mut output = File::create(output_path).map_err(|e| {
-        io::Error::new(e.kind(), format!("Failed to create output file '{}': {}", output_path, e))
-    })?;
-
-    // Write header
-    let header = BinaryPafHeader::new(record_count, string_table.len() as u64, strategy, use_delta_first, use_delta_second, tp_type, complexity_metric, max_complexity, distance);
-    header.write(&mut output)?;
-
-    // Write string table
-    string_table.write(&mut output)?;
-
-    // Write records
-    let mut writer = BufWriter::new(&mut output);
-    let input = open_paf_reader(input_path)?;
-    let mut temp_table = string_table.clone();
-    for line_result in input.lines() {
-        let line = line_result?;
-        if line.trim().is_empty() || line.starts_with('#') { continue; }
-
-        let record = parse_paf_with_cigar(&line, &mut temp_table, &tp_type, max_complexity as usize, &complexity_metric)?;
-        match strategy {
-            CompressionStrategy::Automatic(_) => record.write_automatic(&mut writer, use_delta_first, use_delta_second, strategy)?,
-            CompressionStrategy::VarintZstd(_) => record.write(&mut writer, false, strategy)?,
-            CompressionStrategy::DeltaVarintZstd(_) => record.write(&mut writer, true, strategy)?,
-        }
-    }
-    writer.flush()?;
-
-    info!("Compressed {} records ({} unique names) with {} strategy", record_count, string_table.len(), strategy);
-    Ok(())
-}
-
-fn write_binary(
-    output_path: &str,
-    records: &[AlignmentRecord],
-    string_table: &StringTable,
-    strategy: CompressionStrategy,
-    tp_type: TracepointType,
-    max_complexity: u64,
-    complexity_metric: ComplexityMetric,
-    distance: Distance,
-) -> io::Result<()> {
-    let mut output = File::create(output_path).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("Failed to create output file '{}': {}", output_path, e),
-        )
-    })?;
-
-    // Verify records is not empty
-    if records.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "No records provided"));
-    }
-
-    // Analyze data for Automatic mode
-    let (use_delta_first, use_delta_second) = match strategy {
-        CompressionStrategy::Automatic(_) => analyze_smart_light_compression(records),
-        _ => (false, false),
-    };
-
-    // Write header
-    let header = BinaryPafHeader::new(
-        records.len() as u64,
-        string_table.len() as u64,
-        strategy,
-        use_delta_first,
-        use_delta_second,
-        tp_type,
-        complexity_metric,
-        max_complexity,
-        distance,
-    );
-    header.write(&mut output)?;
-
-    // Write string table
-    string_table.write(&mut output)?;
-
-    // Write records
-    let mut writer = BufWriter::new(&mut output);
-    match strategy {
-        CompressionStrategy::Automatic(_) => {
-            for record in records {
-                record.write_automatic(&mut writer, use_delta_first, use_delta_second, strategy)?;
-            }
-        }
-        CompressionStrategy::VarintZstd(_) => {
-            for record in records {
-                record.write(&mut writer, false, strategy)?;
-            }
-        }
-        CompressionStrategy::DeltaVarintZstd(_) => {
-            for record in records {
-                record.write(&mut writer, true, strategy)?;
-            }
-        }
-    }
-    writer.flush()?;
-
-    Ok(())
-}
-
-fn write_paf_output(
-    output_path: &str,
-    records: &[AlignmentRecord],
-    string_table: &StringTable,
-) -> io::Result<()> {
-    let output: Box<dyn Write> = if output_path == "-" {
-        Box::new(io::stdout())
-    } else {
-        Box::new(File::create(output_path).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("Failed to create output file '{}': {}", output_path, e),
-            )
-        })?)
-    };
-    let mut writer = BufWriter::new(output);
-
-    for record in records {
-        write_paf_line(&mut writer, record, string_table)?;
-    }
-    writer.flush()?;
-    Ok(())
-}
-
-// ============================================================================
 // DECOMPRESSION
 // ============================================================================
 
-pub fn decompress_paf(input_path: &str, output_path: &str) -> io::Result<()> {
-    info!("Decompressing {} to text format...", input_path);
-
-    let input = File::open(input_path).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("Failed to open input file '{}': {}", input_path, e),
-        )
-    })?;
-    let mut reader = BufReader::new(input);
-
-    let header = BinaryPafHeader::read(&mut reader)?;
-
-    if header.version != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Unsupported format version: {}", header.version),
-        ));
-    }
-
-    let strategy = header.strategy()?;
-    info!(
-        "Reading {} records ({} unique names) [{}]",
-        header.num_records, header.num_strings, strategy
-    );
-
-    decompress_varint(reader, output_path, &header, strategy)
-}
-
-fn decompress_varint<R: Read>(
+pub(crate) fn decompress_varint<R: Read>(
     mut reader: R,
     output_path: &str,
     header: &BinaryPafHeader,
@@ -882,7 +254,10 @@ fn decompress_varint<R: Read>(
         Box::new(io::stdout())
     } else {
         Box::new(File::create(output_path).map_err(|e| {
-            io::Error::new(e.kind(), format!("Failed to create output file '{}': {}", output_path, e))
+            io::Error::new(
+                e.kind(),
+                format!("Failed to create output file '{}': {}", output_path, e),
+            )
         })?)
     };
     let mut writer = BufWriter::new(output);
@@ -900,7 +275,7 @@ fn decompress_varint<R: Read>(
                     header.complexity_metric,
                     header.max_complexity,
                 )?;
-                write_paf_line(&mut writer, &record, &string_table)?;
+                write_paf_line_with_tracepoints(&mut writer, &record, &string_table)?;
             }
         }
         CompressionStrategy::VarintZstd(_) => {
@@ -912,7 +287,7 @@ fn decompress_varint<R: Read>(
                     header.complexity_metric,
                     header.max_complexity,
                 )?;
-                write_paf_line(&mut writer, &record, &string_table)?;
+                write_paf_line_with_tracepoints(&mut writer, &record, &string_table)?;
             }
         }
         CompressionStrategy::DeltaVarintZstd(_) => {
@@ -923,7 +298,7 @@ fn decompress_varint<R: Read>(
                     header.complexity_metric,
                     header.max_complexity,
                 )?;
-                write_paf_line(&mut writer, &record, &string_table)?;
+                write_paf_line_with_tracepoints(&mut writer, &record, &string_table)?;
             }
         }
     }
@@ -1005,7 +380,8 @@ fn read_record_automatic<R: Read>(
     reader.read_exact(&mut mapq_buf)?;
     let mapping_quality = mapq_buf[0];
 
-    let tracepoints = read_tracepoints_automatic(reader, tp_type, use_delta_first, use_delta_second)?;
+    let tracepoints =
+        read_tracepoints_automatic(reader, tp_type, use_delta_first, use_delta_second)?;
 
     let num_tags = read_varint(reader)? as usize;
     let mut tags = Vec::with_capacity(num_tags);
@@ -1145,7 +521,12 @@ fn read_tracepoints_automatic<R: Read>(
 // ============================================================================
 
 impl AlignmentRecord {
-    pub(crate) fn write<W: Write>(&self, writer: &mut W, use_delta: bool, strategy: CompressionStrategy) -> io::Result<()> {
+    pub(crate) fn write<W: Write>(
+        &self,
+        writer: &mut W,
+        use_delta: bool,
+        strategy: CompressionStrategy,
+    ) -> io::Result<()> {
         write_varint(writer, self.query_name_id)?;
         write_varint(writer, self.query_start)?;
         write_varint(writer, self.query_end)?;
@@ -1193,7 +574,11 @@ impl AlignmentRecord {
         Ok(())
     }
 
-    fn write_tracepoints<W: Write>(&self, writer: &mut W, strategy: CompressionStrategy) -> io::Result<()> {
+    fn write_tracepoints<W: Write>(
+        &self,
+        writer: &mut W,
+        strategy: CompressionStrategy,
+    ) -> io::Result<()> {
         match &self.tracepoints {
             TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
                 write_varint(writer, tps.len() as u64)?;
@@ -1221,7 +606,8 @@ impl AlignmentRecord {
                 }
 
                 let first_compressed = zstd::encode_all(&first_val_buf[..], strategy.zstd_level())?;
-                let second_compressed = zstd::encode_all(&second_val_buf[..], strategy.zstd_level())?;
+                let second_compressed =
+                    zstd::encode_all(&second_val_buf[..], strategy.zstd_level())?;
 
                 write_varint(writer, first_compressed.len() as u64)?;
                 writer.write_all(&first_compressed)?;
@@ -1261,7 +647,11 @@ impl AlignmentRecord {
         Ok(())
     }
 
-    fn write_tracepoints_raw<W: Write>(&self, writer: &mut W, strategy: CompressionStrategy) -> io::Result<()> {
+    fn write_tracepoints_raw<W: Write>(
+        &self,
+        writer: &mut W,
+        strategy: CompressionStrategy,
+    ) -> io::Result<()> {
         match &self.tracepoints {
             TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
                 write_varint(writer, tps.len() as u64)?;
@@ -1281,7 +671,8 @@ impl AlignmentRecord {
                 }
 
                 let first_compressed = zstd::encode_all(&first_val_buf[..], strategy.zstd_level())?;
-                let second_compressed = zstd::encode_all(&second_val_buf[..], strategy.zstd_level())?;
+                let second_compressed =
+                    zstd::encode_all(&second_val_buf[..], strategy.zstd_level())?;
 
                 write_varint(writer, first_compressed.len() as u64)?;
                 writer.write_all(&first_compressed)?;
@@ -1363,7 +754,8 @@ impl AlignmentRecord {
                 }
 
                 let first_compressed = zstd::encode_all(&first_val_buf[..], strategy.zstd_level())?;
-                let second_compressed = zstd::encode_all(&second_val_buf[..], strategy.zstd_level())?;
+                let second_compressed =
+                    zstd::encode_all(&second_val_buf[..], strategy.zstd_level())?;
 
                 write_varint(writer, first_compressed.len() as u64)?;
                 writer.write_all(&first_compressed)?;
@@ -1669,7 +1061,7 @@ fn skip_record<R: Read + Seek>(reader: &mut R, _is_adaptive: bool) -> io::Result
         let mut tag_type = [0u8; 1];
         reader.read_exact(&mut tag_type)?;
         match tag_type[0] {
-            b'i' => reader.seek(SeekFrom::Current(8))?,
+            b'i' => reader.seek(SeekFrom::Current(4))?,
             b'f' => reader.seek(SeekFrom::Current(4))?,
             b'Z' => {
                 let len = read_varint(reader)? as usize;
@@ -1678,7 +1070,7 @@ fn skip_record<R: Read + Seek>(reader: &mut R, _is_adaptive: bool) -> io::Result
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "Invalid tag type",
+                    format!("Invalid tag type: '{}' (byte: {})", tag_type[0] as char, tag_type[0]),
                 ))
             }
         };
@@ -1888,17 +1280,13 @@ impl BpafReader {
         let max_complexity = self.header.max_complexity;
 
         let tracepoints = match self.header.strategy()? {
-            CompressionStrategy::Automatic(_) => {
-                read_tracepoints_automatic(
-                    &mut self.file,
-                    tp_type,
-                    self.header.use_delta_first(),
-                    self.header.use_delta_second(),
-                )?
-            }
-            CompressionStrategy::VarintZstd(_) => {
-                read_tracepoints_raw(&mut self.file, tp_type)?
-            }
+            CompressionStrategy::Automatic(_) => read_tracepoints_automatic(
+                &mut self.file,
+                tp_type,
+                self.header.use_delta_first(),
+                self.header.use_delta_second(),
+            )?,
+            CompressionStrategy::VarintZstd(_) => read_tracepoints_raw(&mut self.file, tp_type)?,
             CompressionStrategy::DeltaVarintZstd(_) => {
                 AlignmentRecord::read_tracepoints(&mut self.file, tp_type)?
             }

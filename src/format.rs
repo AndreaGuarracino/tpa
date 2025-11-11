@@ -1,10 +1,10 @@
 //! Data structures for Binary PAF format
 
+use crate::binary::{complexity_metric_from_u8, complexity_metric_to_u8, BINARY_MAGIC};
+use crate::{utils::*, Distance};
+use lib_tracepoints::{ComplexityMetric, MixedRepresentation, TracepointType};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use lib_tracepoints::{TracepointType, ComplexityMetric, MixedRepresentation};
-use crate::{Distance, utils::*};
-use crate::binary::{BINARY_MAGIC, complexity_metric_to_u8, complexity_metric_from_u8};
 
 #[derive(Clone, Copy, Debug)]
 pub enum CompressionStrategy {
@@ -30,7 +30,10 @@ impl CompressionStrategy {
         let strategy_name = parts[0].to_lowercase();
         let compression_level = if parts.len() > 1 {
             parts[1].trim().parse::<i32>().map_err(|_| {
-                format!("Invalid compression level '{}'. Must be a number between 1 and 22.", parts[1])
+                format!(
+                    "Invalid compression level '{}'. Must be a number between 1 and 22.",
+                    parts[1]
+                )
             })?
         } else {
             3 // Default compression level
@@ -100,23 +103,23 @@ impl std::fmt::Display for CompressionStrategy {
         match self {
             CompressionStrategy::Automatic(level) => {
                 if *level == 3 {
-                    write!(f, "automatic")
+                    write!(f, "Automatic")
                 } else {
-                    write!(f, "automatic,{}", level)
+                    write!(f, "Automatic,{}", level)
                 }
             }
             CompressionStrategy::VarintZstd(level) => {
                 if *level == 3 {
-                    write!(f, "varint-zstd")
+                    write!(f, "Varint-zstd")
                 } else {
-                    write!(f, "varint-zstd,{}", level)
+                    write!(f, "Varint-zstd,{}", level)
                 }
             }
             CompressionStrategy::DeltaVarintZstd(level) => {
                 if *level == 3 {
-                    write!(f, "delta-varint-zstd")
+                    write!(f, "Delta-varint-zstd")
                 } else {
-                    write!(f, "delta-varint-zstd,{}", level)
+                    write!(f, "Delta-varint-zstd,{}", level)
                 }
             }
         }
@@ -168,11 +171,6 @@ impl BinaryPafHeader {
         }
     }
 
-    /// Get compression strategy from flags
-    pub(crate) fn strategy(&self) -> io::Result<CompressionStrategy> {
-        CompressionStrategy::from_code(self.flags & 0x07)
-    }
-
     /// Get delta encoding flag for first values (Automatic mode only)
     pub(crate) fn use_delta_first(&self) -> bool {
         (self.flags & 0x08) != 0
@@ -181,6 +179,56 @@ impl BinaryPafHeader {
     /// Get delta encoding flag for second values (Automatic mode only)
     pub(crate) fn use_delta_second(&self) -> bool {
         (self.flags & 0x10) != 0
+    }
+
+    /// Get format version
+    pub fn version(&self) -> u8 {
+        self.version
+    }
+
+    /// Get number of records
+    pub fn num_records(&self) -> u64 {
+        self.num_records
+    }
+
+    /// Get number of unique strings
+    pub fn num_strings(&self) -> u64 {
+        self.num_strings
+    }
+
+    /// Get compression strategy
+    pub fn strategy(&self) -> io::Result<CompressionStrategy> {
+        CompressionStrategy::from_code(self.flags & 0x07)
+    }
+
+    /// Get delta encoding flag for first values (Automatic mode only)
+    pub fn delta_first(&self) -> bool {
+        (self.flags & 0x08) != 0
+    }
+
+    /// Get delta encoding flag for second values (Automatic mode only)
+    pub fn delta_second(&self) -> bool {
+        (self.flags & 0x10) != 0
+    }
+
+    /// Get tracepoint type
+    pub fn tp_type(&self) -> TracepointType {
+        self.tracepoint_type
+    }
+
+    /// Get distance mode
+    pub fn distance(&self) -> &Distance {
+        &self.distance
+    }
+
+    /// Get complexity metric
+    pub fn complexity_metric(&self) -> ComplexityMetric {
+        self.complexity_metric
+    }
+
+    /// Get max complexity
+    pub fn max_complexity(&self) -> u64 {
+        self.max_complexity
     }
 
     pub(crate) fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
@@ -315,6 +363,7 @@ impl StringTable {
         })
     }
 }
+
 pub struct AlignmentRecord {
     pub query_name_id: u64,
     pub query_start: u64,
@@ -349,7 +398,9 @@ pub enum MixedTracepointItem {
 impl From<&MixedRepresentation> for MixedTracepointItem {
     fn from(item: &MixedRepresentation) -> Self {
         match item {
-            MixedRepresentation::Tracepoint(a, b) => MixedTracepointItem::Tracepoint(*a as u64, *b as u64),
+            MixedRepresentation::Tracepoint(a, b) => {
+                MixedTracepointItem::Tracepoint(*a as u64, *b as u64)
+            }
             MixedRepresentation::CigarOp(len, op) => MixedTracepointItem::CigarOp(*len as u64, *op),
         }
     }
@@ -363,7 +414,7 @@ pub struct Tag {
 
 #[derive(Debug)]
 pub enum TagValue {
-    Int(i64),
+    Int(i32),
     Float(f32),
     String(String),
 }
@@ -389,9 +440,9 @@ impl Tag {
         reader.read_exact(&mut tag_type)?;
         let value = match tag_type[0] {
             b'i' => {
-                let mut buf = [0u8; 8];
+                let mut buf = [0u8; 4];
                 reader.read_exact(&mut buf)?;
-                TagValue::Int(i64::from_le_bytes(buf))
+                TagValue::Int(i32::from_le_bytes(buf))
             }
             b'f' => {
                 let mut buf = [0u8; 4];
@@ -403,7 +454,10 @@ impl Tag {
                 let mut buf = vec![0u8; len as usize];
                 reader.read_exact(&mut buf)?;
                 TagValue::String(String::from_utf8(buf).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("Invalid UTF-8 in tag: {}", e))
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Invalid UTF-8 in tag: {}", e),
+                    )
                 })?)
             }
             _ => {
@@ -429,7 +483,7 @@ pub fn parse_tag(field: &str) -> Option<Tag> {
     let key = [parts[0].as_bytes()[0], parts[0].as_bytes()[1]];
     let tag_type = parts[1].as_bytes()[0];
     let value = match tag_type {
-        b'i' => parts[2].parse::<i64>().ok().map(TagValue::Int)?,
+        b'i' => parts[2].parse::<i32>().ok().map(TagValue::Int)?,
         b'f' => parts[2].parse::<f32>().ok().map(TagValue::Float)?,
         b'Z' => TagValue::String(parts[2].to_string()),
         _ => return None,

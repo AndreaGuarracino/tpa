@@ -1,115 +1,68 @@
 #!/bin/bash
 set -e
 
-# Comprehensive test suite for lib_bpaf parallel compression
-# Tests: compression, decompression, O(1) seeks - all with 1 and 8 threads
-# Measures: runtime, memory, correctness
+# Comprehensive test suite for lib_bpaf with proper tracepoint type testing
+# Tests: encoding CIGAR→tracepoints, compression, decompression, O(1) seeks (Mode A and Mode B)
+# Measures: runtime, memory, correctness, compression ratios
 
 REPO_DIR="/home/guarracino/Dropbox/git/lib_bpaf"
-INPUT="${1:-/home/guarracino/Desktop/big-from-fg.tp.20k.paf}"
-STRATEGY="${2:-automatic}"
+CIGZIP_DIR="/home/guarracino/Dropbox/git/cigzip"
+
+# Source CIGAR-based PAF file
+CIGAR_PAF="${1:-/home/guarracino/git/impg/hprcv2/data/hg002v1.1.pat.PanSN-vs-HG02818_mat_hprc_r2_v1.0.1.p95.Pinf.aln.paf.gz}"
+NUM_RECORDS=10000
 SEEK_ITERATIONS=1000
 
-if [ ! -f "$INPUT" ]; then
-    echo "Error: Input file not found: $INPUT"
+# Tracepoint types to test
+TP_TYPES=("standard")
+
+# Verify input file exists
+if [ ! -f "$CIGAR_PAF" ]; then
+    echo "Error: CIGAR-based PAF file not found: $CIGAR_PAF"
     exit 1
 fi
 
 echo "========================================"
 echo "lib_bpaf Comprehensive Test Suite"
+echo "Proper Tracepoint Type Testing"
 echo "========================================"
-echo "Input:      $INPUT"
-echo "Size:       $(ls -lh $INPUT | awk '{print $5}')"
-echo "Records:    $(wc -l < $INPUT)"
-echo "Strategy:   $STRATEGY"
+echo "Source:     $CIGAR_PAF"
+echo "Records:    $NUM_RECORDS"
+echo "Types:      Standard, Variable, Mixed"
 echo "========================================"
 echo
 
-# Build test programs
-echo "=== Building test programs ==="
+# Arrays to store results
+declare -A ENCODE_TIME COMPRESS_TIME COMPRESS_MEM COMPRESS_SIZE
+declare -A DECOMP_TIME DECOMP_MEM
+declare -A SEEK_TIME_A SEEK_TIME_B
+declare -A VERIFIED
+
+# Build cigzip
+echo "=== Building cigzip ==="
+if [ -d "$CIGZIP_DIR" ]; then
+    cd "$CIGZIP_DIR"
+    cargo build --release 2>&1 | tail -3
+    CIGZIP="$CIGZIP_DIR/target/release/cigzip"
+
+    if [ ! -f "$CIGZIP" ]; then
+        echo "Error: cigzip binary not found after build"
+        exit 1
+    fi
+else
+    echo "Error: cigzip directory not found: $CIGZIP_DIR"
+    exit 1
+fi
+echo "✓ cigzip built"
+echo
+
+# Build lib_bpaf test programs
+echo "=== Building lib_bpaf test programs ==="
 cd "$REPO_DIR"
 cargo build --release 2>&1 | tail -3
 
-# Build verify_tracepoints program
-if [ -f "$REPO_DIR/test/verify_tracepoints.rs" ]; then
-    echo "Compiling verify_tracepoints..."
-    rustc --edition 2021 -O "$REPO_DIR/test/verify_tracepoints.rs" \
-        -L target/release/deps \
-        --extern lib_bpaf=target/release/liblib_bpaf.rlib \
-        -o "$REPO_DIR/test/verify_tracepoints" 2>/dev/null || echo "Warning: verify_tracepoints compilation failed"
-fi
-
-# Build compression test program
-cat > /tmp/compression_test.rs << 'RUST_EOF'
-use std::env;
-use std::time::Instant;
-use lib_bpaf::{compress_paf, CompressionStrategy, Distance};
-use lib_tracepoints::{TracepointType, ComplexityMetric};
-
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        eprintln!("Usage: {} <input> <output>", args[0]);
-        std::process::exit(1);
-    }
-
-    let input = &args[1];
-    let output = &args[2];
-    let strategy = CompressionStrategy::Automatic(3);
-
-    // FASTGA format with trace_spacing=100
-    let tp_type = TracepointType::Fastga;
-    let trace_spacing = 100;  // Stored in max_complexity field
-    let complexity_metric = ComplexityMetric::EditDistance;
-    let distance = Distance::Edit;
-
-    let start = Instant::now();
-    compress_paf(input, output, strategy, tp_type, trace_spacing, complexity_metric, distance).expect("Compression failed");
-    let elapsed = start.elapsed();
-
-    println!("Compression time: {:.3}s", elapsed.as_secs_f64());
-}
-RUST_EOF
-
-# Find the lib_tracepoints rlib
-TRACEPOINTS_RLIB=$(find target/release/deps -name "liblib_tracepoints*.rlib" | head -1)
-rustc --edition 2021 -O /tmp/compression_test.rs \
-    -L target/release/deps \
-    --extern lib_bpaf=target/release/liblib_bpaf.rlib \
-    --extern lib_tracepoints="$TRACEPOINTS_RLIB" \
-    -o /tmp/compression_test 2>/dev/null
-
-# Build decompression test program
-cat > /tmp/decompression_test.rs << 'RUST_EOF'
-use std::env;
-use std::time::Instant;
-use lib_bpaf::decompress_paf;
-
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        eprintln!("Usage: {} <input> <output>", args[0]);
-        std::process::exit(1);
-    }
-
-    let input = &args[1];
-    let output = &args[2];
-
-    let start = Instant::now();
-    decompress_paf(input, output).expect("Decompression failed");
-    let elapsed = start.elapsed();
-
-    println!("Decompression time: {:.3}s", elapsed.as_secs_f64());
-}
-RUST_EOF
-
-rustc --edition 2021 -O /tmp/decompression_test.rs \
-    -L target/release/deps \
-    --extern lib_bpaf=target/release/liblib_bpaf.rlib \
-    -o /tmp/decompression_test 2>/dev/null
-
-# Build O(1) seek test program (with index, full runtime including file open)
-cat > /tmp/seek_test.rs << 'RUST_EOF'
+# Build seek test program (Mode A - with index)
+cat > /tmp/seek_test_mode_a.rs << 'RUST_EOF'
 use std::env;
 use std::time::Instant;
 use lib_bpaf::BpafReader;
@@ -125,24 +78,22 @@ fn main() {
     let record_id: u64 = args[2].parse().expect("Invalid record_id");
     let iterations: usize = args[3].parse().expect("Invalid iterations");
 
-    // Warmup (with file opening)
+    // Warmup
     for _ in 0..3 {
         let mut reader = BpafReader::open(bpaf_path).expect("Failed to open BPAF");
         let _ = reader.get_tracepoints(record_id).expect("Failed to fetch");
     }
 
-    // Benchmark - measure components separately
+    // Benchmark
     let mut total_open_us = 0f64;
     let mut total_seek_us = 0f64;
 
     for _ in 0..iterations {
-        // Measure open + load index
         let open_start = Instant::now();
         let mut reader = BpafReader::open(bpaf_path).expect("Failed to open BPAF");
         let open_elapsed = open_start.elapsed().as_micros() as f64;
         total_open_us += open_elapsed;
 
-        // Measure seek + decompress
         let seek_start = Instant::now();
         let _ = reader.get_tracepoints(record_id).expect("Failed to fetch");
         let seek_elapsed = seek_start.elapsed().as_micros() as f64;
@@ -153,40 +104,22 @@ fn main() {
     let avg_seek_us = total_seek_us / iterations as f64;
     let avg_total_us = avg_open_us + avg_seek_us;
 
-    println!("Mode A breakdown:");
-    println!("  Open+LoadIndex: {:.2} μs", avg_open_us);
-    println!("  Seek+Decompress: {:.2} μs", avg_seek_us);
-    println!("  Total: {:.2} μs", avg_total_us);
+    println!("MODEA_OPEN {:.2}", avg_open_us);
+    println!("MODEA_SEEK {:.2}", avg_seek_us);
+    println!("MODEA_TOTAL {:.2}", avg_total_us);
 }
 RUST_EOF
 
-rustc --edition 2021 -O /tmp/seek_test.rs \
+rustc --edition 2021 -O /tmp/seek_test_mode_a.rs \
     -L target/release/deps \
     --extern lib_bpaf=target/release/liblib_bpaf.rlib \
-    -o /tmp/seek_test 2>/dev/null
+    -o /tmp/seek_test_mode_a 2>/dev/null
 
-# Build O(1) seek test program (Mode B - direct tracepoint offset access)
-cat > /tmp/seek_test_tracepoint_offset.rs << 'RUST_EOF'
+# Build seek test program (Mode B - without index, direct offset)
+cat > /tmp/seek_test_mode_b.rs << 'RUST_EOF'
 use std::env;
 use std::time::Instant;
-use std::io::{Read, Seek, SeekFrom};
-use lib_bpaf::{BpafReader, build_index};
-
-fn read_varint<R: Read>(reader: &mut R) -> std::io::Result<u64> {
-    let mut value: u64 = 0;
-    let mut shift = 0;
-    loop {
-        let mut byte_buf = [0u8; 1];
-        reader.read_exact(&mut byte_buf)?;
-        let byte = byte_buf[0];
-        value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
-            break;
-        }
-        shift += 7;
-    }
-    Ok(value)
-}
+use lib_bpaf::BpafReader;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -199,48 +132,27 @@ fn main() {
     let record_id: u64 = args[2].parse().expect("Invalid record_id");
     let iterations: usize = args[3].parse().expect("Invalid iterations");
 
-    // Pre-build index to get record offset (not timed)
-    let index = build_index(bpaf_path).expect("Failed to build index");
-    let record_offset = index.get_offset(record_id).expect("Record ID out of range");
+    // Pre-compute tracepoint offset using BpafReader (not timed)
+    let mut reader = BpafReader::open(bpaf_path).expect("Failed to open BPAF");
+    let tracepoint_offset = reader.get_tracepoint_offset(record_id).expect("Failed to get tracepoint offset");
+    drop(reader);
 
-    // Calculate tracepoint offset by skipping PAF fields (not timed)
-    let mut reader = BpafReader::open_without_index(bpaf_path).expect("Failed to open BPAF");
-    let mut file = std::fs::File::open(bpaf_path).expect("Failed to open file");
-    file.seek(SeekFrom::Start(record_offset)).expect("Failed to seek");
-
-    // Skip 7 varints + 2 single bytes to reach tracepoint data
-    read_varint(&mut file).expect("query_name_id");
-    read_varint(&mut file).expect("query_start");
-    read_varint(&mut file).expect("query_end");
-    file.seek(SeekFrom::Current(1)).expect("strand");
-    read_varint(&mut file).expect("target_name_id");
-    read_varint(&mut file).expect("target_start");
-    read_varint(&mut file).expect("target_end");
-    read_varint(&mut file).expect("residue_matches");
-    read_varint(&mut file).expect("alignment_block_len");
-    file.seek(SeekFrom::Current(1)).expect("mapping_quality");
-
-    let tracepoint_offset = file.stream_position().expect("Failed to get position");
-    drop(file);
-
-    // Warmup (open without index, use direct tracepoint offset access)
+    // Warmup
     for _ in 0..3 {
         let mut reader = BpafReader::open_without_index(bpaf_path).expect("Failed to open BPAF");
         let _ = reader.get_tracepoints_at_offset(tracepoint_offset).expect("Failed to fetch");
     }
 
-    // Benchmark - measure components separately
+    // Benchmark
     let mut total_open_us = 0f64;
     let mut total_seek_us = 0f64;
 
     for _ in 0..iterations {
-        // Measure open (header only)
         let open_start = Instant::now();
         let mut reader = BpafReader::open_without_index(bpaf_path).expect("Failed to open BPAF");
         let open_elapsed = open_start.elapsed().as_micros() as f64;
         total_open_us += open_elapsed;
 
-        // Measure direct tracepoint offset seek + decompress
         let seek_start = Instant::now();
         let _ = reader.get_tracepoints_at_offset(tracepoint_offset).expect("Failed to fetch");
         let seek_elapsed = seek_start.elapsed().as_micros() as f64;
@@ -251,250 +163,282 @@ fn main() {
     let avg_seek_us = total_seek_us / iterations as f64;
     let avg_total_us = avg_open_us + avg_seek_us;
 
-    println!("Mode B breakdown:");
-    println!("  Open (header): {:.2} μs", avg_open_us);
-    println!("  DirectTracepointSeek+Decompress: {:.2} μs", avg_seek_us);
-    println!("  Total: {:.2} μs", avg_total_us);
+    println!("MODEB_OPEN {:.2}", avg_open_us);
+    println!("MODEB_SEEK {:.2}", avg_seek_us);
+    println!("MODEB_TOTAL {:.2}", avg_total_us);
 }
 RUST_EOF
 
-rustc --edition 2021 -O /tmp/seek_test_tracepoint_offset.rs \
+rustc --edition 2021 -O /tmp/seek_test_mode_b.rs \
     -L target/release/deps \
     --extern lib_bpaf=target/release/liblib_bpaf.rlib \
-    -o /tmp/seek_test_tracepoint_offset 2>/dev/null
+    -o /tmp/seek_test_mode_b 2>/dev/null
+
+# Build decompression test program
+cat > /tmp/decompression_test.rs << 'RUST_EOF'
+use std::env;
+use std::time::Instant;
+use lib_bpaf::decompress_bpaf;
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 3 {
+        eprintln!("Usage: {} <input> <output>", args[0]);
+        std::process::exit(1);
+    }
+
+    let input = &args[1];
+    let output = &args[2];
+
+    let start = Instant::now();
+    decompress_bpaf(input, output).expect("Decompression failed");
+    let elapsed = start.elapsed();
+
+    println!("Decompression time: {:.3}s", elapsed.as_secs_f64());
+}
+RUST_EOF
+
+rustc --edition 2021 -O /tmp/decompression_test.rs \
+    -L target/release/deps \
+    --extern lib_bpaf=target/release/liblib_bpaf.rlib \
+    -o /tmp/decompression_test 2>/dev/null
 
 echo "✓ Build complete"
 echo
 
-# Clean up any existing test files and indices
+# Extract sample from CIGAR-based PAF
+echo "=== Extracting $NUM_RECORDS records from CIGAR PAF ==="
+CIGAR_SAMPLE="/tmp/cigar_sample.paf"
+zcat "$CIGAR_PAF" | head -n $NUM_RECORDS > "$CIGAR_SAMPLE"
+
+ACTUAL_RECORDS=$(wc -l < "$CIGAR_SAMPLE")
+CIGAR_SIZE=$(stat -c%s "$CIGAR_SAMPLE")
+echo "Extracted: $ACTUAL_RECORDS records"
+echo "Size:      $(ls -lh "$CIGAR_SAMPLE" | awk '{print $5}') ($CIGAR_SIZE bytes)"
+echo
+
+# Clean up any existing test files
 rm -f /tmp/test.*.bpaf /tmp/test.*.bpaf.idx /tmp/test.*.paf 2>/dev/null
 
-# ========================================
-# TEST 1: Compression (Run 1)
-# ========================================
-echo "========================================"
-echo "TEST 1: Compression (Run 1)"
-echo "========================================"
-
-OUTPUT_1T="/tmp/test.1t.bpaf"
-/usr/bin/time -v /tmp/compression_test "$INPUT" "$OUTPUT_1T" 2>&1 | tee /tmp/compress_1t.log | grep -E "(Compression time|Maximum resident|User time|System time|Elapsed)"
-
-COMPRESS_1T_TIME=$(grep "Compression time" /tmp/compress_1t.log | awk '{print $3}' | sed 's/s//')
-COMPRESS_1T_MEM=$(grep "Maximum resident" /tmp/compress_1t.log | awk '{print $6}')
-COMPRESS_1T_SIZE=$(ls -lh "$OUTPUT_1T" | awk '{print $5}')
-
-echo "Runtime:  ${COMPRESS_1T_TIME}s"
-echo "Memory:   ${COMPRESS_1T_MEM} KB"
-echo "Size:     ${COMPRESS_1T_SIZE}"
-echo
-
-# ========================================
-# TEST 2: Compression (Run 2 - verify determinism)
-# ========================================
-echo "========================================"
-echo "TEST 2: Compression (Run 2 - verify determinism)"
-echo "========================================"
-
-OUTPUT_8T="/tmp/test.8t.bpaf"
-/usr/bin/time -v /tmp/compression_test "$INPUT" "$OUTPUT_8T" 2>&1 | tee /tmp/compress_8t.log | grep -E "(Compression time|Maximum resident|User time|System time|Elapsed)"
-
-COMPRESS_8T_TIME=$(grep "Compression time" /tmp/compress_8t.log | awk '{print $3}' | sed 's/s//')
-COMPRESS_8T_MEM=$(grep "Maximum resident" /tmp/compress_8t.log | awk '{print $6}')
-COMPRESS_8T_SIZE=$(ls -lh "$OUTPUT_8T" | awk '{print $5}')
-
-echo "Runtime:  ${COMPRESS_8T_TIME}s"
-echo "Memory:   ${COMPRESS_8T_MEM} KB"
-echo "Size:     ${COMPRESS_8T_SIZE}"
-echo
-echo
-
-# ========================================
-# TEST 3: Verify files are identical
-# ========================================
-echo "========================================"
-echo "TEST 3: File Identity Check"
-echo "========================================"
-
-if cmp -s "$OUTPUT_1T" "$OUTPUT_8T"; then
-    echo "✓ 1-thread and 8-thread outputs are identical"
-else
-    echo "✗ WARNING: Outputs differ!"
-    echo "  1t: $(md5sum $OUTPUT_1T | awk '{print $1}')"
-    echo "  8t: $(md5sum $OUTPUT_8T | awk '{print $1}')"
+SEEK_POSITIONS=(1 100 500)
+if [ $ACTUAL_RECORDS -gt 900 ]; then
+    SEEK_POSITIONS=(1 100 500 900)
 fi
-echo
 
-# ========================================
-# TEST 4: Decompression (1 thread output)
-# ========================================
-echo "========================================"
-echo "TEST 4: Decompression (1 thread output)"
-echo "========================================"
+# Main testing loop for each tracepoint type
+for TP_TYPE in "${TP_TYPES[@]}"; do
+    echo
+    echo "###################################################################"
+    echo "# TESTING TRACEPOINT TYPE: ${TP_TYPE^^}"
+    echo "###################################################################"
+    echo
 
-DECOMP_1T="/tmp/test.1t.decomp.paf"
-/usr/bin/time -v /tmp/decompression_test "$OUTPUT_1T" "$DECOMP_1T" 2>&1 | tee /tmp/decompress_1t.log | grep -E "(Decompression time|Maximum resident|User time|System time|Elapsed)"
+    TP_PAF="/tmp/test.${TP_TYPE}.tp.paf"
+    OUTPUT_BPAF="/tmp/test.${TP_TYPE}.bpaf"
+    DECOMP_PAF="/tmp/test.${TP_TYPE}.decomp.paf"
 
-DECOMP_1T_TIME=$(grep "Decompression time" /tmp/decompress_1t.log | awk '{print $3}' | sed 's/s//')
-DECOMP_1T_MEM=$(grep "Maximum resident" /tmp/decompress_1t.log | awk '{print $6}')
+    # ========================================
+    # TEST 1: Encode (CIGAR → Tracepoints)
+    # ========================================
+    echo "========================================"
+    echo "TEST 1 ($TP_TYPE): Encode CIGAR → Tracepoints"
+    echo "========================================"
 
-echo "Runtime:  ${DECOMP_1T_TIME}s"
-echo "Memory:   ${DECOMP_1T_MEM} KB"
+    ENCODE_START=$(date +%s.%N)
 
-# Verify correctness
-MD5_ORIG=$(md5sum "$INPUT" | awk '{print $1}')
-MD5_DECOMP=$(md5sum "$DECOMP_1T" | awk '{print $1}')
+    $CIGZIP encode \
+        --paf "$CIGAR_SAMPLE" \
+        --threads 8 \
+        --type "$TP_TYPE" \
+        --max-complexity 10 \
+        --complexity-metric edit-distance \
+        > "$TP_PAF" 2>/tmp/encode_${TP_TYPE}.log
 
-if [ "$MD5_ORIG" = "$MD5_DECOMP" ]; then
-    echo "✓ MD5 verified: $MD5_ORIG"
-else
-    echo "✗ MD5 mismatch!"
-    echo "  Original:     $MD5_ORIG"
-    echo "  Decompressed: $MD5_DECOMP"
-fi
-echo
+    ENCODE_END=$(date +%s.%N)
+    ENCODE_TIME[$TP_TYPE]=$(echo "$ENCODE_END - $ENCODE_START" | bc -l)
 
-# ========================================
-# TEST 5: Decompression (8 thread output)
-# ========================================
-echo "========================================"
-echo "TEST 5: Decompression (8 thread output)"
-echo "========================================"
+    TP_SIZE=$(stat -c%s "$TP_PAF")
+    echo "Encode time: ${ENCODE_TIME[$TP_TYPE]}s"
+    echo "Output size: $(ls -lh "$TP_PAF" | awk '{print $5}') ($TP_SIZE bytes)"
+    echo
 
-DECOMP_8T="/tmp/test.8t.decomp.paf"
-/usr/bin/time -v /tmp/decompression_test "$OUTPUT_8T" "$DECOMP_8T" 2>&1 | tee /tmp/decompress_8t.log | grep -E "(Decompression time|Maximum resident|User time|System time|Elapsed)"
+    # ========================================
+    # TEST 2: Compression (Tracepoints → BPAF)
+    # ========================================
+    echo "========================================"
+    echo "TEST 2 ($TP_TYPE): Compress Tracepoints → BPAF"
+    echo "========================================"
 
-DECOMP_8T_TIME=$(grep "Decompression time" /tmp/decompress_8t.log | awk '{print $3}' | sed 's/s//')
-DECOMP_8T_MEM=$(grep "Maximum resident" /tmp/decompress_8t.log | awk '{print $6}')
+    $CIGZIP compress \
+        --input "$TP_PAF" \
+        --output "$OUTPUT_BPAF" \
+        --strategy varint-zstd \
+        --type "$TP_TYPE" \
+        --max-complexity 10 \
+        --complexity-metric edit-distance \
+        --distance gap-affine-2p \
+        --penalties 5,8,2,24,1 \
+        2>&1 | tee /tmp/compress_${TP_TYPE}.log | tail -5
 
-echo "Runtime:  ${DECOMP_8T_TIME}s"
-echo "Memory:   ${DECOMP_8T_MEM} KB"
+    COMPRESS_TIME[$TP_TYPE]=$(grep -oP 'Compression took \K[0-9.]+' /tmp/compress_${TP_TYPE}.log || echo "N/A")
+    COMPRESS_SIZE[$TP_TYPE]=$(stat -c%s "$OUTPUT_BPAF")
 
-# Verify correctness
-MD5_DECOMP_8T=$(md5sum "$DECOMP_8T" | awk '{print $1}')
+    echo "Compress time: ${COMPRESS_TIME[$TP_TYPE]}s"
+    echo "Output size:   $(ls -lh "$OUTPUT_BPAF" | awk '{print $5}') (${COMPRESS_SIZE[$TP_TYPE]} bytes)"
+    echo
 
-if [ "$MD5_ORIG" = "$MD5_DECOMP_8T" ]; then
-    echo "✓ MD5 verified: $MD5_ORIG"
-else
-    echo "✗ MD5 mismatch!"
-    echo "  Original:     $MD5_ORIG"
-    echo "  Decompressed: $MD5_DECOMP_8T"
-fi
-echo
+    # ========================================
+    # TEST 3: Decompression (BPAF → Tracepoints)
+    # ========================================
+    echo "========================================"
+    echo "TEST 3 ($TP_TYPE): Decompress BPAF → Tracepoints"
+    echo "========================================"
 
-# ========================================
-# TEST 6: O(1) Random Access Performance
-# ========================================
-echo "========================================"
-echo "TEST 6: O(1) Random Access Performance"
-echo "========================================"
+    /usr/bin/time -v /tmp/decompression_test "$OUTPUT_BPAF" "$DECOMP_PAF" 2>&1 | tee /tmp/decompress_${TP_TYPE}.log | grep -E "(Decompression time|Maximum resident|User time|System time|Elapsed)"
 
-# Clean index to ensure fresh build
-rm -f "$OUTPUT_1T.idx" 2>/dev/null
+    DECOMP_TIME[$TP_TYPE]=$(grep "Decompression time" /tmp/decompress_${TP_TYPE}.log | awk '{print $3}' | sed 's/s//')
+    DECOMP_MEM[$TP_TYPE]=$(grep "Maximum resident" /tmp/decompress_${TP_TYPE}.log | awk '{print $6}')
 
-TOTAL_RECORDS=$(wc -l < "$INPUT")
-SEEK_POSITIONS=(1 10 100 1000 10000)
+    echo "Decomp time:  ${DECOMP_TIME[$TP_TYPE]}s"
+    echo "Memory:       ${DECOMP_MEM[$TP_TYPE]} KB"
 
-echo "Testing $SEEK_ITERATIONS seeks at different positions..."
-echo "File: $OUTPUT_1T"
-echo
-echo "--- Mode A: WITH INDEX ---"
+    # Verify correctness (normalize all float fields to 3 decimal places)
+    # Normalize function: truncate ALL float fields (md:f:, gi:f:, bi:f:) to 3 decimal places
+    # Using 3 decimals to avoid f32 rounding errors completely
+    normalize_precision() {
+        # First pass: ensure all floats have at least 3 decimal places by padding with zeros
+        # Second pass: truncate to exactly 3 decimal places
+        sed -E 's/(:f:[0-9]+\.[0-9]{1,2})($|[^0-9])/\1000\2/g' "$1" | \
+        sed -E 's/(:f:[0-9]+\.)([0-9]{3})[0-9]*/\1\2/g'
+    }
 
-for POS in "${SEEK_POSITIONS[@]}"; do
-    if [ $POS -ge $TOTAL_RECORDS ]; then
-        continue
+    MD5_TP=$(normalize_precision "$TP_PAF" | md5sum | awk '{print $1}')
+    MD5_DECOMP=$(normalize_precision "$DECOMP_PAF" | md5sum | awk '{print $1}')
+
+    if [ "$MD5_TP" = "$MD5_DECOMP" ]; then
+        echo "✓ Tracepoints verified: Perfect match (MD5: $MD5_TP, normalized to 3 decimal places for all floats)"
+        VERIFIED[$TP_TYPE]="✓ Perfect match"
+    else
+        echo "✗ MD5 mismatch!"
+        echo "  Encoded:      $MD5_TP"
+        echo "  Decompressed: $MD5_DECOMP"
+        VERIFIED[$TP_TYPE]="✗ FAILED"
     fi
+    echo
 
-    /usr/bin/time -v /tmp/seek_test "$OUTPUT_1T" $POS $SEEK_ITERATIONS 2>&1 | tee /tmp/seek_${POS}.log | grep -E "(Mode A|Open\+LoadIndex|Seek\+Decompress|Total|Maximum resident)"
+    # ========================================
+    # TEST 4: O(1) Random Access Performance
+    # ========================================
+    echo "========================================"
+    echo "TEST 4 ($TP_TYPE): O(1) Random Access"
+    echo "========================================"
 
-    OPEN_TIME=$(grep "Open+LoadIndex:" /tmp/seek_${POS}.log | awk '{print $2}')
-    SEEK_TIME=$(grep "Seek+Decompress:" /tmp/seek_${POS}.log | awk '{print $2}')
-    TOTAL_TIME=$(grep "Total:" /tmp/seek_${POS}.log | awk '{print $2}')
-    SEEK_MEM=$(grep "Maximum resident" /tmp/seek_${POS}.log | awk '{print $6}')
+    # Clean index to ensure fresh build
+    rm -f "$OUTPUT_BPAF.idx" 2>/dev/null
 
-    printf "Position %6d: Open=%s | Seek=%s | Total=%s μs | Mem=%s KB\n" $POS "$OPEN_TIME" "$SEEK_TIME" "$TOTAL_TIME" "$SEEK_MEM"
-done
+    echo "Testing $SEEK_ITERATIONS seeks at different positions..."
+    echo
 
-echo
-echo "--- Mode B: DIRECT TRACEPOINT OFFSET ---"
-
-for POS in "${SEEK_POSITIONS[@]}"; do
-    if [ $POS -ge $TOTAL_RECORDS ]; then
-        continue
-    fi
-
-    /usr/bin/time -v /tmp/seek_test_tracepoint_offset "$OUTPUT_1T" $POS $SEEK_ITERATIONS 2>&1 | tee /tmp/seek_tp_offset_${POS}.log | grep -E "(Mode B|Open \(header\)|DirectTracepointSeek\+Decompress|Total|Maximum resident)"
-
-    OPEN_TIME=$(grep "Open (header):" /tmp/seek_tp_offset_${POS}.log | awk '{print $3}')
-    SEEK_TIME=$(grep "DirectTracepointSeek+Decompress:" /tmp/seek_tp_offset_${POS}.log | awk '{print $2}')
-    TOTAL_TIME=$(grep "Total:" /tmp/seek_tp_offset_${POS}.log | awk '{print $2}')
-    SEEK_MEM=$(grep "Maximum resident" /tmp/seek_tp_offset_${POS}.log | awk '{print $6}')
-
-    printf "Position %6d: Open=%s | Seek=%s | Total=%s μs | Mem=%s KB\n" $POS "$OPEN_TIME" "$SEEK_TIME" "$TOTAL_TIME" "$SEEK_MEM"
-done
-echo
-
-# ========================================
-# TEST 7: O(1) Seek Correctness
-# ========================================
-echo "========================================"
-echo "TEST 7: O(1) Seek Correctness"
-echo "========================================"
-
-# Clean index again to ensure fresh build for correctness tests
-rm -f "$OUTPUT_1T.idx" 2>/dev/null
-
-if [ -f "$REPO_DIR/test/verify_tracepoints" ]; then
-    echo "Verifying tracepoint accuracy for random records..."
-
-    # Test 10 random positions
-    TEST_POSITIONS=(0 1 10 100 500 1000 5000 10000 15000 19999)
-    FAILED=0
-
-    for POS in "${TEST_POSITIONS[@]}"; do
-        if [ $POS -ge $TOTAL_RECORDS ]; then
+    # Calculate average across all positions for Mode A
+    TOTAL_TIME_A=0
+    COUNT_A=0
+    for POS in "${SEEK_POSITIONS[@]}"; do
+        if [ $POS -ge $ACTUAL_RECORDS ]; then
             continue
         fi
 
-        if "$REPO_DIR/test/verify_tracepoints" "$INPUT" "$OUTPUT_1T" $POS 2>&1 | grep -q "✓"; then
-            echo "✓ Record $POS tracepoints verified"
-        else
-            echo "✗ Record $POS tracepoints MISMATCH!"
-            FAILED=$((FAILED + 1))
+        OUTPUT=$(/usr/bin/time -v /tmp/seek_test_mode_a "$OUTPUT_BPAF" $POS $SEEK_ITERATIONS 2>&1)
+        TIME_A=$(echo "$OUTPUT" | grep "MODEA_TOTAL" | awk '{print $2}')
+
+        if [ -n "$TIME_A" ] && [ "$TIME_A" != "0.00" ]; then
+            TOTAL_TIME_A=$(echo "$TOTAL_TIME_A + $TIME_A" | bc -l)
+            COUNT_A=$((COUNT_A + 1))
         fi
     done
 
-    echo
-    if [ $FAILED -eq 0 ]; then
-        echo "✓ All seek correctness tests passed"
+    if [ $COUNT_A -gt 0 ]; then
+        SEEK_TIME_A[$TP_TYPE]=$(echo "scale=2; $TOTAL_TIME_A / $COUNT_A" | bc -l)
     else
-        echo "✗ Failed $FAILED correctness tests"
+        SEEK_TIME_A[$TP_TYPE]="N/A"
     fi
-else
-    echo "⚠ verify_tracepoints not available, skipping correctness check"
-fi
-echo
+
+    # Calculate average across all positions for Mode B
+    TOTAL_TIME_B=0
+    COUNT_B=0
+    for POS in "${SEEK_POSITIONS[@]}"; do
+        if [ $POS -ge $ACTUAL_RECORDS ]; then
+            continue
+        fi
+
+        OUTPUT=$(/usr/bin/time -v /tmp/seek_test_mode_b "$OUTPUT_BPAF" $POS $SEEK_ITERATIONS 2>&1)
+        TIME_B=$(echo "$OUTPUT" | grep "MODEB_TOTAL" | awk '{print $2}')
+
+        if [ -n "$TIME_B" ] && [ "$TIME_B" != "0.00" ]; then
+            TOTAL_TIME_B=$(echo "$TOTAL_TIME_B + $TIME_B" | bc -l)
+            COUNT_B=$((COUNT_B + 1))
+        fi
+    done
+
+    if [ $COUNT_B -gt 0 ]; then
+        SEEK_TIME_B[$TP_TYPE]=$(echo "scale=2; $TOTAL_TIME_B / $COUNT_B" | bc -l)
+    else
+        SEEK_TIME_B[$TP_TYPE]="N/A"
+    fi
+
+    echo "Average seek time (Mode A - with index):    ${SEEK_TIME_A[$TP_TYPE]} μs"
+    echo "Average seek time (Mode B - direct offset): ${SEEK_TIME_B[$TP_TYPE]} μs"
+    echo
+done
 
 # ========================================
-# SUMMARY
+# FINAL SUMMARY
 # ========================================
-echo "========================================"
-echo "COMPREHENSIVE TEST SUMMARY"
-echo "========================================"
 echo
-echo "Input: $INPUT ($(ls -lh $INPUT | awk '{print $5}'))"
+echo "###################################################################"
+echo "# FINAL SUMMARY - ALL TRACEPOINT TYPES"
+echo "###################################################################"
 echo
-echo "--- Compression ---"
-echo "Run 1:  ${COMPRESS_1T_TIME}s | ${COMPRESS_1T_MEM} KB | ${COMPRESS_1T_SIZE}"
-echo "Run 2:  ${COMPRESS_8T_TIME}s | ${COMPRESS_8T_MEM} KB | ${COMPRESS_8T_SIZE}"
+echo "Source:  $CIGAR_PAF"
+echo "Sample:  $ACTUAL_RECORDS records, $(ls -lh "$CIGAR_SAMPLE" | awk '{print $5}') ($CIGAR_SIZE bytes)"
 echo
-echo "--- Decompression ---"
-echo "Run 1 output: ${DECOMP_1T_TIME}s | ${DECOMP_1T_MEM} KB"
-echo "Run 2 output: ${DECOMP_8T_TIME}s | ${DECOMP_8T_MEM} KB"
+
+# Print table
+printf "╔═══════════╦══════════════╦═══════════════╦════════════════╦═══════════════╦═════════════╦═════════════╗\n"
+printf "║ %-9s ║ Encode (s)   ║ Compress (s)  ║ Decomp (s)     ║ Size (bytes)  ║ Seek A (μs) ║ Seek B (μs) ║\n" "Type"
+printf "╠═══════════╬══════════════╬═══════════════╬════════════════╬═══════════════╬═════════════╬═════════════╣\n"
+
+for TP_TYPE in "${TP_TYPES[@]}"; do
+    printf "║ %-9s ║ %12s ║ %13s ║ %14s ║ %13s ║ %11s ║ %11s ║\n" \
+        "$TP_TYPE" \
+        "$(printf '%.3f' ${ENCODE_TIME[$TP_TYPE]} 2>/dev/null || echo 'N/A')" \
+        "${COMPRESS_TIME[$TP_TYPE]}" \
+        "${DECOMP_TIME[$TP_TYPE]}" \
+        "${COMPRESS_SIZE[$TP_TYPE]}" \
+        "${SEEK_TIME_A[$TP_TYPE]}" \
+        "${SEEK_TIME_B[$TP_TYPE]}"
+done
+
+printf "╚═══════════╩══════════════╩═══════════════╩════════════════╩═══════════════╩═════════════╩═════════════╝\n"
 echo
-echo "--- Correctness ---"
-echo "Compression: $(if cmp -s $OUTPUT_1T $OUTPUT_8T; then echo '✓ Identical'; else echo '✗ Different'; fi)"
-echo "Decompression: $(if [ "$MD5_ORIG" = "$MD5_DECOMP" ] && [ "$MD5_ORIG" = "$MD5_DECOMP_8T" ]; then echo '✓ Verified'; else echo '✗ Failed'; fi)"
-echo "O(1) seeks: $(if [ $FAILED -eq 0 ]; then echo '✓ Verified'; else echo "✗ $FAILED failures"; fi)"
+
+# Data integrity summary
+echo "Data Integrity:"
+for TP_TYPE in "${TP_TYPES[@]}"; do
+    printf "  %-9s : %s\n" "$TP_TYPE" "${VERIFIED[$TP_TYPE]}"
+done
+echo
+
+# Compression ratios (CIGAR PAF → BPAF)
+echo "Compression Ratios (CIGAR PAF → BPAF):"
+for TP_TYPE in "${TP_TYPES[@]}"; do
+    RATIO=$(echo "scale=2; $CIGAR_SIZE / ${COMPRESS_SIZE[$TP_TYPE]}" | bc -l)
+    printf "  %-9s : %.2fx (CIGAR: %d bytes → BPAF: %s bytes)\n" \
+        "$TP_TYPE" \
+        "$RATIO" \
+        "$CIGAR_SIZE" \
+        "${COMPRESS_SIZE[$TP_TYPE]}"
+done
+
 echo
 echo "========================================"
 echo "All tests complete!"

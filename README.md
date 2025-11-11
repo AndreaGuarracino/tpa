@@ -87,25 +87,25 @@ for record in reader.iter_records() {
 ### Compression
 
 ```rust
-use lib_bpaf::{compress_paf, CompressionStrategy};
+use lib_bpaf::{compress_paf_with_tracepoints, CompressionStrategy};
 
 // Automatic (default): Analyzes data to choose delta vs raw + varint + zstd
 // - Samples first 1000 records to determine optimal encoding
 // - Handles all tracepoint types automatically
 // - Enables O(1) random tracepoint access
-compress_paf("alignments.paf", "alignments.bpaf", CompressionStrategy::Automatic(3))?;
+compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::Automatic(3))?;
 
 // DeltaVarintZstd: Delta encoding + varint + zstd
 // - Always uses delta encoding for tracepoints
 // - Works well when values are naturally small or monotonic
 // - Enables O(1) random tracepoint access
-compress_paf("alignments.paf", "alignments.bpaf", CompressionStrategy::DeltaVarintZstd(3))?;
+compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::DeltaVarintZstd(3))?;
 
 // VarintZstd: No delta + varint + zstd
 // - All types: raw first values
 // - Use if delta encoding doesn't help your data
 // - Also enables O(1) random tracepoint access
-compress_paf("alignments.paf", "alignments.bpaf", CompressionStrategy::VarintZstd(3))?;
+compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::VarintZstd(3))?;
 ```
 
 **Strategy guide:**

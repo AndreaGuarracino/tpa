@@ -1,9 +1,9 @@
 //! Utility functions for binary I/O
 
+use crate::Distance;
 use flate2::read::MultiGzDecoder;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use crate::Distance;
 
 // ============================================================================
 // VARINT ENCODING (LEB128)
@@ -97,8 +97,8 @@ pub(crate) fn write_distance<W: Write>(writer: &mut W, distance: &Distance) -> i
 pub(crate) fn read_distance<R: Read>(reader: &mut R) -> io::Result<Distance> {
     let mut code = [0u8; 1];
     reader.read_exact(&mut code)?;
-    let mut distance = Distance::from_u8(code[0])
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut distance =
+        Distance::from_u8(code[0]).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     match &mut distance {
         Distance::Edit => {}
