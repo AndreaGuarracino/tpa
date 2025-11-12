@@ -36,7 +36,8 @@ Binary format for genomic sequence alignments with tracepoints.
 - **Tags**: Optional key-value pairs
 
 ### String Table
-- Follows the header and stores deduplicated sequence names (length + UTF-8 bytes)
+- Follows the header and stores deduplicated sequence names
+- Per string: name length (varint) + name bytes (UTF-8) + sequence length (varint)
 
 ## Installation
 

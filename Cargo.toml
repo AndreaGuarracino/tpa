@@ -14,3 +14,10 @@ flate2 = "1.1.5"
 env_logger = "0.11.8"
 lib_tracepoints = { git = "https://github.com/AndreaGuarracino/lib_tracepoints" }
 lib_wfa2 = { git = "https://github.com/AndreaGuarracino/lib_wfa2" }
+
+[dev-dependencies]
+noodles = { version = "0.100.0", features = ["bgzf"] }
+
+[[bin]]
+name = "bpaf-analyze"
+path = "src/bin/bpaf-analyze.rs"

@@ -231,7 +231,7 @@ pub(crate) fn decompress_varint<R: Read>(
     strategy: CompressionStrategy,
 ) -> io::Result<()> {
     // Read string table
-    let string_table = StringTable::read(&mut reader)?;
+    let string_table = StringTable::read(&mut reader, header.num_strings())?;
 
     // Stream write records
     let output: Box<dyn Write> = if output_path == "-" {
@@ -703,7 +703,7 @@ pub fn build_index(bpaf_path: &str) -> io::Result<BpafIndex> {
             format!("Unsupported format version: {}", header.version),
         ));
     }
-    StringTable::read(&mut reader)?;
+    StringTable::read(&mut reader, header.num_strings)?;
 
     let mut offsets = Vec::with_capacity(header.num_records as usize);
     for _ in 0..header.num_records {
@@ -891,8 +891,8 @@ impl BpafReader {
         }
 
         self.file.seek(SeekFrom::Start(0))?;
-        BinaryPafHeader::read(&mut self.file)?;
-        self.string_table = StringTable::read(&mut self.file)?;
+        let header = BinaryPafHeader::read(&mut self.file)?;
+        self.string_table = StringTable::read(&mut self.file, header.num_strings())?;
         Ok(())
     }
 

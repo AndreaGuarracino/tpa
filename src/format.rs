@@ -287,7 +287,6 @@ impl StringTable {
     }
 
     pub(crate) fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        write_varint(writer, self.strings.len() as u64)?;
         for (s, &len) in self.strings.iter().zip(self.lengths.iter()) {
             write_varint(writer, s.len() as u64)?;
             writer.write_all(s.as_bytes())?;
@@ -296,8 +295,8 @@ impl StringTable {
         Ok(())
     }
 
-    pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
-        let num_strings = read_varint(reader)? as usize;
+    pub fn read<R: Read>(reader: &mut R, num_strings: u64) -> io::Result<Self> {
+        let num_strings = num_strings as usize;
         let mut strings = Vec::with_capacity(num_strings);
         let mut lengths = Vec::with_capacity(num_strings);
         let mut index = HashMap::new();
