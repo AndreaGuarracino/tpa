@@ -10,11 +10,13 @@ CIGZIP_DIR="/home/guarracino/Dropbox/git/cigzip"
 
 # Source CIGAR-based PAF file
 CIGAR_PAF="${1:-/home/guarracino/git/impg/hprcv2/data/hg002v1.1.pat.PanSN-vs-HG02818_mat_hprc_r2_v1.0.1.p95.Pinf.aln.paf.gz}"
-NUM_RECORDS=10000
+MAX_COMPLEXITY="${2:-32}"
+COMPLEXITY_METRIC="${3:-edit-distance}"
+NUM_RECORDS=20000
 SEEK_ITERATIONS=1000
 
 # Tracepoint types to test
-TP_TYPES=("standard")
+TP_TYPES=("standard" "variable" "mixed")
 
 # Verify input file exists
 if [ ! -f "$CIGAR_PAF" ]; then
@@ -26,9 +28,11 @@ echo "========================================"
 echo "lib_bpaf Comprehensive Test Suite"
 echo "Proper Tracepoint Type Testing"
 echo "========================================"
-echo "Source:     $CIGAR_PAF"
-echo "Records:    $NUM_RECORDS"
-echo "Types:      Standard, Variable, Mixed"
+echo "Source:       $CIGAR_PAF"
+echo "Records:      $NUM_RECORDS"
+echo "Complexity:   $MAX_COMPLEXITY"
+echo "Metric:       $COMPLEXITY_METRIC"
+echo "Types:        ${TP_TYPES[*]}"
 echo "========================================"
 echo
 
@@ -209,7 +213,12 @@ echo
 # Extract sample from CIGAR-based PAF
 echo "=== Extracting $NUM_RECORDS records from CIGAR PAF ==="
 CIGAR_SAMPLE="/tmp/cigar_sample.paf"
-zcat "$CIGAR_PAF" | head -n $NUM_RECORDS > "$CIGAR_SAMPLE"
+# Handle both gzipped and plain PAF files
+if [[ "$CIGAR_PAF" == *.gz ]]; then
+    zcat "$CIGAR_PAF" | head -n $NUM_RECORDS > "$CIGAR_SAMPLE"
+else
+    head -n $NUM_RECORDS "$CIGAR_PAF" > "$CIGAR_SAMPLE"
+fi
 
 ACTUAL_RECORDS=$(wc -l < "$CIGAR_SAMPLE")
 CIGAR_SIZE=$(stat -c%s "$CIGAR_SAMPLE")
@@ -225,6 +234,15 @@ if [ $ACTUAL_RECORDS -gt 900 ]; then
     SEEK_POSITIONS=(1 100 500 900)
 fi
 
+# Detect if input file already has tracepoint tags
+if head -1 "$CIGAR_SAMPLE" | grep -q "tp:Z:"; then
+    HAS_TRACEPOINTS=true
+    echo "=== Input file already has tracepoint tags (tp:Z:) - will skip encoding ==="
+    echo
+else
+    HAS_TRACEPOINTS=false
+fi
+
 # Main testing loop for each tracepoint type
 for TP_TYPE in "${TP_TYPES[@]}"; do
     echo
@@ -238,29 +256,43 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
     DECOMP_PAF="/tmp/test.${TP_TYPE}.decomp.paf"
 
     # ========================================
-    # TEST 1: Encode (CIGAR → Tracepoints)
+    # TEST 1: Encode (CIGAR → Tracepoints) or Copy Tracepoints
     # ========================================
-    echo "========================================"
-    echo "TEST 1 ($TP_TYPE): Encode CIGAR → Tracepoints"
-    echo "========================================"
+    if [ "$HAS_TRACEPOINTS" = "true" ]; then
+        echo "========================================"
+        echo "TEST 1 ($TP_TYPE): Input already has tracepoints - copying file"
+        echo "========================================"
 
-    ENCODE_START=$(date +%s.%N)
+        cp "$CIGAR_SAMPLE" "$TP_PAF"
+        ENCODE_TIME[$TP_TYPE]="0.000"
 
-    $CIGZIP encode \
-        --paf "$CIGAR_SAMPLE" \
-        --threads 8 \
-        --type "$TP_TYPE" \
-        --max-complexity 10 \
-        --complexity-metric edit-distance \
-        > "$TP_PAF" 2>/tmp/encode_${TP_TYPE}.log
+        TP_SIZE=$(stat -c%s "$TP_PAF")
+        echo "File copied (no encoding needed)"
+        echo "Output size: $(ls -lh "$TP_PAF" | awk '{print $5}') ($TP_SIZE bytes)"
+        echo
+    else
+        echo "========================================"
+        echo "TEST 1 ($TP_TYPE): Encode CIGAR → Tracepoints"
+        echo "========================================"
 
-    ENCODE_END=$(date +%s.%N)
-    ENCODE_TIME[$TP_TYPE]=$(echo "$ENCODE_END - $ENCODE_START" | bc -l)
+        ENCODE_START=$(date +%s.%N)
 
-    TP_SIZE=$(stat -c%s "$TP_PAF")
-    echo "Encode time: ${ENCODE_TIME[$TP_TYPE]}s"
-    echo "Output size: $(ls -lh "$TP_PAF" | awk '{print $5}') ($TP_SIZE bytes)"
-    echo
+        $CIGZIP encode \
+            --paf "$CIGAR_SAMPLE" \
+            --threads 8 \
+            --type "$TP_TYPE" \
+            --max-complexity $MAX_COMPLEXITY \
+            --complexity-metric $COMPLEXITY_METRIC \
+            > "$TP_PAF" 2>/tmp/encode_${TP_TYPE}.log
+
+        ENCODE_END=$(date +%s.%N)
+        ENCODE_TIME[$TP_TYPE]=$(echo "$ENCODE_END - $ENCODE_START" | bc -l)
+
+        TP_SIZE=$(stat -c%s "$TP_PAF")
+        echo "Encode time: ${ENCODE_TIME[$TP_TYPE]}s"
+        echo "Output size: $(ls -lh "$TP_PAF" | awk '{print $5}') ($TP_SIZE bytes)"
+        echo
+    fi
 
     # ========================================
     # TEST 2: Compression (Tracepoints → BPAF)
@@ -272,10 +304,10 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
     $CIGZIP compress \
         --input "$TP_PAF" \
         --output "$OUTPUT_BPAF" \
-        --strategy varint-zstd \
+        --strategy automatic \
         --type "$TP_TYPE" \
-        --max-complexity 10 \
-        --complexity-metric edit-distance \
+        --max-complexity $MAX_COMPLEXITY \
+        --complexity-metric $COMPLEXITY_METRIC \
         --distance gap-affine-2p \
         --penalties 5,8,2,24,1 \
         2>&1 | tee /tmp/compress_${TP_TYPE}.log | tail -5
@@ -306,9 +338,13 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
     # Normalize function: truncate ALL float fields (md:f:, gi:f:, bi:f:) to 3 decimal places
     # Using 3 decimals to avoid f32 rounding errors completely
     normalize_precision() {
-        # First pass: ensure all floats have at least 3 decimal places by padding with zeros
-        # Second pass: truncate to exactly 3 decimal places
-        sed -E 's/(:f:[0-9]+\.[0-9]{1,2})($|[^0-9])/\1000\2/g' "$1" | \
+        # Normalize ALL float format variations to ensure proper comparison
+        # 1. Leading decimal points (.0549 → 0.0549)
+        # 2. Integer floats (1 → 1.000, 0 → 0.000)
+        # 3. Truncate to exactly 3 decimal places
+        sed -E 's/:f:\./:f:0./g' "$1" | \
+        sed -E 's/:f:([0-9]+)($|[^0-9.])/:f:\1.000\2/g' | \
+        sed -E 's/(:f:[0-9]+\.[0-9]{1,2})($|[^0-9])/\1000\2/g' | \
         sed -E 's/(:f:[0-9]+\.)([0-9]{3})[0-9]*/\1\2/g'
     }
 
