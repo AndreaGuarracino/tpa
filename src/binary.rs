@@ -1,6 +1,6 @@
 //! Binary I/O operations for BPAF format
 
-use lib_tracepoints::{ComplexityMetric, TracepointType};
+use lib_tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 use log::{debug, info};
 use std::convert::TryFrom;
 use std::fs::File;
@@ -76,6 +76,16 @@ fn encode_varint_inline(mut value: u64) -> Vec<u8> {
     bytes
 }
 
+#[inline]
+fn u64_to_usize(value: u64) -> io::Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Tracepoint value {} exceeds usize capacity", value),
+        )
+    })
+}
+
 /// Empirical strategy selection by actually compressing samples
 /// Returns true if ZigzagDelta should be used (produces smaller output)
 pub(crate) fn analyze_smart_compression(records: &[AlignmentRecord], zstd_level: i32) -> bool {
@@ -87,8 +97,8 @@ pub(crate) fn analyze_smart_compression(records: &[AlignmentRecord], zstd_level:
     for record in records.iter() {
         if let TracepointData::Standard(tps) | TracepointData::Fastga(tps) = &record.tracepoints {
             for (first, second) in tps {
-                all_first_vals.push(*first);
-                all_second_vals.push(*second);
+                all_first_vals.push(*first as u64);
+                all_second_vals.push(*second as u64);
             }
         }
     }
@@ -241,8 +251,8 @@ fn format_tracepoints(tps: &TracepointData) -> String {
         TracepointData::Mixed(items) => items
             .iter()
             .map(|item| match item {
-                MixedTracepointItem::Tracepoint(a, b) => format!("{},{}", a, b),
-                MixedTracepointItem::CigarOp(len, op) => format!("{}{}", len, op),
+                MixedRepresentation::Tracepoint(a, b) => format!("{},{}", a, b),
+                MixedRepresentation::CigarOp(len, op) => format!("{}{}", len, op),
             })
             .collect::<Vec<_>>()
             .join(";"),
@@ -281,8 +291,6 @@ pub(crate) fn decompress_varint<R: Read>(
             &mut reader,
             strategy,
             header.tracepoint_type,
-            header.complexity_metric,
-            header.max_complexity,
         )?;
         write_paf_line_with_tracepoints(&mut writer, &record, &string_table)?;
     }
@@ -296,8 +304,6 @@ fn read_record<R: Read>(
     reader: &mut R,
     strategy: CompressionStrategy,
     tp_type: TracepointType,
-    complexity_metric: ComplexityMetric,
-    max_complexity: u64,
 ) -> io::Result<AlignmentRecord> {
     let query_name_id = read_varint(reader)?;
     let query_start = read_varint(reader)?;
@@ -333,9 +339,6 @@ fn read_record<R: Read>(
         residue_matches,
         alignment_block_len,
         mapping_quality,
-        tp_type,
-        complexity_metric,
-        max_complexity,
         tracepoints,
         tags,
     })
@@ -431,7 +434,13 @@ fn read_tracepoints<R: Read>(
             let first_vals = decode_tracepoint_values(&first_buf, num_items, strategy)?;
             let second_vals = decode_tracepoint_values(&second_buf, num_items, strategy)?;
 
-            let tps: Vec<(u64, u64)> = first_vals.into_iter().zip(second_vals).collect();
+            let mut tps = Vec::with_capacity(num_items);
+            for (a, b) in first_vals.into_iter().zip(second_vals) {
+                let a_usize = u64_to_usize(a)?;
+                let b_usize = u64_to_usize(b)?;
+                tps.push((a_usize, b_usize));
+            }
+
             Ok(match tp_type {
                 TracepointType::Standard => TracepointData::Standard(tps),
                 _ => TracepointData::Fastga(tps),
@@ -451,14 +460,14 @@ fn read_tracepoints<R: Read>(
 fn read_variable_tracepoint_items<R: Read>(
     reader: &mut R,
     num_items: usize,
-) -> io::Result<Vec<(u64, Option<u64>)>> {
+) -> io::Result<Vec<(usize, Option<usize>)>> {
     let mut tps = Vec::with_capacity(num_items);
     for _ in 0..num_items {
-        let a = read_varint(reader)?;
+        let a = u64_to_usize(read_varint(reader)?)?;
         let mut flag = [0u8; 1];
         reader.read_exact(&mut flag)?;
         let b_opt = if flag[0] == 1 {
-            Some(read_varint(reader)?)
+            Some(u64_to_usize(read_varint(reader)?)?)
         } else {
             None
         };
@@ -470,22 +479,22 @@ fn read_variable_tracepoint_items<R: Read>(
 fn read_mixed_tracepoint_items<R: Read>(
     reader: &mut R,
     num_items: usize,
-) -> io::Result<Vec<MixedTracepointItem>> {
+) -> io::Result<Vec<MixedRepresentation>> {
     let mut items = Vec::with_capacity(num_items);
     for _ in 0..num_items {
         let mut item_type = [0u8; 1];
         reader.read_exact(&mut item_type)?;
         match item_type[0] {
             0 => {
-                let a = read_varint(reader)?;
-                let b = read_varint(reader)?;
-                items.push(MixedTracepointItem::Tracepoint(a, b));
+                let a = u64_to_usize(read_varint(reader)?)?;
+                let b = u64_to_usize(read_varint(reader)?)?;
+                items.push(MixedRepresentation::Tracepoint(a, b));
             }
             1 => {
-                let len = read_varint(reader)?;
+                let len = u64_to_usize(read_varint(reader)?)?;
                 let mut op = [0u8; 1];
                 reader.read_exact(&mut op)?;
-                items.push(MixedTracepointItem::CigarOp(len, op[0] as char));
+                items.push(MixedRepresentation::CigarOp(len, op[0] as char));
             }
             _ => {
                 return Err(io::Error::new(
@@ -537,7 +546,10 @@ impl AlignmentRecord {
                 if tps.is_empty() {
                     return Ok(());
                 }
-                let (first_vals, second_vals): (Vec<u64>, Vec<u64>) = tps.iter().copied().unzip();
+                let (first_vals, second_vals): (Vec<u64>, Vec<u64>) = tps
+                    .iter()
+                    .map(|(a, b)| (*a as u64, *b as u64))
+                    .unzip();
 
                 let first_val_buf = encode_tracepoint_values(&first_vals, strategy)?;
                 let second_val_buf = encode_tracepoint_values(&second_vals, strategy)?;
@@ -554,10 +566,10 @@ impl AlignmentRecord {
             TracepointData::Variable(tps) => {
                 write_varint(writer, tps.len() as u64)?;
                 for (a, b_opt) in tps {
-                    write_varint(writer, *a)?;
+                    write_varint(writer, *a as u64)?;
                     if let Some(b) = b_opt {
                         writer.write_all(&[1])?;
-                        write_varint(writer, *b)?;
+                        write_varint(writer, *b as u64)?;
                     } else {
                         writer.write_all(&[0])?;
                     }
@@ -567,14 +579,14 @@ impl AlignmentRecord {
                 write_varint(writer, items.len() as u64)?;
                 for item in items {
                     match item {
-                        MixedTracepointItem::Tracepoint(a, b) => {
+                        MixedRepresentation::Tracepoint(a, b) => {
                             writer.write_all(&[0])?;
-                            write_varint(writer, *a)?;
-                            write_varint(writer, *b)?;
+                            write_varint(writer, *a as u64)?;
+                            write_varint(writer, *b as u64)?;
                         }
-                        MixedTracepointItem::CigarOp(len, op) => {
+                        MixedRepresentation::CigarOp(len, op) => {
                             writer.write_all(&[1])?;
-                            write_varint(writer, *len)?;
+                            write_varint(writer, *len as u64)?;
                             writer.write_all(&[*op as u8])?;
                         }
                     }
@@ -671,11 +683,10 @@ pub fn build_index(bpaf_path: &str) -> io::Result<BpafIndex> {
     let header = BinaryPafHeader::read(&mut reader)?;
     StringTable::read(&mut reader)?;
 
-    let tp_type = header.tracepoint_type;
     let mut offsets = Vec::with_capacity(header.num_records as usize);
     for _ in 0..header.num_records {
         offsets.push(reader.stream_position()?);
-        skip_record(&mut reader, tp_type)?;
+        skip_record(&mut reader, header.tracepoint_type)?;
     }
 
     info!("Index built: {} records", offsets.len());
@@ -910,8 +921,6 @@ impl BpafReader {
             &mut self.file,
             strategy,
             self.header.tracepoint_type,
-            self.header.complexity_metric,
-            self.header.max_complexity,
         )
     }
 

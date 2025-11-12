@@ -1,5 +1,5 @@
 /// Demo of offset-based access without index loading
-use lib_bpaf::BpafReader;
+use lib_bpaf::{BpafReader, TracepointData};
 use std::time::Instant;
 
 /// Helper to display ComplexityMetric (doesn't implement Debug)
@@ -40,13 +40,7 @@ fn main() -> std::io::Result<()> {
         reader.get_tracepoints_at_offset(offset)?;
     let read_time = start.elapsed();
 
-    let tp_count = match &tracepoints {
-        lib_bpaf::TracepointData::Standard(tps) | lib_bpaf::TracepointData::Fastga(tps) => {
-            tps.len()
-        }
-        lib_bpaf::TracepointData::Variable(tps) => tps.len(),
-        lib_bpaf::TracepointData::Mixed(tps) => tps.len(),
-    };
+    let tp_count = tracepoint_len(&tracepoints);
 
     println!("✓ Read in {:.3}ms", read_time.as_secs_f64() * 1000.0);
     println!("  Type: {:?}", tp_type);
@@ -58,4 +52,12 @@ fn main() -> std::io::Result<()> {
     println!("  Tracepoints: {} items", tp_count);
 
     Ok(())
+}
+
+fn tracepoint_len(tp: &TracepointData) -> usize {
+    match tp {
+        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => tps.len(),
+        TracepointData::Variable(tps) => tps.len(),
+        TracepointData::Mixed(items) => items.len(),
+    }
 }

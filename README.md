@@ -47,7 +47,7 @@ lib_bpaf = { git = "https://github.com/AndreaGuarracino/lib_bpaf" }
 ### Read with random access
 
 ```rust
-use lib_bpaf::BpafReader;
+use lib_bpaf::{BpafReader, TracepointType};
 
 // Open with index for O(1) record access
 let mut reader = BpafReader::open("alignments.bpaf")?;
@@ -55,12 +55,13 @@ println!("Total records: {}", reader.len());
 
 // Jump to any record instantly
 let record = reader.get_alignment_record(1000)?;
-let (tracepoints, tp_type, _, _) = reader.get_tracepoints(1000)?;
+let (tracepoints, _, _, _) = reader.get_tracepoints(1000)?;
 
 match &tracepoints {
-    TracepointData::Standard(tps) => println!("{} tracepoints", tps.len()),
-    TracepointData::Fastga(tps) => println!("{} FastGA traces", tps.len()),
-    _ => {}
+    TracepointType::Standard(tps) => println!("{} tracepoints", tps.len()),
+    TracepointType::Fastga(tps) => println!("{} FastGA traces", tps.len()),
+    TracepointType::Variable(tps) => println!("{} variable segments", tps.len()),
+    TracepointType::Mixed(items) => println!("{} mixed items", items.len()),
 }
 ```
 

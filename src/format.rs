@@ -2,7 +2,7 @@
 
 use crate::binary::BINARY_MAGIC;
 use crate::{utils::*, Distance};
-use lib_tracepoints::{ComplexityMetric, MixedRepresentation, TracepointType};
+use lib_tracepoints::{ComplexityMetric, TracepointData, TracepointType};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
@@ -173,8 +173,8 @@ impl BinaryPafHeader {
     }
 
     /// Get distance mode
-    pub fn distance(&self) -> &Distance {
-        &self.distance
+    pub fn distance(&self) -> Distance {
+        self.distance
     }
 
     /// Get complexity metric
@@ -332,35 +332,8 @@ pub struct AlignmentRecord {
     pub residue_matches: u64,
     pub alignment_block_len: u64,
     pub mapping_quality: u8,
-    pub tp_type: TracepointType,
-    pub complexity_metric: ComplexityMetric,
-    pub max_complexity: u64,
     pub tracepoints: TracepointData,
     pub tags: Vec<Tag>,
-}
-
-pub enum TracepointData {
-    Standard(Vec<(u64, u64)>),
-    Mixed(Vec<MixedTracepointItem>),
-    Variable(Vec<(u64, Option<u64>)>),
-    Fastga(Vec<(u64, u64)>),
-}
-
-#[derive(Debug, Clone)]
-pub enum MixedTracepointItem {
-    Tracepoint(u64, u64),
-    CigarOp(u64, char),
-}
-
-impl From<&MixedRepresentation> for MixedTracepointItem {
-    fn from(item: &MixedRepresentation) -> Self {
-        match item {
-            MixedRepresentation::Tracepoint(a, b) => {
-                MixedTracepointItem::Tracepoint(*a as u64, *b as u64)
-            }
-            MixedRepresentation::CigarOp(len, op) => MixedTracepointItem::CigarOp(*len as u64, *op),
-        }
-    }
 }
 
 pub struct Tag {

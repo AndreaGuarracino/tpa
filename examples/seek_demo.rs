@@ -1,5 +1,5 @@
 /// Demo of seekable BPAF reader with O(1) random access and performance profiling
-use lib_bpaf::BpafReader;
+use lib_bpaf::{BpafReader, TracepointData};
 use std::time::Instant;
 
 /// Helper to display ComplexityMetric (doesn't implement Debug)
@@ -82,12 +82,7 @@ fn demo_full_access(reader: &mut BpafReader, args: &[String]) -> std::io::Result
                     .get(record.target_name_id)
                     .unwrap();
 
-                let tp_count = match &record.tracepoints {
-                    lib_bpaf::TracepointData::Standard(tps)
-                    | lib_bpaf::TracepointData::Fastga(tps) => tps.len(),
-                    lib_bpaf::TracepointData::Variable(tps) => tps.len(),
-                    lib_bpaf::TracepointData::Mixed(tps) => tps.len(),
-                };
+                let tp_count = tracepoint_len(&record.tracepoints);
 
                 println!("Record {}:", record_id);
                 println!(
@@ -132,12 +127,7 @@ fn demo_tracepoint_access(reader: &mut BpafReader, args: &[String]) -> std::io::
     for &record_id in &record_ids {
         match reader.get_tracepoints(record_id) {
             Ok((tracepoints, tp_type, complexity_metric, max_complexity)) => {
-                let tp_count = match &tracepoints {
-                    lib_bpaf::TracepointData::Standard(tps)
-                    | lib_bpaf::TracepointData::Fastga(tps) => tps.len(),
-                    lib_bpaf::TracepointData::Variable(tps) => tps.len(),
-                    lib_bpaf::TracepointData::Mixed(tps) => tps.len(),
-                };
+                let tp_count = tracepoint_len(&tracepoints);
 
                 println!("Record {}:", record_id);
                 println!("  Type: {:?}", tp_type);
@@ -217,4 +207,12 @@ fn profile_methods(reader: &mut BpafReader) -> std::io::Result<()> {
 
     println!("✓ Profiling complete");
     Ok(())
+}
+
+fn tracepoint_len(tp: &TracepointData) -> usize {
+    match tp {
+        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => tps.len(),
+        TracepointData::Variable(tps) => tps.len(),
+        TracepointData::Mixed(items) => items.len(),
+    }
 }

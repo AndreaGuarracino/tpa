@@ -1,4 +1,4 @@
-use lib_bpaf::{BpafReader, MixedTracepointItem, TracepointData};
+use lib_bpaf::{BpafReader, MixedRepresentation, TracepointData};
 use std::env;
 use std::io::{self, Write};
 use std::process;
@@ -33,8 +33,8 @@ fn format_tracepoints(tp_data: &TracepointData) -> String {
         TracepointData::Mixed(items) => items
             .iter()
             .map(|item| match item {
-                MixedTracepointItem::Tracepoint(a, b) => format!("{},{}", a, b),
-                MixedTracepointItem::CigarOp(len, op) => format!("{}{}", len, op),
+                MixedRepresentation::Tracepoint(a, b) => format!("{},{}", a, b),
+                MixedRepresentation::CigarOp(len, op) => format!("{}{}", len, op),
             })
             .collect::<Vec<_>>()
             .join(";"),
