@@ -381,14 +381,22 @@ fn decode_tracepoint_values(
             Ok(vals)
         }
         CompressionStrategy::ZigzagDelta(_) => {
-            // Zigzag + delta
-            let mut deltas = Vec::with_capacity(num_items);
-            for _ in 0..num_items {
+            // Sigzag + delta decode
+            let mut vals = Vec::with_capacity(num_items);
+
+            // First value
+            let zigzag = read_varint(&mut reader)?;
+            let first = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+            vals.push(first as u64);
+
+            // Remaining values: zigzag decode + delta accumulate in one pass
+            for _ in 1..num_items {
                 let zigzag = read_varint(&mut reader)?;
-                let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
-                deltas.push(val);
+                let delta = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+                let prev = *vals.last().unwrap() as i64;
+                vals.push((prev + delta) as u64);
             }
-            Ok(delta_decode(&deltas))
+            Ok(vals)
         }
         CompressionStrategy::Automatic(_) => {
             panic!("Automatic strategy must be resolved before decoding")
@@ -981,8 +989,10 @@ pub fn read_standard_tracepoints_at_offset<R: Read + Seek>(
     strategy: CompressionStrategy,
 ) -> io::Result<Vec<(usize, usize)>> {
     file.seek(SeekFrom::Start(offset))?;
-    let num_items = read_varint(file)? as usize;
-    decode_standard_tracepoints(file, num_items, strategy)
+    // Buffer small reads (varints + compressed block lengths)
+    let mut buffered = BufReader::with_capacity(64, file);
+    let num_items = read_varint(&mut buffered)? as usize;
+    decode_standard_tracepoints(&mut buffered, num_items, strategy)
 }
 
 /// Fastest access: decode variable tracepoints directly from file at offset.
@@ -993,8 +1003,10 @@ pub fn read_variable_tracepoints_at_offset<R: Read + Seek>(
     offset: u64,
 ) -> io::Result<Vec<(usize, Option<usize>)>> {
     file.seek(SeekFrom::Start(offset))?;
-    let num_items = read_varint(file)? as usize;
-    decode_variable_tracepoints(file, num_items)
+    // Buffer small reads (varints + compressed block lengths)
+    let mut buffered = BufReader::with_capacity(64, file);
+    let num_items = read_varint(&mut buffered)? as usize;
+    decode_variable_tracepoints(&mut buffered, num_items)
 }
 
 /// Fastest access: decode mixed tracepoints directly from file at offset.
@@ -1005,8 +1017,10 @@ pub fn read_mixed_tracepoints_at_offset<R: Read + Seek>(
     offset: u64,
 ) -> io::Result<Vec<MixedRepresentation>> {
     file.seek(SeekFrom::Start(offset))?;
-    let num_items = read_varint(file)? as usize;
-    decode_mixed_tracepoints(file, num_items)
+    // Buffer small reads (varints + compressed block lengths)
+    let mut buffered = BufReader::with_capacity(64, file);
+    let num_items = read_varint(&mut buffered)? as usize;
+    decode_mixed_tracepoints(&mut buffered, num_items)
 }
 
 pub struct RecordIterator<'a> {
