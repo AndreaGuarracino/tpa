@@ -259,7 +259,7 @@ fn compress_paf(
         }?;
 
         // Write with chosen strategy
-        record.write_automatic(&mut writer, chosen_strategy)?;
+        record.write(&mut writer, chosen_strategy)?;
     }
     writer.flush()?;
 

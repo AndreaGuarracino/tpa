@@ -17,28 +17,6 @@ use crate::utils::*;
 pub const BINARY_MAGIC: &[u8; 4] = b"BPAF";
 
 // ============================================================================
-// COMPLEXITY METRIC SERIALIZATION
-// ============================================================================
-
-pub fn complexity_metric_to_u8(metric: &ComplexityMetric) -> u8 {
-    match metric {
-        ComplexityMetric::EditDistance => 0,
-        ComplexityMetric::DiagonalDistance => 1,
-    }
-}
-
-pub fn complexity_metric_from_u8(byte: u8) -> io::Result<ComplexityMetric> {
-    match byte {
-        0 => Ok(ComplexityMetric::EditDistance),
-        1 => Ok(ComplexityMetric::DiagonalDistance),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Invalid complexity metric code: {}", byte),
-        )),
-    }
-}
-
-// ============================================================================
 // DELTA ENCODING
 // ============================================================================
 
@@ -363,7 +341,68 @@ fn read_record<R: Read>(
     })
 }
 
-/// Read tracepoints with compression strategy
+/// Encode tracepoint values based on compression strategy
+#[inline]
+fn encode_tracepoint_values(
+    vals: &[u64],
+    strategy: CompressionStrategy,
+) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(vals.len() * 2);
+    match strategy {
+        CompressionStrategy::Raw(_) => {
+            // Raw varints
+            for &val in vals {
+                write_varint(&mut buf, val)?;
+            }
+        }
+        CompressionStrategy::ZigzagDelta(_) => {
+            // Zigzag + delta
+            let deltas = delta_encode(vals);
+            for &val in &deltas {
+                let zigzag = ((val << 1) ^ (val >> 63)) as u64;
+                write_varint(&mut buf, zigzag)?;
+            }
+        }
+        CompressionStrategy::Automatic(_) => {
+            panic!("Automatic strategy must be resolved before encoding")
+        }
+    }
+    Ok(buf)
+}
+
+/// Decode tracepoint values based on compression strategy
+#[inline]
+fn decode_tracepoint_values(
+    buf: &[u8],
+    num_items: usize,
+    strategy: CompressionStrategy,
+) -> io::Result<Vec<u64>> {
+    let mut reader = buf;
+    match strategy {
+        CompressionStrategy::Raw(_) => {
+            // Raw varints
+            let mut vals = Vec::with_capacity(num_items);
+            for _ in 0..num_items {
+                vals.push(read_varint(&mut reader)?);
+            }
+            Ok(vals)
+        }
+        CompressionStrategy::ZigzagDelta(_) => {
+            // Zigzag + delta
+            let mut deltas = Vec::with_capacity(num_items);
+            for _ in 0..num_items {
+                let zigzag = read_varint(&mut reader)?;
+                let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+                deltas.push(val);
+            }
+            Ok(delta_decode(&deltas))
+        }
+        CompressionStrategy::Automatic(_) => {
+            panic!("Automatic strategy must be resolved before decoding")
+        }
+    }
+}
+
 fn read_tracepoints<R: Read>(
     reader: &mut R,
     tp_type: TracepointType,
@@ -389,36 +428,8 @@ fn read_tracepoints<R: Read>(
             let first_buf = zstd::decode_all(&first_compressed[..])?;
             let second_buf = zstd::decode_all(&second_compressed[..])?;
 
-            // Helper to decode values based on strategy
-            let decode_values = |buf: &[u8], strategy: CompressionStrategy| -> io::Result<Vec<u64>> {
-                let mut reader = buf;
-                match strategy {
-                    CompressionStrategy::Raw(_) => {
-                        // Raw varints
-                        let mut vals = Vec::with_capacity(num_items);
-                        for _ in 0..num_items {
-                            vals.push(read_varint(&mut reader)?);
-                        }
-                        Ok(vals)
-                    }
-                    CompressionStrategy::ZigzagDelta(_) => {
-                        // Zigzag + delta
-                        let mut deltas = Vec::with_capacity(num_items);
-                        for _ in 0..num_items {
-                            let zigzag = read_varint(&mut reader)?;
-                            let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
-                            deltas.push(val);
-                        }
-                        Ok(delta_decode(&deltas))
-                    }
-                    CompressionStrategy::Automatic(_) => {
-                        panic!("Automatic strategy must be resolved before decoding")
-                    }
-                }
-            };
-
-            let first_vals = decode_values(&first_buf, strategy)?;
-            let second_vals = decode_values(&second_buf, strategy)?;
+            let first_vals = decode_tracepoint_values(&first_buf, num_items, strategy)?;
+            let second_vals = decode_tracepoint_values(&second_buf, num_items, strategy)?;
 
             let tps: Vec<(u64, u64)> = first_vals.into_iter().zip(second_vals).collect();
             Ok(match tp_type {
@@ -492,7 +503,7 @@ fn read_mixed_tracepoint_items<R: Read>(
 // ============================================================================
 
 impl AlignmentRecord {
-    pub(crate) fn write_automatic<W: Write>(
+    pub(crate) fn write<W: Write>(
         &self,
         writer: &mut W,
         strategy: CompressionStrategy,
@@ -528,33 +539,8 @@ impl AlignmentRecord {
                 }
                 let (first_vals, second_vals): (Vec<u64>, Vec<u64>) = tps.iter().copied().unzip();
 
-                // Helper to encode values based on strategy
-                let encode_values = |vals: &[u64], strategy: CompressionStrategy| -> io::Result<Vec<u8>> {
-                    let mut buf = Vec::with_capacity(vals.len() * 2);
-                    match strategy {
-                        CompressionStrategy::Raw(_) => {
-                            // Raw varints
-                            for &val in vals {
-                                write_varint(&mut buf, val)?;
-                            }
-                        }
-                        CompressionStrategy::ZigzagDelta(_) => {
-                            // Zigzag + delta
-                            let deltas = delta_encode(vals);
-                            for &val in &deltas {
-                                let zigzag = ((val << 1) ^ (val >> 63)) as u64;
-                                write_varint(&mut buf, zigzag)?;
-                            }
-                        }
-                        CompressionStrategy::Automatic(_) => {
-                            panic!("Automatic strategy must be resolved before encoding")
-                        }
-                    }
-                    Ok(buf)
-                };
-
-                let first_val_buf = encode_values(&first_vals, strategy)?;
-                let second_val_buf = encode_values(&second_vals, strategy)?;
+                let first_val_buf = encode_tracepoint_values(&first_vals, strategy)?;
+                let second_val_buf = encode_tracepoint_values(&second_vals, strategy)?;
 
                 let first_compressed = zstd::encode_all(&first_val_buf[..], strategy.zstd_level())?;
                 let second_compressed =

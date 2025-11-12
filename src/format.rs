@@ -1,6 +1,6 @@
 //! Data structures for Binary PAF format
 
-use crate::binary::{complexity_metric_from_u8, complexity_metric_to_u8, BINARY_MAGIC};
+use crate::binary::BINARY_MAGIC;
 use crate::{utils::*, Distance};
 use lib_tracepoints::{ComplexityMetric, MixedRepresentation, TracepointType};
 use std::collections::HashMap;
@@ -193,7 +193,7 @@ impl BinaryPafHeader {
         write_varint(writer, self.num_records)?;
         write_varint(writer, self.num_strings)?;
         writer.write_all(&[self.tracepoint_type.to_u8()])?;
-        writer.write_all(&[complexity_metric_to_u8(&self.complexity_metric)])?;
+        writer.write_all(&[self.complexity_metric.to_u8()])?;
         write_varint(writer, self.max_complexity)?;
         write_distance(writer, &self.distance)?;
         Ok(())
@@ -221,7 +221,8 @@ impl BinaryPafHeader {
 
         let mut metric_buf = [0u8; 1];
         reader.read_exact(&mut metric_buf)?;
-        let complexity_metric = complexity_metric_from_u8(metric_buf[0])?;
+        let complexity_metric = ComplexityMetric::from_u8(metric_buf[0])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         let max_complexity = read_varint(reader)?;
 
