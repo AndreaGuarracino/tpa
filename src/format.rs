@@ -95,16 +95,6 @@ impl CompressionStrategy {
         }
     }
 
-    /// Get encoding tuple (use_zigzag, use_delta) that applies to both positions
-    pub fn encoding(&self) -> (bool, bool) {
-        match self {
-            CompressionStrategy::Automatic(_) => {
-                panic!("Automatic strategy must be resolved to Raw or ZigzagDelta before encoding")
-            }
-            CompressionStrategy::Raw(_) => (false, false),
-            CompressionStrategy::ZigzagDelta(_) => (true, true),
-        }
-    }
 }
 
 impl std::fmt::Display for CompressionStrategy {

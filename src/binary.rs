@@ -297,14 +297,11 @@ pub(crate) fn decompress_varint<R: Read>(
     };
     let mut writer = BufWriter::new(output);
 
-    // Get encoding from strategy stored in header (applies to both positions)
-    let (use_zigzag, use_delta) = strategy.encoding();
-    let use_delta_encoding = use_zigzag && use_delta;
+    // Read records with strategy from header
     for _ in 0..header.num_records {
         let record = read_record_automatic(
             &mut reader,
-            use_delta_encoding,  // use_delta_first
-            use_delta_encoding,  // use_delta_second
+            strategy,
             header.tracepoint_type,
             header.complexity_metric,
             header.max_complexity,
@@ -317,59 +314,9 @@ pub(crate) fn decompress_varint<R: Read>(
     Ok(())
 }
 
-fn read_record_varint<R: Read>(
-    reader: &mut R,
-    _use_delta: bool,
-    tp_type: TracepointType,
-    complexity_metric: ComplexityMetric,
-    max_complexity: u64,
-) -> io::Result<AlignmentRecord> {
-    let query_name_id = read_varint(reader)?;
-    let query_start = read_varint(reader)?;
-    let query_end = read_varint(reader)?;
-    let mut strand_buf = [0u8; 1];
-    reader.read_exact(&mut strand_buf)?;
-    let strand = strand_buf[0] as char;
-    let target_name_id = read_varint(reader)?;
-    let target_start = read_varint(reader)?;
-    let target_end = read_varint(reader)?;
-    let residue_matches = read_varint(reader)?;
-    let alignment_block_len = read_varint(reader)?;
-    let mut mapq_buf = [0u8; 1];
-    reader.read_exact(&mut mapq_buf)?;
-    let mapping_quality = mapq_buf[0];
-
-    let tracepoints = read_tracepoints_raw(reader, tp_type)?;
-
-    let num_tags = read_varint(reader)? as usize;
-    let mut tags = Vec::with_capacity(num_tags);
-    for _ in 0..num_tags {
-        tags.push(Tag::read(reader)?);
-    }
-
-    Ok(AlignmentRecord {
-        query_name_id,
-        query_start,
-        query_end,
-        strand,
-        target_name_id,
-        target_start,
-        target_end,
-        residue_matches,
-        alignment_block_len,
-        mapping_quality,
-        tp_type,
-        complexity_metric,
-        max_complexity,
-        tracepoints,
-        tags,
-    })
-}
-
 fn read_record_automatic<R: Read>(
     reader: &mut R,
-    use_delta_first: bool,
-    use_delta_second: bool,
+    strategy: CompressionStrategy,
     tp_type: TracepointType,
     complexity_metric: ComplexityMetric,
     max_complexity: u64,
@@ -389,12 +336,7 @@ fn read_record_automatic<R: Read>(
     reader.read_exact(&mut mapq_buf)?;
     let mapping_quality = mapq_buf[0];
 
-    // Convert old use_delta flags to new encoding tuples
-    // Old behavior: use_delta meant "zigzag+delta", not use_delta meant "raw"
-    let encoding_first = if use_delta_first { (true, true) } else { (false, false) };
-    let encoding_second = if use_delta_second { (true, true) } else { (false, false) };
-    let tracepoints =
-        read_tracepoints_automatic(reader, tp_type, encoding_first, encoding_second)?;
+    let tracepoints = read_tracepoints_automatic(reader, tp_type, strategy)?;
 
     let num_tags = read_varint(reader)? as usize;
     let mut tags = Vec::with_capacity(num_tags);
@@ -421,40 +363,11 @@ fn read_record_automatic<R: Read>(
     })
 }
 
-fn read_tracepoints_raw<R: Read>(
-    reader: &mut R,
-    tp_type: TracepointType,
-) -> io::Result<TracepointData> {
-    // Raw encoding uses no zigzag or delta
-    read_tracepoints_automatic(reader, tp_type, (false, false), (false, false))
-}
-
-fn read_tracepoints_delta<R: Read>(
-    reader: &mut R,
-    tp_type: TracepointType,
-) -> io::Result<TracepointData> {
-    // DeltaVarintZstd strategy encoding:
-    // - Standard: zigzag + delta on first, raw on second
-    // - Fastga: zigzag only on first, raw on second
-    let encoding_first = match tp_type {
-        TracepointType::Standard => (true, true),   // zigzag + delta
-        TracepointType::Fastga => (true, false),    // zigzag only
-        _ => (false, false),                        // raw
-    };
-    read_tracepoints_automatic(reader, tp_type, encoding_first, (false, false))
-}
-
-/// Read tracepoints with configurable encoding per component.
-/// Encoding: (use_zigzag, use_delta)
-/// - (false, false) = raw varints
-/// - (true, false) = zigzag only
-/// - (false, true) = delta only (no zigzag)
-/// - (true, true) = zigzag + delta
+/// Read tracepoints with compression strategy
 fn read_tracepoints_automatic<R: Read>(
     reader: &mut R,
     tp_type: TracepointType,
-    encoding_first: (bool, bool),
-    encoding_second: (bool, bool),
+    strategy: CompressionStrategy,
 ) -> io::Result<TracepointData> {
     let num_items = read_varint(reader)? as usize;
     match tp_type {
@@ -476,11 +389,11 @@ fn read_tracepoints_automatic<R: Read>(
             let first_buf = zstd::decode_all(&first_compressed[..])?;
             let second_buf = zstd::decode_all(&second_compressed[..])?;
 
-            // Helper to decode values based on encoding flags
-            let decode_values = |buf: &[u8], use_zigzag: bool, use_delta: bool| -> io::Result<Vec<u64>> {
+            // Helper to decode values based on strategy
+            let decode_values = |buf: &[u8], strategy: CompressionStrategy| -> io::Result<Vec<u64>> {
                 let mut reader = buf;
-                match (use_zigzag, use_delta) {
-                    (false, false) => {
+                match strategy {
+                    CompressionStrategy::Raw(_) => {
                         // Raw varints
                         let mut vals = Vec::with_capacity(num_items);
                         for _ in 0..num_items {
@@ -488,26 +401,7 @@ fn read_tracepoints_automatic<R: Read>(
                         }
                         Ok(vals)
                     }
-                    (true, false) => {
-                        // Zigzag only
-                        let mut vals = Vec::with_capacity(num_items);
-                        for _ in 0..num_items {
-                            let zigzag = read_varint(&mut reader)?;
-                            let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
-                            vals.push(val as u64);
-                        }
-                        Ok(vals)
-                    }
-                    (false, true) => {
-                        // Delta only (no zigzag)
-                        let mut deltas = Vec::with_capacity(num_items);
-                        for _ in 0..num_items {
-                            let val = read_varint(&mut reader)? as i64;
-                            deltas.push(val);
-                        }
-                        Ok(delta_decode(&deltas))
-                    }
-                    (true, true) => {
+                    CompressionStrategy::ZigzagDelta(_) => {
                         // Zigzag + delta
                         let mut deltas = Vec::with_capacity(num_items);
                         for _ in 0..num_items {
@@ -517,11 +411,14 @@ fn read_tracepoints_automatic<R: Read>(
                         }
                         Ok(delta_decode(&deltas))
                     }
+                    CompressionStrategy::Automatic(_) => {
+                        panic!("Automatic strategy must be resolved before decoding")
+                    }
                 }
             };
 
-            let first_vals = decode_values(&first_buf, encoding_first.0, encoding_first.1)?;
-            let second_vals = decode_values(&second_buf, encoding_second.0, encoding_second.1)?;
+            let first_vals = decode_values(&first_buf, strategy)?;
+            let second_vals = decode_values(&second_buf, strategy)?;
 
             let tps: Vec<(u64, u64)> = first_vals.into_iter().zip(second_vals).collect();
             Ok(match tp_type {
@@ -595,39 +492,9 @@ fn read_mixed_tracepoint_items<R: Read>(
 // ============================================================================
 
 impl AlignmentRecord {
-    pub(crate) fn write<W: Write>(
-        &self,
-        writer: &mut W,
-        use_delta: bool,
-        strategy: CompressionStrategy,
-    ) -> io::Result<()> {
-        write_varint(writer, self.query_name_id)?;
-        write_varint(writer, self.query_start)?;
-        write_varint(writer, self.query_end)?;
-        writer.write_all(&[self.strand as u8])?;
-        write_varint(writer, self.target_name_id)?;
-        write_varint(writer, self.target_start)?;
-        write_varint(writer, self.target_end)?;
-        write_varint(writer, self.residue_matches)?;
-        write_varint(writer, self.alignment_block_len)?;
-        writer.write_all(&[self.mapping_quality])?;
-        if use_delta {
-            self.write_tracepoints(writer, strategy)?;
-        } else {
-            self.write_tracepoints_raw(writer, strategy)?;
-        }
-        write_varint(writer, self.tags.len() as u64)?;
-        for tag in &self.tags {
-            tag.write(writer)?;
-        }
-        Ok(())
-    }
-
     pub(crate) fn write_automatic<W: Write>(
         &self,
         writer: &mut W,
-        encoding_first: (bool, bool),
-        encoding_second: (bool, bool),
         strategy: CompressionStrategy,
     ) -> io::Result<()> {
         write_varint(writer, self.query_name_id)?;
@@ -640,148 +507,10 @@ impl AlignmentRecord {
         write_varint(writer, self.residue_matches)?;
         write_varint(writer, self.alignment_block_len)?;
         writer.write_all(&[self.mapping_quality])?;
-        self.write_tracepoints_automatic(writer, encoding_first, encoding_second, strategy)?;
+        self.write_tracepoints_automatic(writer, strategy)?;
         write_varint(writer, self.tags.len() as u64)?;
         for tag in &self.tags {
             tag.write(writer)?;
-        }
-        Ok(())
-    }
-
-    fn write_tracepoints<W: Write>(
-        &self,
-        writer: &mut W,
-        strategy: CompressionStrategy,
-    ) -> io::Result<()> {
-        match &self.tracepoints {
-            TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
-                write_varint(writer, tps.len() as u64)?;
-                if tps.is_empty() {
-                    return Ok(());
-                }
-                let (first_vals, second_vals): (Vec<u64>, Vec<u64>) = tps.iter().copied().unzip();
-
-                let use_delta = !matches!(self.tp_type, TracepointType::Fastga);
-                let first_vals_encoded = if use_delta {
-                    delta_encode(&first_vals)
-                } else {
-                    first_vals.iter().map(|&v| v as i64).collect()
-                };
-
-                let mut first_val_buf = Vec::with_capacity(first_vals_encoded.len() * 2);
-                let mut second_val_buf = Vec::with_capacity(second_vals.len() * 2);
-
-                for &val in &first_vals_encoded {
-                    let zigzag = ((val << 1) ^ (val >> 63)) as u64;
-                    write_varint(&mut first_val_buf, zigzag)?;
-                }
-                for &val in &second_vals {
-                    write_varint(&mut second_val_buf, val)?;
-                }
-
-                let first_compressed = zstd::encode_all(&first_val_buf[..], strategy.zstd_level())?;
-                let second_compressed =
-                    zstd::encode_all(&second_val_buf[..], strategy.zstd_level())?;
-
-                write_varint(writer, first_compressed.len() as u64)?;
-                writer.write_all(&first_compressed)?;
-                write_varint(writer, second_compressed.len() as u64)?;
-                writer.write_all(&second_compressed)?;
-            }
-            TracepointData::Variable(tps) => {
-                write_varint(writer, tps.len() as u64)?;
-                for (a, b_opt) in tps {
-                    write_varint(writer, *a)?;
-                    if let Some(b) = b_opt {
-                        writer.write_all(&[1])?;
-                        write_varint(writer, *b)?;
-                    } else {
-                        writer.write_all(&[0])?;
-                    }
-                }
-            }
-            TracepointData::Mixed(items) => {
-                write_varint(writer, items.len() as u64)?;
-                for item in items {
-                    match item {
-                        MixedTracepointItem::Tracepoint(a, b) => {
-                            writer.write_all(&[0])?;
-                            write_varint(writer, *a)?;
-                            write_varint(writer, *b)?;
-                        }
-                        MixedTracepointItem::CigarOp(len, op) => {
-                            writer.write_all(&[1])?;
-                            write_varint(writer, *len)?;
-                            writer.write_all(&[*op as u8])?;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn write_tracepoints_raw<W: Write>(
-        &self,
-        writer: &mut W,
-        strategy: CompressionStrategy,
-    ) -> io::Result<()> {
-        match &self.tracepoints {
-            TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
-                write_varint(writer, tps.len() as u64)?;
-                if tps.is_empty() {
-                    return Ok(());
-                }
-                let (first_vals, second_vals): (Vec<u64>, Vec<u64>) = tps.iter().copied().unzip();
-
-                let mut first_val_buf = Vec::with_capacity(first_vals.len() * 2);
-                let mut second_val_buf = Vec::with_capacity(second_vals.len() * 2);
-
-                for &val in &first_vals {
-                    write_varint(&mut first_val_buf, val)?;
-                }
-                for &val in &second_vals {
-                    write_varint(&mut second_val_buf, val)?;
-                }
-
-                let first_compressed = zstd::encode_all(&first_val_buf[..], strategy.zstd_level())?;
-                let second_compressed =
-                    zstd::encode_all(&second_val_buf[..], strategy.zstd_level())?;
-
-                write_varint(writer, first_compressed.len() as u64)?;
-                writer.write_all(&first_compressed)?;
-                write_varint(writer, second_compressed.len() as u64)?;
-                writer.write_all(&second_compressed)?;
-            }
-            TracepointData::Variable(tps) => {
-                write_varint(writer, tps.len() as u64)?;
-                for (a, b_opt) in tps {
-                    write_varint(writer, *a)?;
-                    if let Some(b) = b_opt {
-                        writer.write_all(&[1])?;
-                        write_varint(writer, *b)?;
-                    } else {
-                        writer.write_all(&[0])?;
-                    }
-                }
-            }
-            TracepointData::Mixed(items) => {
-                write_varint(writer, items.len() as u64)?;
-                for item in items {
-                    match item {
-                        MixedTracepointItem::Tracepoint(a, b) => {
-                            writer.write_all(&[0])?;
-                            write_varint(writer, *a)?;
-                            write_varint(writer, *b)?;
-                        }
-                        MixedTracepointItem::CigarOp(len, op) => {
-                            writer.write_all(&[1])?;
-                            write_varint(writer, *len)?;
-                            writer.write_all(&[*op as u8])?;
-                        }
-                    }
-                }
-            }
         }
         Ok(())
     }
@@ -789,8 +518,6 @@ impl AlignmentRecord {
     fn write_tracepoints_automatic<W: Write>(
         &self,
         writer: &mut W,
-        encoding_first: (bool, bool),
-        encoding_second: (bool, bool),
         strategy: CompressionStrategy,
     ) -> io::Result<()> {
         match &self.tracepoints {
@@ -801,32 +528,17 @@ impl AlignmentRecord {
                 }
                 let (first_vals, second_vals): (Vec<u64>, Vec<u64>) = tps.iter().copied().unzip();
 
-                // Helper to encode values based on (use_zigzag, use_delta) flags
-                let encode_values = |vals: &[u64], use_zigzag: bool, use_delta: bool| -> io::Result<Vec<u8>> {
+                // Helper to encode values based on strategy
+                let encode_values = |vals: &[u64], strategy: CompressionStrategy| -> io::Result<Vec<u8>> {
                     let mut buf = Vec::with_capacity(vals.len() * 2);
-                    match (use_zigzag, use_delta) {
-                        (false, false) => {
+                    match strategy {
+                        CompressionStrategy::Raw(_) => {
                             // Raw varints
                             for &val in vals {
                                 write_varint(&mut buf, val)?;
                             }
                         }
-                        (true, false) => {
-                            // Zigzag only
-                            for &val in vals {
-                                let signed = val as i64;
-                                let zigzag = ((signed << 1) ^ (signed >> 63)) as u64;
-                                write_varint(&mut buf, zigzag)?;
-                            }
-                        }
-                        (false, true) => {
-                            // Delta only (no zigzag)
-                            let deltas = delta_encode(vals);
-                            for &val in &deltas {
-                                write_varint(&mut buf, val as u64)?;
-                            }
-                        }
-                        (true, true) => {
+                        CompressionStrategy::ZigzagDelta(_) => {
                             // Zigzag + delta
                             let deltas = delta_encode(vals);
                             for &val in &deltas {
@@ -834,12 +546,15 @@ impl AlignmentRecord {
                                 write_varint(&mut buf, zigzag)?;
                             }
                         }
+                        CompressionStrategy::Automatic(_) => {
+                            panic!("Automatic strategy must be resolved before encoding")
+                        }
                     }
                     Ok(buf)
                 };
 
-                let first_val_buf = encode_values(&first_vals, encoding_first.0, encoding_first.1)?;
-                let second_val_buf = encode_values(&second_vals, encoding_second.0, encoding_second.1)?;
+                let first_val_buf = encode_values(&first_vals, strategy)?;
+                let second_val_buf = encode_values(&second_vals, strategy)?;
 
                 let first_compressed = zstd::encode_all(&first_val_buf[..], strategy.zstd_level())?;
                 let second_compressed =
@@ -881,51 +596,6 @@ impl AlignmentRecord {
             }
         }
         Ok(())
-    }
-
-    pub(crate) fn read<R: Read>(
-        reader: &mut R,
-        tp_type: TracepointType,
-        complexity_metric: ComplexityMetric,
-        max_complexity: u64,
-    ) -> io::Result<Self> {
-        let query_name_id = read_varint(reader)?;
-        let query_start = read_varint(reader)?;
-        let query_end = read_varint(reader)?;
-        let mut strand_buf = [0u8; 1];
-        reader.read_exact(&mut strand_buf)?;
-        let strand = strand_buf[0] as char;
-        let target_name_id = read_varint(reader)?;
-        let target_start = read_varint(reader)?;
-        let target_end = read_varint(reader)?;
-        let residue_matches = read_varint(reader)?;
-        let alignment_block_len = read_varint(reader)?;
-        let mut mapq_buf = [0u8; 1];
-        reader.read_exact(&mut mapq_buf)?;
-        let mapping_quality = mapq_buf[0];
-        let tracepoints = read_tracepoints_delta(reader, tp_type)?;
-        let num_tags = read_varint(reader)? as usize;
-        let mut tags = Vec::with_capacity(num_tags);
-        for _ in 0..num_tags {
-            tags.push(Tag::read(reader)?);
-        }
-        Ok(Self {
-            query_name_id,
-            query_start,
-            query_end,
-            strand,
-            target_name_id,
-            target_start,
-            target_end,
-            residue_matches,
-            alignment_block_len,
-            mapping_quality,
-            tp_type,
-            complexity_metric,
-            max_complexity,
-            tracepoints,
-            tags,
-        })
     }
 }
 
@@ -1248,14 +918,11 @@ impl BpafReader {
     pub fn get_alignment_record_at_offset(&mut self, offset: u64) -> io::Result<AlignmentRecord> {
         self.file.seek(SeekFrom::Start(offset))?;
 
-        // Get encoding from strategy stored in header (applies to both positions)
+        // Read with strategy from header
         let strategy = self.header.strategy()?;
-        let (use_zigzag, use_delta) = strategy.encoding();
-        let use_delta_encoding = use_zigzag && use_delta;
         read_record_automatic(
             &mut self.file,
-            use_delta_encoding,  // use_delta_first
-            use_delta_encoding,  // use_delta_second
+            strategy,
             self.header.tracepoint_type,
             self.header.complexity_metric,
             self.header.max_complexity,
@@ -1317,14 +984,12 @@ impl BpafReader {
         let complexity_metric = self.header.complexity_metric;
         let max_complexity = self.header.max_complexity;
 
-        // Get encoding from strategy stored in header (applies to both positions)
+        // Read tracepoints with strategy from header
         let strategy = self.header.strategy()?;
-        let encoding = strategy.encoding();
         let tracepoints = read_tracepoints_automatic(
             &mut self.file,
             tp_type,
-            encoding,
-            encoding,
+            strategy,
         )?;
 
         Ok((tracepoints, tp_type, complexity_metric, max_complexity))

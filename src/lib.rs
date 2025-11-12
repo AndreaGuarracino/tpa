@@ -93,13 +93,11 @@ pub fn compress_paf_with_tracepoints(
     )
 }
 
-/// Compress PAF with custom encoding flags (for testing/experimentation)
+/// Compress PAF with custom compression strategy (for testing/experimentation)
 ///
-/// Encoding options (use_zigzag, use_delta):
-/// - (false, false) = raw varints
-/// - (true, false) = zigzag only
-/// - (false, true) = delta only (no zigzag)
-/// - (true, true) = zigzag + delta encoding
+/// Strategy options:
+/// - Raw: raw varints + zstd
+/// - ZigzagDelta: zigzag + delta encoding + zstd
 pub fn compress_paf_with_custom_encoding(
     input_path: &str,
     output_path: &str,
@@ -107,9 +105,7 @@ pub fn compress_paf_with_custom_encoding(
     max_complexity: u64,
     complexity_metric: ComplexityMetric,
     distance: Distance,
-    encoding_first: (bool, bool),
-    encoding_second: (bool, bool),
-    zstd_level: i32,
+    strategy: CompressionStrategy,
 ) -> io::Result<()> {
     compress_paf_custom(
         input_path,
@@ -118,9 +114,7 @@ pub fn compress_paf_with_custom_encoding(
         max_complexity,
         complexity_metric,
         distance,
-        encoding_first,
-        encoding_second,
-        zstd_level,
+        strategy,
     )
 }
 
@@ -164,13 +158,11 @@ fn compress_paf_custom(
     max_complexity: u64,
     complexity_metric: ComplexityMetric,
     distance: Distance,
-    encoding_first: (bool, bool),
-    encoding_second: (bool, bool),
-    zstd_level: i32,
+    strategy: CompressionStrategy,
 ) -> io::Result<()> {
     info!(
-        "Compressing PAF with custom encoding: first={:?}, second={:?}",
-        encoding_first, encoding_second
+        "Compressing PAF with custom strategy: {}",
+        strategy
     );
 
     // Pass 1: Build string table
@@ -206,20 +198,13 @@ fn compress_paf_custom(
         ));
     }
 
-    // Pass 2: Write with custom encoding
+    // Pass 2: Write with custom strategy
     let mut output = File::create(output_path).map_err(|e| {
         io::Error::new(
             e.kind(),
             format!("Failed to create output file '{}': {}", output_path, e),
         )
     })?;
-
-    // Choose strategy based on encoding tuples
-    let strategy = if encoding_first == (true, true) && encoding_second == (true, true) {
-        CompressionStrategy::ZigzagDelta(zstd_level)
-    } else {
-        CompressionStrategy::Raw(zstd_level)
-    };
 
     let header = BinaryPafHeader::new(
         record_count,
@@ -249,12 +234,7 @@ fn compress_paf_custom(
             &complexity_metric,
         )?;
 
-        record.write_automatic(
-            &mut writer,
-            encoding_first,
-            encoding_second,
-            strategy,
-        )?;
+        record.write_automatic(&mut writer, strategy)?;
     }
     writer.flush()?;
 
@@ -371,8 +351,7 @@ fn compress_paf(
     // Write string table
     string_table.write(&mut output)?;
 
-    // Write records with chosen strategy's encoding
-    let encoding = chosen_strategy.encoding();
+    // Write records with chosen strategy
     let mut writer = BufWriter::new(&mut output);
     let input = open_paf_reader(input_path)?;
     for line_result in input.lines() {
@@ -399,8 +378,8 @@ fn compress_paf(
             )
         }?;
 
-        // Write with chosen strategy's encoding (same for both positions)
-        record.write_automatic(&mut writer, encoding, encoding, chosen_strategy)?;
+        // Write with chosen strategy
+        record.write_automatic(&mut writer, chosen_strategy)?;
     }
     writer.flush()?;
 

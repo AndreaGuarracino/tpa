@@ -71,9 +71,6 @@ fn main() -> io::Result<()> {
 
     let strategy = header.strategy()?;
     println!("Compression strategy: {}", strategy);
-    let (use_zigzag, use_delta) = strategy.encoding();
-    println!("  Encoding (use_zigzag, use_delta): ({}, {})", use_zigzag, use_delta);
-    println!("  Note: Both tracepoint positions use the same encoding");
 
     println!("Tracepoint type: {:?}", header.tp_type());
     println!("Complexity metric: {:?}", header.complexity_metric());
