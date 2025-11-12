@@ -55,13 +55,13 @@ println!("Total records: {}", reader.len());
 
 // Jump to any record instantly
 let record = reader.get_alignment_record(1000)?;
-let (tracepoints, _, _, _) = reader.get_tracepoints(1000)?;
+let (tracepoints, _, _) = reader.get_tracepoints(1000)?;
 
 match &tracepoints {
-    TracepointType::Standard(tps) => println!("{} tracepoints", tps.len()),
-    TracepointType::Fastga(tps) => println!("{} FastGA traces", tps.len()),
-    TracepointType::Variable(tps) => println!("{} variable segments", tps.len()),
-    TracepointType::Mixed(items) => println!("{} mixed items", items.len()),
+    TracepointData::Standard(tps) => println!("{} tracepoints", tps.len()),
+    TracepointData::Fastga(tps) => println!("{} FastGA traces", tps.len()),
+    TracepointData::Variable(tps) => println!("{} variable segments", tps.len()),
+    TracepointData::Mixed(items) => println!("{} mixed items", items.len()),
 }
 ```
 

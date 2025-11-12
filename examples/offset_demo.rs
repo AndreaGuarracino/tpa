@@ -36,14 +36,14 @@ fn main() -> std::io::Result<()> {
     // Access by offset
     println!("Reading tracepoints at offset {}...", offset);
     let start = Instant::now();
-    let (tracepoints, tp_type, complexity_metric, max_complexity) =
+    let (tracepoints, complexity_metric, max_complexity) =
         reader.get_tracepoints_at_offset(offset)?;
     let read_time = start.elapsed();
 
     let tp_count = tracepoint_len(&tracepoints);
 
     println!("✓ Read in {:.3}ms", read_time.as_secs_f64() * 1000.0);
-    println!("  Type: {:?}", tp_type);
+    println!("  Type: {:?}", tracepoints.tp_type());
     println!(
         "  Complexity: {} (max: {})",
         complexity_metric_str(complexity_metric),

@@ -951,12 +951,11 @@ impl BpafReader {
         self.file.stream_position()
     }
 
-
     /// Get tracepoints by record ID
     pub fn get_tracepoints(
         &mut self,
         record_id: u64,
-    ) -> io::Result<(TracepointData, TracepointType, ComplexityMetric, u64)> {
+    ) -> io::Result<(TracepointData, ComplexityMetric, u64)> {
         let tracepoint_offset = self.get_tracepoint_offset(record_id)?;
         self.get_tracepoints_at_offset(tracepoint_offset)
     }
@@ -966,7 +965,7 @@ impl BpafReader {
     pub fn get_tracepoints_at_offset(
         &mut self,
         tracepoint_offset: u64,
-    ) -> io::Result<(TracepointData, TracepointType, ComplexityMetric, u64)> {
+    ) -> io::Result<(TracepointData, ComplexityMetric, u64)> {
         self.file.seek(SeekFrom::Start(tracepoint_offset))?;
 
         let tp_type = self.header.tracepoint_type;
@@ -981,7 +980,7 @@ impl BpafReader {
             strategy,
         )?;
 
-        Ok((tracepoints, tp_type, complexity_metric, max_complexity))
+        Ok((tracepoints, complexity_metric, max_complexity))
     }
 
     /// Get standard tracepoints by tracepoint offset

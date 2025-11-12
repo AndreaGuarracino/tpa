@@ -126,11 +126,11 @@ fn demo_tracepoint_access(reader: &mut BpafReader, args: &[String]) -> std::io::
     let start = Instant::now();
     for &record_id in &record_ids {
         match reader.get_tracepoints(record_id) {
-            Ok((tracepoints, tp_type, complexity_metric, max_complexity)) => {
+            Ok((tracepoints, complexity_metric, max_complexity)) => {
                 let tp_count = tracepoint_len(&tracepoints);
 
                 println!("Record {}:", record_id);
-                println!("  Type: {:?}", tp_type);
+                println!("  Type: {:?}", tracepoints.tp_type());
                 println!(
                     "  Complexity: {} (max: {})",
                     complexity_metric_str(complexity_metric),
