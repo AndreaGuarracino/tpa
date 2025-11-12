@@ -64,7 +64,7 @@ impl CompressionStrategy {
     }
 
     /// Convert to strategy code for file header
-    pub(crate) fn to_code(&self) -> u8 {
+    fn to_code(&self) -> u8 {
         match self {
             CompressionStrategy::Automatic(_) => {
                 panic!("Automatic strategy must be resolved to Raw or ZigzagDelta before writing")
@@ -75,7 +75,7 @@ impl CompressionStrategy {
     }
 
     /// Parse from strategy code
-    pub(crate) fn from_code(code: u8) -> io::Result<Self> {
+    fn from_code(code: u8) -> io::Result<Self> {
         match code {
             0 => Ok(CompressionStrategy::Raw(3)),
             1 => Ok(CompressionStrategy::ZigzagDelta(3)),

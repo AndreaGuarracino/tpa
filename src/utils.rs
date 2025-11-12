@@ -10,7 +10,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 // ============================================================================
 
 /// Encode an unsigned integer as a varint
-pub(crate) fn encode_varint(mut value: u64) -> Vec<u8> {
+fn encode_varint(mut value: u64) -> Vec<u8> {
     let mut bytes = Vec::new();
     loop {
         let mut byte = (value & 0x7F) as u8;
