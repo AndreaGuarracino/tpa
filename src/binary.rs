@@ -76,16 +76,6 @@ fn encode_varint_inline(mut value: u64) -> Vec<u8> {
     bytes
 }
 
-#[inline]
-fn u64_to_usize(value: u64) -> io::Result<usize> {
-    usize::try_from(value).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Tracepoint value {} exceeds usize capacity", value),
-        )
-    })
-}
-
 /// Empirical strategy selection by actually compressing samples
 /// Returns true if ZigzagDelta should be used (produces smaller output)
 pub(crate) fn analyze_smart_compression(records: &[AlignmentRecord], zstd_level: i32) -> bool {
@@ -458,8 +448,8 @@ fn decode_standard_tracepoints<R: Read>(
     // Convert to (usize, usize) tuples
     let mut tps = Vec::with_capacity(num_items);
     for (a, b) in first_vals.into_iter().zip(second_vals) {
-        let a_usize = u64_to_usize(a)?;
-        let b_usize = u64_to_usize(b)?;
+        let a_usize = a as usize;
+        let b_usize = b as usize;
         tps.push((a_usize, b_usize));
     }
 
@@ -474,11 +464,11 @@ fn decode_variable_tracepoints<R: Read>(
 ) -> io::Result<Vec<(usize, Option<usize>)>> {
     let mut tps = Vec::with_capacity(num_items);
     for _ in 0..num_items {
-        let a = u64_to_usize(read_varint(reader)?)?;
+        let a = read_varint(reader)? as usize;
         let mut flag = [0u8; 1];
         reader.read_exact(&mut flag)?;
         let b_opt = if flag[0] == 1 {
-            Some(u64_to_usize(read_varint(reader)?)?)
+            Some(read_varint(reader)? as usize)
         } else {
             None
         };
@@ -499,12 +489,12 @@ fn decode_mixed_tracepoints<R: Read>(
         reader.read_exact(&mut item_type)?;
         match item_type[0] {
             0 => {
-                let a = u64_to_usize(read_varint(reader)?)?;
-                let b = u64_to_usize(read_varint(reader)?)?;
+                let a = read_varint(reader)? as usize;
+                let b = read_varint(reader)? as usize;
                 items.push(MixedRepresentation::Tracepoint(a, b));
             }
             1 => {
-                let len = u64_to_usize(read_varint(reader)?)?;
+                let len = read_varint(reader)? as usize;
                 let mut op = [0u8; 1];
                 reader.read_exact(&mut op)?;
                 items.push(MixedRepresentation::CigarOp(len, op[0] as char));
