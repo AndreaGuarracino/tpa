@@ -7,9 +7,27 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
-CIGZIP_DIR="$(dirname "$REPO_DIR")/cigzip"
+CIGZIP_DIR="/workspace/git/cigzip"
 CIGZIP="$CIGZIP_DIR/target/release/cigzip"
 NORMALIZE="$SCRIPT_DIR/normalize_paf.pl"
+
+# Helper functions for unit conversion
+time_to_seconds() {
+    local time_str="$1"
+    # Convert MM:SS.MS format to seconds
+    if [[ "$time_str" =~ ^([0-9]+):([0-9]+\.[0-9]+)$ ]]; then
+        local minutes="${BASH_REMATCH[1]}"
+        local seconds="${BASH_REMATCH[2]}"
+        awk "BEGIN {printf \"%.3f\", $minutes * 60 + $seconds}"
+    else
+        echo "$time_str"
+    fi
+}
+
+kb_to_mb() {
+    local kb="$1"
+    awk "BEGIN {printf \"%.2f\", $kb / 1024}"
+}
 
 # Parameters
 INPUT_PAF="${1}"
@@ -68,12 +86,21 @@ else
 fi
 echo ""
 
-# Extract sample
-echo "=== Extracting $NUM_RECORDS records ==="
-if [ $IS_COMPRESSED -eq 1 ]; then
-    zcat "$INPUT_PAF" | head -n "$NUM_RECORDS" > "$OUTPUT_DIR/input_sample.paf"
+# Extract sample (or all if NUM_RECORDS=0)
+if [ "$NUM_RECORDS" -eq 0 ]; then
+    echo "=== Using ALL records from input file ==="
+    if [ $IS_COMPRESSED -eq 1 ]; then
+        zcat "$INPUT_PAF" > "$OUTPUT_DIR/input_sample.paf"
+    else
+        cp "$INPUT_PAF" "$OUTPUT_DIR/input_sample.paf"
+    fi
 else
-    head -n "$NUM_RECORDS" "$INPUT_PAF" > "$OUTPUT_DIR/input_sample.paf"
+    echo "=== Extracting $NUM_RECORDS records ==="
+    if [ $IS_COMPRESSED -eq 1 ]; then
+        zcat "$INPUT_PAF" | head -n "$NUM_RECORDS" > "$OUTPUT_DIR/input_sample.paf"
+    else
+        head -n "$NUM_RECORDS" "$INPUT_PAF" > "$OUTPUT_DIR/input_sample.paf"
+    fi
 fi
 
 EXTRACTED=$(wc -l < "$OUTPUT_DIR/input_sample.paf")
@@ -107,20 +134,52 @@ use lib_bpaf::BpafReader;
 fn main() {
     let args: Vec<String> = env::args().collect();
     let bpaf_path = &args[1];
-    let record_id: u64 = args[2].parse().unwrap();
-    let iterations: usize = args[3].parse().unwrap();
+    let num_records: u64 = args[2].parse().unwrap();
+    let num_positions: usize = args[3].parse().unwrap();
+    let iterations_per_pos: usize = args[4].parse().unwrap();
 
     let mut reader = BpafReader::open(bpaf_path).unwrap();
-    
-    // Warmup
-    for _ in 0..5 { let _ = reader.get_tracepoints(record_id); }
-    
-    // Benchmark
-    let start = Instant::now();
-    for _ in 0..iterations {
-        reader.get_tracepoints(record_id).unwrap();
+
+    // Generate random positions
+    use std::collections::HashSet;
+    let mut rng = 12345u64;  // Simple LCG
+    let mut positions = HashSet::new();
+    while positions.len() < num_positions {
+        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+        positions.insert((rng % num_records) as u64);
     }
-    println!("{}", start.elapsed().as_micros() / iterations as u128);
+    let positions: Vec<u64> = positions.into_iter().collect();
+
+    let mut sum_us = 0u128;
+    let mut sum_sq_us = 0u128;
+    let mut success = 0usize;
+    let total_tests = num_positions * iterations_per_pos;
+
+    for &pos in &positions {
+        // Warmup
+        for _ in 0..3 { let _ = reader.get_tracepoints(pos); }
+
+        // Benchmark this position
+        for _ in 0..iterations_per_pos {
+            let start = Instant::now();
+            match reader.get_tracepoints(pos) {
+                Ok(_) => {
+                    let time_us = start.elapsed().as_micros();
+                    sum_us += time_us;
+                    sum_sq_us += time_us * time_us;
+                    success += 1;
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    let avg_us = sum_us as f64 / total_tests as f64;
+    let variance = (sum_sq_us as f64 / total_tests as f64) - (avg_us * avg_us);
+    let stddev_us = variance.sqrt();
+    let success_ratio = success as f64 / total_tests as f64;
+
+    println!("{:.2} {:.2} {:.4}", avg_us, stddev_us, success_ratio);
 }
 RUST_A
 
@@ -135,38 +194,73 @@ use lib_bpaf::{BpafReader, read_standard_tracepoints_at_offset,
 fn main() {
     let args: Vec<String> = env::args().collect();
     let bpaf_path = &args[1];
-    let record_id: u64 = args[2].parse().unwrap();
-    let iterations: usize = args[3].parse().unwrap();
-    let tp_type = &args[4];
+    let num_records: u64 = args[2].parse().unwrap();
+    let num_positions: usize = args[3].parse().unwrap();
+    let iterations_per_pos: usize = args[4].parse().unwrap();
+    let tp_type = &args[5];
 
     let mut reader = BpafReader::open(bpaf_path).unwrap();
-    let offset = reader.get_tracepoint_offset(record_id).unwrap();
     let strategy = reader.header().strategy().unwrap();
+
+    // Generate random positions and get their offsets
+    use std::collections::HashSet;
+    let mut rng = 12345u64;
+    let mut positions = HashSet::new();
+    while positions.len() < num_positions {
+        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+        positions.insert((rng % num_records) as u64);
+    }
+
+    let offsets: Vec<u64> = positions.iter()
+        .map(|&pos| reader.get_tracepoint_offset(pos).unwrap())
+        .collect();
     drop(reader);
 
     let mut file = File::open(bpaf_path).unwrap();
-    
-    // Warmup
-    for _ in 0..3 {
-        match tp_type.as_str() {
-            "standard" => { let _ = read_standard_tracepoints_at_offset(&mut file, offset, strategy); }
-            "variable" => { let _ = read_variable_tracepoints_at_offset(&mut file, offset); }
-            "mixed" => { let _ = read_mixed_tracepoints_at_offset(&mut file, offset); }
-            _ => panic!("Invalid tp_type"),
+    let mut sum_us = 0u128;
+    let mut sum_sq_us = 0u128;
+    let mut success = 0usize;
+    let total_tests = num_positions * iterations_per_pos;
+
+    for &offset in &offsets {
+        // Warmup
+        for _ in 0..3 {
+            let _ = match tp_type.as_str() {
+                "standard" => read_standard_tracepoints_at_offset(&mut file, offset, strategy).map(|_| ()),
+                "variable" => read_variable_tracepoints_at_offset(&mut file, offset).map(|_| ()),
+                "mixed" => read_mixed_tracepoints_at_offset(&mut file, offset).map(|_| ()),
+                _ => panic!("Invalid tp_type"),
+            };
+        }
+
+        // Benchmark this position
+        for _ in 0..iterations_per_pos {
+            let start = Instant::now();
+            let result = match tp_type.as_str() {
+                "standard" => read_standard_tracepoints_at_offset(&mut file, offset, strategy).map(|_| ()),
+                "variable" => read_variable_tracepoints_at_offset(&mut file, offset).map(|_| ()),
+                "mixed" => read_mixed_tracepoints_at_offset(&mut file, offset).map(|_| ()),
+                _ => panic!("Invalid tp_type"),
+            };
+
+            match result {
+                Ok(_) => {
+                    let time_us = start.elapsed().as_micros();
+                    sum_us += time_us;
+                    sum_sq_us += time_us * time_us;
+                    success += 1;
+                }
+                Err(_) => {}
+            }
         }
     }
-    
-    // Benchmark
-    let start = Instant::now();
-    for _ in 0..iterations {
-        match tp_type.as_str() {
-            "standard" => { read_standard_tracepoints_at_offset(&mut file, offset, strategy).unwrap(); }
-            "variable" => { read_variable_tracepoints_at_offset(&mut file, offset).unwrap(); }
-            "mixed" => { read_mixed_tracepoints_at_offset(&mut file, offset).unwrap(); }
-            _ => panic!("Invalid tp_type"),
-        }
-    }
-    println!("{}", start.elapsed().as_micros() / iterations as u128);
+
+    let avg_us = sum_us as f64 / total_tests as f64;
+    let variance = (sum_sq_us as f64 / total_tests as f64) - (avg_us * avg_us);
+    let stddev_us = variance.sqrt();
+    let success_ratio = success as f64 / total_tests as f64;
+
+    println!("{:.2} {:.2} {:.4}", avg_us, stddev_us, success_ratio);
 }
 RUST_B
 
@@ -181,15 +275,27 @@ rustc --edition 2021 -O /tmp/seek_mode_b.rs \
 echo "✓ Seek tools ready"
 echo ""
 
+# Results storage - declare arrays before use
+declare -A ENCODE_TIME ENCODE_MEM
+declare -A COMPRESS_TIME COMPRESS_MEM COMPRESS_SIZE
+declare -A DECOMPRESS_TIME DECOMPRESS_MEM
+declare -A SEEK_A SEEK_B SEEK_A_STDDEV SEEK_B_STDDEV SEEK_SUCCESS_RATIO
+declare -A VERIFIED
+declare -A TP_SIZE
+
 # Determine tracepoint types to test
 if [ "$INPUT_TYPE" = "cigar" ]; then
     TP_TYPES=("standard" "variable" "mixed")
     echo "=== Encoding CIGAR to all tracepoint types ==="
     for TP_TYPE in "${TP_TYPES[@]}"; do
         echo "  Encoding $TP_TYPE..."
-        $CIGZIP encode --paf "$OUTPUT_DIR/input_sample.paf" --threads 1 --type "$TP_TYPE" \
+        /usr/bin/time -v $CIGZIP encode --paf "$OUTPUT_DIR/input_sample.paf" --threads 1 --type "$TP_TYPE" \
             --max-complexity "$MAX_COMPLEXITY" --complexity-metric "$COMPLEXITY_METRIC" \
-            > "$OUTPUT_DIR/${TP_TYPE}.tp.paf" 2>/dev/null
+            > "$OUTPUT_DIR/${TP_TYPE}.tp.paf" 2> "$OUTPUT_DIR/${TP_TYPE}_encode.log"
+
+        # Extract encoding metrics
+        ENCODE_TIME[$TP_TYPE]=$(grep "Elapsed (wall clock)" "$OUTPUT_DIR/${TP_TYPE}_encode.log" | awk '{print $8}')
+        ENCODE_MEM[$TP_TYPE]=$(grep "Maximum resident set size" "$OUTPUT_DIR/${TP_TYPE}_encode.log" | awk '{print $6}')
     done
     echo "✓ All encodings complete"
     echo ""
@@ -197,6 +303,9 @@ else
     # Already tracepoints - detect which type
     TP_TYPES=("standard")
     cp "$OUTPUT_DIR/input_sample.paf" "$OUTPUT_DIR/standard.tp.paf"
+    # No encoding needed - set to N/A
+    ENCODE_TIME["standard"]="N/A"
+    ENCODE_MEM["standard"]="N/A"
     echo "✓ Using existing tracepoint PAF"
     echo ""
 fi
@@ -220,13 +329,9 @@ STRATEGIES=(
     "cascaded"
     "simple8b-full"
     "selective-rle"
+    "rice-entropy"
+    "huffman-entropy"
 )
-
-# Results storage
-declare -A COMPRESS_TIME COMPRESS_MEM COMPRESS_SIZE
-declare -A DECOMPRESS_TIME DECOMPRESS_MEM
-declare -A SEEK_A SEEK_B
-declare -A VERIFIED
 
 # Test function
 test_configuration() {
@@ -234,15 +339,20 @@ test_configuration() {
     local strategy="$2"
     local tp_paf="$OUTPUT_DIR/${tp_type}.tp.paf"
     local key="${tp_type}_${strategy}"
-    
+
     echo "    Testing $strategy..."
-    
+
+    # Store tracepoint PAF size (only once per type)
+    if [ -z "${TP_SIZE[$tp_type]}" ]; then
+        TP_SIZE[$tp_type]=$(stat -c%s "$tp_paf" 2>/dev/null || stat -f%z "$tp_paf")
+    fi
+
     # Compress
     /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.bpaf" \
         --type "$tp_type" --max-complexity "$MAX_COMPLEXITY" \
         --complexity-metric "$COMPLEXITY_METRIC" --distance gap-affine --penalties 5,8,2 \
         --strategy "$strategy" 2>&1 | tee "$OUTPUT_DIR/${key}_compress.log" >/dev/null
-    
+
     COMPRESS_TIME[$key]=$(grep "Elapsed (wall clock)" "$OUTPUT_DIR/${key}_compress.log" | awk '{print $8}')
     COMPRESS_MEM[$key]=$(grep "Maximum resident set size" "$OUTPUT_DIR/${key}_compress.log" | awk '{print $6}')
     COMPRESS_SIZE[$key]=$(stat -c%s "$OUTPUT_DIR/${key}.bpaf" 2>/dev/null || stat -f%z "$OUTPUT_DIR/${key}.bpaf")
@@ -264,25 +374,95 @@ test_configuration() {
         VERIFIED[$key]="✗"
     fi
     
-    # Seek Mode A
-    local total_a=0
-    for i in $(seq 0 100 $((EXTRACTED - 1))); do
-        local time_a=$(/tmp/seek_mode_a "$OUTPUT_DIR/${key}.bpaf" "$i" 50 2>/dev/null || echo "0")
-        total_a=$((total_a + time_a))
-    done
-    SEEK_A[$key]=$(echo "scale=1; $total_a / 10" | bc -l)
-    
-    # Seek Mode B
-    local total_b=0
-    for i in $(seq 0 100 $((EXTRACTED - 1))); do
-        local time_b=$(/tmp/seek_mode_b "$OUTPUT_DIR/${key}.bpaf" "$i" 50 "$tp_type" 2>/dev/null || echo "0")
-        total_b=$((total_b + time_b))
-    done
-    SEEK_B[$key]=$(echo "scale=1; $total_b / 10" | bc -l)
-    
+    # Seek Mode A: 100 positions × 100 iterations
+    local seek_a_result=$(/tmp/seek_mode_a "$OUTPUT_DIR/${key}.bpaf" "$EXTRACTED" 100 100 2>/dev/null || echo "0 0 0")
+    read -r seek_a_avg seek_a_std seek_a_ratio <<< "$seek_a_result"
+    SEEK_A[$key]="$seek_a_avg"
+    SEEK_A_STDDEV[$key]="$seek_a_std"
+
+    # Seek Mode B: 100 positions × 100 iterations
+    local seek_b_result=$(/tmp/seek_mode_b "$OUTPUT_DIR/${key}.bpaf" "$EXTRACTED" 100 100 "$tp_type" 2>/dev/null || echo "0 0 0")
+    read -r seek_b_avg seek_b_std seek_b_ratio <<< "$seek_b_result"
+    SEEK_B[$key]="$seek_b_avg"
+    SEEK_B_STDDEV[$key]="$seek_b_std"
+    SEEK_SUCCESS_RATIO[$key]="$seek_b_ratio"  # Using Mode B ratio (both should be identical)
+
     # Cleanup
     rm -f "$OUTPUT_DIR/${key}_compress.log" "$OUTPUT_DIR/${key}_decompress.log" "$OUTPUT_DIR/${key}_decomp.paf"
 }
+
+# TSV output function
+output_tsv_row() {
+    local tp_type="$1"
+    local strategy="$2"
+    local key="${tp_type}_${strategy}"
+    local tsv_file="$OUTPUT_DIR/results.tsv"
+
+    # Calculate ratios
+    local tp_size_bytes=${TP_SIZE[$tp_type]}
+    local bpaf_size_bytes=${COMPRESS_SIZE[$key]}
+    local ratio_orig_to_tp=$(awk "BEGIN {printf \"%.3f\", $SIZE / $tp_size_bytes}")
+    local ratio_tp_to_bpaf=$(awk "BEGIN {printf \"%.3f\", $tp_size_bytes / $bpaf_size_bytes}")
+    local ratio_orig_to_bpaf=$(awk "BEGIN {printf \"%.3f\", $SIZE / $bpaf_size_bytes}")
+
+    # Convert times to seconds
+    local encode_time_sec=$(time_to_seconds "${ENCODE_TIME[$tp_type]}")
+    local compress_time_sec=$(time_to_seconds "${COMPRESS_TIME[$key]}")
+    local decompress_time_sec=$(time_to_seconds "${DECOMPRESS_TIME[$key]}")
+
+    # Convert memory to MB
+    local encode_mem_mb=$(kb_to_mb "${ENCODE_MEM[$tp_type]}")
+    local compress_mem_mb=$(kb_to_mb "${COMPRESS_MEM[$key]}")
+    local decompress_mem_mb=$(kb_to_mb "${DECOMPRESS_MEM[$key]}")
+
+    # Verification status
+    local verified="${VERIFIED[$key]}"
+    local verified_text="no"
+    if [ "$verified" = "✓" ]; then
+        verified_text="yes"
+    fi
+
+    # Dataset name from input file
+    local dataset_name=$(basename "$INPUT_PAF" .paf.gz | sed 's/.paf$//')
+
+    # Output TSV row (28 columns)
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$dataset_name" \
+        "$INPUT_TYPE" \
+        "$SIZE" \
+        "$EXTRACTED" \
+        "$tp_type" \
+        "$encode_time_sec" \
+        "$encode_mem_mb" \
+        "$tp_size_bytes" \
+        "$MAX_COMPLEXITY" \
+        "$COMPLEXITY_METRIC" \
+        "$strategy" \
+        "$compress_time_sec" \
+        "$compress_mem_mb" \
+        "$bpaf_size_bytes" \
+        "$ratio_orig_to_tp" \
+        "$ratio_tp_to_bpaf" \
+        "$ratio_orig_to_bpaf" \
+        "$decompress_time_sec" \
+        "$decompress_mem_mb" \
+        "$verified_text" \
+        "100" \
+        "100" \
+        "10000" \
+        "${SEEK_A[$key]}" \
+        "${SEEK_A_STDDEV[$key]}" \
+        "${SEEK_B[$key]}" \
+        "${SEEK_B_STDDEV[$key]}" \
+        "${SEEK_SUCCESS_RATIO[$key]}" \
+        >> "$tsv_file"
+}
+
+# Initialize TSV file with header
+TSV_FILE="$OUTPUT_DIR/results.tsv"
+cat > "$TSV_FILE" << TSV_HEADER
+dataset_name	dataset_type	original_size_bytes	num_records	encoding_type	encoding_runtime_sec	encoding_memory_mb	tp_file_size_bytes	max_complexity	complexity_metric	compression_strategy	compression_runtime_sec	compression_memory_mb	bpaf_size_bytes	ratio_orig_to_tp	ratio_tp_to_bpaf	ratio_orig_to_bpaf	decompression_runtime_sec	decompression_memory_mb	verification_passed	seek_positions_tested	seek_iterations_per_position	seek_total_tests	seek_mode_a_avg_us	seek_mode_a_stddev_us	seek_mode_b_avg_us	seek_mode_b_stddev_us	seek_success_ratio
+TSV_HEADER
 
 # Run all tests
 for TP_TYPE in "${TP_TYPES[@]}"; do
@@ -292,6 +472,7 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
     
     for STRATEGY in "${STRATEGIES[@]}"; do
         test_configuration "$TP_TYPE" "$STRATEGY"
+        output_tsv_row "$TP_TYPE" "$STRATEGY"
     done
     echo ""
 done
@@ -312,28 +493,53 @@ cat > "$REPORT" << HEADER
 HEADER
 
 for TP_TYPE in "${TP_TYPES[@]}"; do
+    # Calculate baseline sizes
+    tp_size_bytes=${TP_SIZE[$TP_TYPE]}
+    tp_size_mb=$(awk "BEGIN {printf \"%.2f\", $tp_size_bytes / 1024 / 1024}")
+
     cat >> "$REPORT" << SECTION
 ## Tracepoint Type: ${TP_TYPE^^}
 
-| Strategy | Compress Time | Compress Mem (KB) | Size (bytes) | Ratio | Decompress Time | Decompress Mem (KB) | Seek A (μs) | Seek B (μs) | Verified |
-|----------|---------------|-------------------|--------------|-------|-----------------|---------------------|-------------|-------------|----------|
+**Baseline Sizes:**
+- Original Input (CIGAR PAF): $SIZE bytes ($(awk "BEGIN {printf \"%.2f\", $SIZE / 1024 / 1024}") MB)
+- Tracepoint PAF ($TP_TYPE): $tp_size_bytes bytes ($tp_size_mb MB)
+
+| Strategy | Compressed Size (bytes) | BPAF Ratio | End-to-End Ratio | Compress Time | Compress Mem (KB) | Decompress Time | Decompress Mem (KB) | Seek A (μs) | Seek B (μs) | Verified |
+|----------|-------------------------|------------|------------------|---------------|-------------------|-----------------|---------------------|-------------|-------------|----------|
 SECTION
 
     for STRATEGY in "${STRATEGIES[@]}"; do
-        key="${TP_TYPE}_${strategy}"
-        ratio=$(echo "scale=2; $SIZE / ${COMPRESS_SIZE[$key]}" | bc -l 2>/dev/null || echo "N/A")
-        
+        key="${TP_TYPE}_${STRATEGY}"
+
+        # Calculate both ratios
+        bpaf_ratio=$(awk "BEGIN {printf \"%.2f\", $tp_size_bytes / ${COMPRESS_SIZE[$key]}}" 2>/dev/null || echo "N/A")
+        e2e_ratio=$(awk "BEGIN {printf \"%.2f\", $SIZE / ${COMPRESS_SIZE[$key]}}" 2>/dev/null || echo "N/A")
+
         cat >> "$REPORT" << ROW
-| $STRATEGY | ${COMPRESS_TIME[$key]} | ${COMPRESS_MEM[$key]} | ${COMPRESS_SIZE[$key]} | ${ratio}x | ${DECOMPRESS_TIME[$key]} | ${DECOMPRESS_MEM[$key]} | ${SEEK_A[$key]} | ${SEEK_B[$key]} | ${VERIFIED[$key]} |
+| $STRATEGY | ${COMPRESS_SIZE[$key]} | ${bpaf_ratio}x | ${e2e_ratio}x | ${COMPRESS_TIME[$key]} | ${COMPRESS_MEM[$key]} | ${DECOMPRESS_TIME[$key]} | ${DECOMPRESS_MEM[$key]} | ${SEEK_A[$key]} | ${SEEK_B[$key]} | ${VERIFIED[$key]} |
 ROW
     done
-    
+
     echo "" >> "$REPORT"
 done
 
 cat >> "$REPORT" << FOOTER
 
 ---
+
+## Compression Ratio Legend
+
+- **BPAF Ratio:** Tracepoint PAF size / BPAF size
+  - Measures BPAF compression strategy effectiveness only
+  - Use this to compare strategy performance
+  - Fair comparison across all strategies
+
+- **End-to-End Ratio:** Original input size / BPAF size
+  - Measures total compression from original input
+  - Includes CIGAR→tracepoint conversion gains (if applicable)
+  - Higher for CIGAR inputs due to format conversion
+
+**Note:** For CIGAR PAF inputs, End-to-End ratio includes both format conversion (~6-10x) and BPAF compression. For tracepoint PAF inputs, both ratios are identical.
 
 ## Seek Mode Legend
 
@@ -351,5 +557,6 @@ FOOTER
 
 echo "========================================="
 echo "Tests complete!"
-echo "Report: $REPORT"
+echo "Markdown Report: $REPORT"
+echo "TSV Data:        $TSV_FILE"
 echo "========================================="

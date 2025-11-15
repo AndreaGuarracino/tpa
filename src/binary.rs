@@ -117,7 +117,8 @@ pub(crate) fn analyze_correlation(records: &[AlignmentRecord]) -> f64 {
 }
 
 /// Empirical strategy selection by actually compressing a subset of records
-pub(crate) fn analyze_smart_compression(records: &[AlignmentRecord], zstd_level: i32) -> bool {
+/// Tests ALL concrete strategies and returns the best performing one
+pub(crate) fn analyze_smart_compression(records: &[AlignmentRecord], zstd_level: i32) -> CompressionStrategy {
     // Collect sample tracepoints
     let mut all_first_vals = Vec::new();
     let mut all_second_vals = Vec::new();
@@ -134,77 +135,112 @@ pub(crate) fn analyze_smart_compression(records: &[AlignmentRecord], zstd_level:
 
     if all_first_vals.is_empty() {
         info!("Empirical analysis: No tracepoints found, defaulting to Raw");
-        return false;  // Default to Raw
+        return CompressionStrategy::Raw(zstd_level);
     }
 
-    // Compress with Raw strategy (varint + zstd)
-    let raw_size = {
-        let mut first_val_buf = Vec::with_capacity(all_first_vals.len() * 2);
-        let mut second_val_buf = Vec::with_capacity(all_second_vals.len() * 2);
+    // Define all concrete strategies to test (excluding meta-strategies)
+    let strategies_to_test = vec![
+        CompressionStrategy::Raw(zstd_level),
+        CompressionStrategy::ZigzagDelta(zstd_level),
+        CompressionStrategy::TwoDimDelta(zstd_level),
+        CompressionStrategy::RunLength(zstd_level),
+        CompressionStrategy::BitPacked(zstd_level),
+        CompressionStrategy::DeltaOfDelta(zstd_level),
+        CompressionStrategy::FrameOfReference(zstd_level),
+        CompressionStrategy::HybridRLE(zstd_level),
+        CompressionStrategy::OffsetJoint(zstd_level),
+        CompressionStrategy::XORDelta(zstd_level),
+        CompressionStrategy::Dictionary(zstd_level),
+        CompressionStrategy::Simple8(zstd_level),
+        CompressionStrategy::StreamVByte(zstd_level),
+        CompressionStrategy::FastPFOR(zstd_level),
+        CompressionStrategy::Cascaded(zstd_level),
+        CompressionStrategy::Simple8bFull(zstd_level),
+        CompressionStrategy::SelectiveRLE(zstd_level),
+    ];
 
-        // Write first values as varint
-        for &val in &all_first_vals {
-            first_val_buf.extend_from_slice(&encode_varint_inline(val));
-        }
-        // Write second values as varint
-        for &val in &all_second_vals {
-            second_val_buf.extend_from_slice(&encode_varint_inline(val));
-        }
+    let mut results = Vec::new();
 
-        // Compress with zstd
-        let first_compressed = zstd::encode_all(&first_val_buf[..], zstd_level).unwrap();
-        let second_compressed = zstd::encode_all(&second_val_buf[..], zstd_level).unwrap();
-
-        first_compressed.len() + second_compressed.len()
-    };
-
-    // Compress with ZigzagDelta strategy (delta + zigzag + varint + zstd)
-    let zigzag_size = {
-        let mut first_val_buf = Vec::with_capacity(all_first_vals.len() * 2);
-        let mut second_val_buf = Vec::with_capacity(all_second_vals.len() * 2);
-
-        // Process first values: delta + zigzag + varint
-        if !all_first_vals.is_empty() {
-            let deltas = delta_encode(&all_first_vals);
-            for delta in deltas {
-                first_val_buf.extend_from_slice(&encode_varint_inline(encode_zigzag(delta)));
+    // Test each strategy
+    for strategy in strategies_to_test {
+        let total_size = match test_strategy_on_sample(&all_first_vals, &all_second_vals, strategy) {
+            Ok(size) => size,
+            Err(_) => {
+                // If a strategy fails, skip it
+                debug!("Strategy {} failed on sample, skipping", strategy);
+                continue;
             }
-        }
+        };
 
-        // Process second values: delta + zigzag + varint
-        if !all_second_vals.is_empty() {
-            let deltas = delta_encode(&all_second_vals);
-            for delta in deltas {
-                second_val_buf.extend_from_slice(&encode_varint_inline(encode_zigzag(delta)));
-            }
-        }
+        results.push((strategy, total_size));
+    }
 
-        // Compress with zstd
-        let first_compressed = zstd::encode_all(&first_val_buf[..], zstd_level).unwrap();
-        let second_compressed = zstd::encode_all(&second_val_buf[..], zstd_level).unwrap();
+    // Find the best strategy (minimum size)
+    if results.is_empty() {
+        info!("All strategies failed, defaulting to Raw");
+        return CompressionStrategy::Raw(zstd_level);
+    }
 
-        first_compressed.len() + second_compressed.len()
-    };
+    results.sort_by_key(|(_, size)| *size);
+    let (best_strategy, best_size) = results[0];
+    let (worst_strategy, worst_size) = results[results.len() - 1];
 
-    let use_zigzag = zigzag_size < raw_size;
-    let winner = if use_zigzag { "ZigzagDelta" } else { "Raw" };
-    let diff_pct = if use_zigzag {
-        ((raw_size - zigzag_size) as f64 / raw_size as f64) * 100.0
-    } else {
-        ((zigzag_size - raw_size) as f64 / zigzag_size as f64) * 100.0
-    };
+    let improvement = ((worst_size - best_size) as f64 / worst_size as f64) * 100.0;
 
-    debug!(
-        "Empirical analysis: sampled {} records, {} tracepoints - Raw: {} bytes, ZigzagDelta: {} bytes -> {} wins ({:.2}% better)",
+    info!(
+        "Empirical analysis: sampled {} records, {} tracepoints - tested {} strategies",
         sample_count,
         all_first_vals.len(),
-        raw_size,
-        zigzag_size,
-        winner,
-        diff_pct
+        results.len()
+    );
+    info!(
+        "Winner: {} ({} bytes) - Best improvement: {:.2}% better than {} ({} bytes)",
+        best_strategy,
+        best_size,
+        improvement,
+        worst_strategy,
+        worst_size
     );
 
-    use_zigzag
+    // Log top 3 strategies
+    for (i, (strat, size)) in results.iter().take(3).enumerate() {
+        let pct_worse = if size > &best_size {
+            ((*size - best_size) as f64 / best_size as f64) * 100.0
+        } else {
+            0.0
+        };
+        debug!("  {}. {} - {} bytes (+{:.2}%)", i + 1, strat, size, pct_worse);
+    }
+
+    best_strategy
+}
+
+/// Helper function to test a single strategy on sample data
+fn test_strategy_on_sample(
+    first_vals: &[u64],
+    second_vals: &[u64],
+    strategy: CompressionStrategy,
+) -> io::Result<usize> {
+    // Encode first values
+    let first_buf = encode_tracepoint_values(first_vals, strategy)?;
+
+    // Encode second values (handle 2D-Delta specially)
+    let second_buf = match strategy {
+        CompressionStrategy::TwoDimDelta(_) => {
+            // Second values encoded as delta from first
+            encode_2d_delta_second_values(first_vals, second_vals)?
+        }
+        _ => {
+            encode_tracepoint_values(second_vals, strategy)?
+        }
+    };
+
+    // Compress both with zstd
+    let zstd_level = strategy.zstd_level();
+    let first_compressed = zstd::encode_all(&first_buf[..], zstd_level)?;
+    let second_compressed = zstd::encode_all(&second_buf[..], zstd_level)?;
+
+    Ok(first_compressed.len() + second_compressed.len())
 }
 
 // ============================================================================
@@ -617,6 +653,14 @@ fn encode_tracepoint_values(
             // Selective RLE: detect and encode runs
             buf = crate::hybrids::encode_selective_rle(vals)?;
         }
+        CompressionStrategy::RiceEntropy(_) => {
+            // Rice/Golomb entropy coding
+            buf = crate::advanced_codecs::encode_rice(vals)?;
+        }
+        CompressionStrategy::HuffmanEntropy(_) => {
+            // Huffman entropy coding
+            buf = crate::advanced_codecs::encode_huffman(vals)?;
+        }
         CompressionStrategy::Automatic(_) | CompressionStrategy::AdaptiveCorrelation(_) => {
             panic!("Automatic strategies must be resolved before encoding")
         }
@@ -916,6 +960,14 @@ fn decode_tracepoint_values(
             // Selective RLE decode
             crate::hybrids::decode_selective_rle(buf)
         }
+        CompressionStrategy::RiceEntropy(_) => {
+            // Rice/Golomb entropy decoding
+            crate::advanced_codecs::decode_rice(buf)
+        }
+        CompressionStrategy::HuffmanEntropy(_) => {
+            // Huffman entropy decoding
+            crate::advanced_codecs::decode_huffman(buf)
+        }
         CompressionStrategy::Automatic(_) | CompressionStrategy::AdaptiveCorrelation(_) => {
             panic!("Automatic strategies must be resolved before decoding")
         }
@@ -1131,7 +1183,8 @@ fn decode_standard_tracepoints<R: Read>(
         CompressionStrategy::XORDelta(_) | CompressionStrategy::Dictionary(_) |
         CompressionStrategy::Simple8(_) | CompressionStrategy::StreamVByte(_) |
         CompressionStrategy::FastPFOR(_) | CompressionStrategy::Cascaded(_) |
-        CompressionStrategy::Simple8bFull(_) | CompressionStrategy::SelectiveRLE(_) => {
+        CompressionStrategy::Simple8bFull(_) | CompressionStrategy::SelectiveRLE(_) |
+        CompressionStrategy::RiceEntropy(_) | CompressionStrategy::HuffmanEntropy(_) => {
             // These strategies use standard encoding for both streams
             let first_vals = decode_tracepoint_values(&first_buf, num_items, strategy)?;
             let second_vals = decode_tracepoint_values(&second_buf, num_items, strategy)?;

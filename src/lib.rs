@@ -1,6 +1,7 @@
 mod binary;
 mod format;
 mod hybrids;
+mod advanced_codecs;
 /// Binary PAF format for efficient storage of sequence alignments with tracepoints
 ///
 /// Format: [Header] → [StringTable] → [Records]
@@ -202,13 +203,8 @@ fn compress_paf(
     // Choose strategy based on user's preference
     let chosen_strategy = match strategy {
         CompressionStrategy::Automatic(level) => {
-            // Run empirical compression test to decide strategy
-            let use_zigzag = analyze_smart_compression(&sample, level);
-            if use_zigzag {
-                CompressionStrategy::ZigzagDelta(level)
-            } else {
-                CompressionStrategy::Raw(level)
-            }
+            // Run empirical compression test to find best strategy
+            analyze_smart_compression(&sample, level)
         }
         CompressionStrategy::AdaptiveCorrelation(level) => {
             // Analyze correlation and choose optimal strategy
@@ -245,6 +241,8 @@ fn compress_paf(
         CompressionStrategy::Cascaded(level) => CompressionStrategy::Cascaded(level),
         CompressionStrategy::Simple8bFull(level) => CompressionStrategy::Simple8bFull(level),
         CompressionStrategy::SelectiveRLE(level) => CompressionStrategy::SelectiveRLE(level),
+        CompressionStrategy::RiceEntropy(level) => CompressionStrategy::RiceEntropy(level),
+        CompressionStrategy::HuffmanEntropy(level) => CompressionStrategy::HuffmanEntropy(level),
     };
 
     // Pass 2: Stream write - Header → StringTable → Records

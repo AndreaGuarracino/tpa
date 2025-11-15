@@ -9,16 +9,21 @@ COMPREHENSIVE_TEST="$SCRIPT_DIR/comprehensive_test.sh"
 
 # Default test files (can override with arguments)
 TEST_FILES=(
-    "${1:-/home/guarracino/git/impg/hprcv2/data/hg002v1.1.pat.PanSN-vs-HG02818_mat_hprc_r2_v1.0.1.p95.Pinf.aln.paf.gz}"
-    "${2:-/home/guarracino/git/impg/hprcv2/data/hg002v1.1.pat.PanSN-vs-HG02818_mat_hprc_r2_v1.0.1.sweepga.paf.gz}"
-    "${3:-/tmp/p95_clean.tp.paf}"
-    "${4:-/tmp/sweepga_clean.tp.paf}"
+    "${1:-/workspace/git/_resources/hg002v1.1.pat.PanSN-vs-HG02818_mat_hprc_r2_v1.0.1.p95.Pinf.aln.paf.gz}"
+    "${2:-/workspace/git/_resources/hg002v1.1.pat.PanSN-vs-HG02818_mat_hprc_r2_v1.0.1.sweepga.paf.gz}"
+    "${3:-/workspace/git/_resources/big-from-fg.tp.20k.paf}"
 )
 
-OUTPUT_BASE="${5:-/tmp/bpaf_all_tests}"
-NUM_RECORDS="${6:-20000}"
+OUTPUT_BASE="${5:-/workspace/git/lib_bpaf/test/bpaf_all_tests}"
+NUM_RECORDS="${6:-0}"  # 0 means use ALL records
 
 mkdir -p "$OUTPUT_BASE"
+
+# Initialize master TSV file
+MASTER_TSV="$OUTPUT_BASE/all_results.tsv"
+cat > "$MASTER_TSV" << TSV_HEADER
+dataset_name	dataset_type	original_size_bytes	num_records	encoding_type	encoding_runtime_sec	encoding_memory_mb	tp_file_size_bytes	max_complexity	complexity_metric	compression_strategy	compression_runtime_sec	compression_memory_mb	bpaf_size_bytes	ratio_orig_to_tp	ratio_tp_to_bpaf	ratio_orig_to_bpaf	decompression_runtime_sec	decompression_memory_mb	verification_passed	seek_positions_tested	seek_iterations_per_position	seek_total_tests	seek_mode_a_avg_us	seek_mode_a_stddev_us	seek_mode_b_avg_us	seek_mode_b_stddev_us	seek_success_ratio
+TSV_HEADER
 
 echo "###################################################################"
 echo "# lib_bpaf - Complete Test Suite"
@@ -27,6 +32,7 @@ echo ""
 echo "Running comprehensive tests on ${#TEST_FILES[@]} files..."
 echo "Output directory: $OUTPUT_BASE"
 echo "Records per file: $NUM_RECORDS"
+echo "Master TSV: $MASTER_TSV"
 echo ""
 
 # Track which files exist
@@ -47,13 +53,12 @@ done
 if [ ${#VALID_FILES[@]} -eq 0 ]; then
     echo "Error: No valid input files found"
     echo ""
-    echo "Usage: $0 [paf1] [paf2] [paf3] [paf4] [output_dir] [num_records]"
+    echo "Usage: $0 [paf1] [paf2] [paf3] [output_dir] [num_records]"
     echo ""
     echo "Default files:"
     echo "  1. p95 CIGAR PAF (compressed)"
     echo "  2. sweepga CIGAR PAF (compressed)"
     echo "  3. p95 tracepoint PAF"
-    echo "  4. sweepga tracepoint PAF"
     exit 1
 fi
 
@@ -78,7 +83,13 @@ for i in "${!VALID_FILES[@]}"; do
     echo ""
     
     $COMPREHENSIVE_TEST "$PAF" "$OUT_DIR" 32 edit-distance "$NUM_RECORDS"
-    
+
+    # Append TSV data (skip header)
+    if [ -f "$OUT_DIR/results.tsv" ]; then
+        tail -n +2 "$OUT_DIR/results.tsv" >> "$MASTER_TSV"
+        echo "✓ Appended results to master TSV"
+    fi
+
     echo ""
     echo ""
 done
@@ -130,6 +141,19 @@ FILE_ENTRY
 done
 
 cat >> "$FINAL_REPORT" << SUMMARY
+
+---
+
+## TSV Data
+
+**Master TSV File:** [\`all_results.tsv\`](./all_results.tsv)
+
+This file contains all test results in tab-separated format with 28 columns:
+- Dataset information (name, type, size, records)
+- Encoding metrics (type, runtime, memory, output size)
+- Compression metrics (strategy, runtime, memory, file sizes, ratios)
+- Decompression metrics (runtime, memory, verification)
+- Seek performance (100 positions × 100 iterations, avg/stddev/success ratio)
 
 ---
 
@@ -189,9 +213,11 @@ echo ""
 echo "Tested ${#VALID_FILES[@]} files in ${TOTAL_TIME} seconds"
 echo ""
 echo "Final Report: $FINAL_REPORT"
+echo "Master TSV:   $MASTER_TSV"
 echo ""
 echo "Individual Reports:"
 for NAME in "${FILE_NAMES[@]}"; do
-    echo "  - $OUTPUT_BASE/$NAME/test_report.md"
+    echo "  - Markdown: $OUTPUT_BASE/$NAME/test_report.md"
+    echo "  - TSV:      $OUTPUT_BASE/$NAME/results.tsv"
 done
 echo ""

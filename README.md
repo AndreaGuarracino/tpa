@@ -128,12 +128,19 @@ compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionSt
 // - Ideal when deltas are noisy or large
 // - Also enables O(1) random tracepoint access
 compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::Raw(3))?;
+
+// BlockwiseAdaptive: Adaptive selection per tracepoint record
+// - Samples 1% of data and tests 4 sub-strategies
+// - Selects optimal encoding (FOR, DeltaOfDelta, XORDelta, Dictionary)
+// - Enables O(1) random tracepoint access
+compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::BlockwiseAdaptive(32))?;
 ```
 
 **Strategy guide:**
 - **Automatic (default)**: Best for most use cases, analyzes data to choose Raw or ZigzagDelta
-- **ZigzagDelta**: Use when tracepoint values are mostly increasing (better delta compression)
-- **Raw**: Use when tracepoint values jump frequently and delta encoding increases entropy
+- **ZigzagDelta**: Use when tracepoint values are mostly increasing
+- **Raw**: Use when tracepoint values jump frequently
+- **BlockwiseAdaptive**: Adaptive selection per record using advanced codecs
 
 ### Index management
 

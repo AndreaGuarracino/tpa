@@ -110,6 +110,20 @@ pub enum CompressionStrategy {
     /// - Negligible overhead when runs are absent
     /// - Configurable compression level (max 22, default: 3)
     SelectiveRLE(i32),
+    /// Rice/Golomb entropy coding
+    /// - Optimal for geometric distributions (many small values, few large)
+    /// - Dynamic parameter k where 2^k ≈ mean(values)
+    /// - Encodes as quotient (unary) + remainder (k bits)
+    /// - Expected 5-20% additional compression on skewed data
+    /// - Configurable compression level (max 22, default: 3)
+    RiceEntropy(i32),
+    /// Huffman entropy coding
+    /// - Canonical Huffman for values 0-255, escape codes for larger
+    /// - Shorter codes for frequent values (e.g., 0 → 1 bit)
+    /// - Dynamic code table built from frequency analysis
+    /// - Expected 5-20% additional compression on skewed data
+    /// - Configurable compression level (max 22, default: 3)
+    HuffmanEntropy(i32),
 }
 
 impl CompressionStrategy {
@@ -156,6 +170,8 @@ impl CompressionStrategy {
             "cascaded" => Ok(CompressionStrategy::Cascaded(compression_level)),
             "simple8b-full" | "simple8bfull" => Ok(CompressionStrategy::Simple8bFull(compression_level)),
             "selective-rle" | "selectiverle" => Ok(CompressionStrategy::SelectiveRLE(compression_level)),
+            "rice" | "rice-entropy" => Ok(CompressionStrategy::RiceEntropy(compression_level)),
+            "huffman" | "huffman-entropy" => Ok(CompressionStrategy::HuffmanEntropy(compression_level)),
             _ => Err(format!(
                 "Unsupported compression strategy '{}'. Use --help to see all available strategies.",
                 strategy_name
@@ -195,6 +211,8 @@ impl CompressionStrategy {
             CompressionStrategy::Cascaded(_) => 14,
             CompressionStrategy::Simple8bFull(_) => 15,
             CompressionStrategy::SelectiveRLE(_) => 16,
+            CompressionStrategy::RiceEntropy(_) => 17,
+            CompressionStrategy::HuffmanEntropy(_) => 18,
         }
     }
 
@@ -218,6 +236,8 @@ impl CompressionStrategy {
             14 => Ok(CompressionStrategy::Cascaded(3)),
             15 => Ok(CompressionStrategy::Simple8bFull(3)),
             16 => Ok(CompressionStrategy::SelectiveRLE(3)),
+            17 => Ok(CompressionStrategy::RiceEntropy(3)),
+            18 => Ok(CompressionStrategy::HuffmanEntropy(3)),
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("Unsupported compression strategy code: {}", code),
@@ -247,6 +267,8 @@ impl CompressionStrategy {
             CompressionStrategy::Cascaded(level) => *level,
             CompressionStrategy::Simple8bFull(level) => *level,
             CompressionStrategy::SelectiveRLE(level) => *level,
+            CompressionStrategy::RiceEntropy(level) => *level,
+            CompressionStrategy::HuffmanEntropy(level) => *level,
         }
     }
 
@@ -311,6 +333,12 @@ impl std::fmt::Display for CompressionStrategy {
             }
             CompressionStrategy::SelectiveRLE(level) => {
                 write!(f, "SelectiveRLE (level {})", level)
+            }
+            CompressionStrategy::RiceEntropy(level) => {
+                write!(f, "RiceEntropy (level {})", level)
+            }
+            CompressionStrategy::HuffmanEntropy(level) => {
+                write!(f, "HuffmanEntropy (level {})", level)
             }
         }
     }
