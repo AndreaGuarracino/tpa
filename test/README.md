@@ -1,135 +1,330 @@
 # lib_bpaf Test Suite
 
-Comprehensive test suite for validating lib_bpaf compression, decompression, and random access functionality.
-
-## Test Script
-
-### `accurate_test.sh`
-
-Main test suite that validates all lib_bpaf functionality across 3 tracepoint types (standard, variable, mixed).
-
-**What it tests:**
-- CIGAR → Tracepoints encoding
-- Tracepoints → BPAF compression (automatic strategy selection)
-- BPAF → Tracepoints decompression with MD5 verification
-- O(1) random access (Mode A with index, Mode B direct offset)
-- Performance and memory efficiency
-
-**Usage:**
-```bash
-bash test/accurate_test.sh <input_paf> [max_complexity] [complexity_metric]
-```
-
-**Parameters:**
-- `input_paf`: CIGAR PAF file (gzipped or plain) OR tracepoint PAF file
-- `max_complexity`: Encoding complexity threshold (default: 32)
-- `complexity_metric`: `edit-distance` or `diagonal-distance` (default: edit-distance)
-
-**Examples:**
-```bash
-# CIGAR PAF files (will encode to tracepoints)
-bash test/accurate_test.sh data/p95.Pinf.aln.paf.gz
-bash test/accurate_test.sh data/sweepga.paf.gz
-
-# Tracepoint PAF files (skips encoding, compresses directly)
-bash test/accurate_test.sh data/big-from-fg.tp.20k.paf
-
-# Custom parameters
-bash test/accurate_test.sh data/p95.paf.gz 10 edit-distance
-```
-
-**Features:**
-- Auto-detects CIGAR vs tracepoint PAF files
-- Handles both gzipped and plain text files
-- Tests 20,000 records by default
-- Runs 1,000 random seeks per tracepoint type
-- Validates data integrity with normalized MD5 checksums
-
----
-
-## Recent Test Results
-
-All 3 files tested successfully with 100% pass rate (9/9 tests):
-
-### p95 CIGAR PAF (17,184 records)
-- Compression: 13-14x
-- Seek times: 15-254 μs
-- Status: ✅ All types passed
-
-### sweepga CIGAR PAF (20,000 records)
-- Compression: 19-26x
-- Seek times: 15-295 μs
-- Status: ✅ All types passed
-
-### big-from-fg Tracepoint PAF (20,000 records)
-- Compression: 2-7x (already tracepoints)
-- Seek times: 20-1841 μs
-- Status: ✅ All types passed
-
-**Test logs:** `test/logs/test_*.log`
-
----
-
-## Test Coverage
-
-✅ **Compression:** All tracepoint types, automatic strategy selection, large datasets
-✅ **Decompression:** MD5 verification, float normalization, perfect reconstruction
-✅ **Random Access:** O(1) seeks, both index modes, consistent accuracy
-✅ **Input Formats:** CIGAR PAF, tracepoint PAF, gzipped, plain text
-✅ **Performance:** Fast encoding/decoding, low memory usage
-
----
+Comprehensive testing framework for lib_bpaf compression strategies and seek performance.
 
 ## Quick Start
 
-```bash
-# Clone and build
-cd /path/to/lib_bpaf
-cargo build --release
+### Test a Single File
 
-# Run test on your PAF file
-bash test/accurate_test.sh /path/to/your/file.paf.gz
+```bash
+# Auto-detects input type (CIGAR compressed/uncompressed, or tracepoints)
+./test/comprehensive_test.sh input.paf.gz
+
+# With custom parameters
+./test/comprehensive_test.sh input.paf.gz /tmp/output 32 edit-distance 20000
+```
+
+### Test Multiple Files
+
+```bash
+# Uses default test files
+./test/run_all_tests.sh
+
+# With custom files
+./test/run_all_tests.sh p95.paf.gz sweepga.paf.gz p95.tp.paf sweepga.tp.paf /tmp/output 20000
 ```
 
 ---
 
-## Expected Performance
+## Test Scripts
 
-| Metric | p95 | sweepga | Tracepoint PAF |
-|--------|-----|---------|----------------|
-| Compression | 13-14x | 19-26x | 2-7x |
-| Encoding | 0.1-0.4s | 0.4-0.5s | skipped |
-| Decompression | 0.06-0.12s | 0.10-0.12s | 1.3-1.4s |
-| Seek (Mode B) | 15-111 μs | 15-112 μs | 20-1611 μs |
-| Memory | 5-9 MB | 9 MB | 5 MB |
+### 1. `comprehensive_test.sh` - Universal Single-File Test
+
+**The main testing script** - handles any PAF input automatically.
+
+**Auto-detection:**
+- ✓ CIGAR PAF (compressed `.paf.gz` or uncompressed `.paf`)
+- ✓ Tracepoint PAF (with `tp:Z:` tags)
+
+**What it tests:**
+- **Tracepoint types:** standard, variable, mixed (if CIGAR input)
+- **Compression strategies:** raw, zigzag-delta, 2d-delta, rle, bit-packed
+- **Performance:** compression/decompression time and memory
+- **Seek modes:** Mode A (BpafReader) and Mode B (standalone functions)
+- **Verification:** lossless round-trip with 3-decimal float normalization
+
+**Usage:**
+```bash
+./test/comprehensive_test.sh <input.paf[.gz]> [output_dir] [max_complexity] [metric] [records]
+```
+
+**Parameters:**
+- `input.paf[.gz]`: Any PAF file (REQUIRED)
+- `output_dir`: Output directory (default: `/tmp/bpaf_test_output`)
+- `max_complexity`: Max tracepoint complexity (default: `32`)
+- `metric`: Complexity metric (default: `edit-distance`)
+- `records`: Number of records to test (default: `20000`)
+
+**Examples:**
+```bash
+# Test compressed CIGAR PAF
+./test/comprehensive_test.sh data/alignments.p95.paf.gz
+
+# Test tracepoint PAF with custom output
+./test/comprehensive_test.sh data/alignments.tp.paf /tmp/mytest
+
+# Test with 50K records
+./test/comprehensive_test.sh data/big.paf.gz /tmp/output 32 edit-distance 50000
+```
+
+**Output:**
+- Individual test files in `output_dir/`
+- Markdown report: `output_dir/test_report.md`
+- Compressed files: `output_dir/{type}_{strategy}.bpaf`
 
 ---
 
-## Input Requirements
+### 2. `run_all_tests.sh` - Multi-File Test Wrapper
 
-**CIGAR PAF files:**
-- Must contain `cg:Z:` tags
-- Can be gzipped or plain text
-- Script will encode to tracepoints automatically
+**Runs comprehensive tests on multiple files** and aggregates results.
 
-**Tracepoint PAF files:**
-- Must contain `tp:Z:` tags
-- Can be gzipped or plain text
-- Script will skip encoding and compress directly
+**Default test suite:**
+1. p95 CIGAR PAF (compressed)
+2. sweepga CIGAR PAF (compressed)
+3. p95 tracepoint PAF
+4. sweepga tracepoint PAF
+
+**Usage:**
+```bash
+./test/run_all_tests.sh [paf1] [paf2] [paf3] [paf4] [output_dir] [records]
+```
+
+**Examples:**
+```bash
+# Use defaults
+./test/run_all_tests.sh
+
+# Custom files
+./test/run_all_tests.sh \
+    /data/file1.paf.gz \
+    /data/file2.paf \
+    /data/file3.tp.paf \
+    /data/file4.tp.paf \
+    /tmp/all_results \
+    20000
+```
+
+**Output:**
+- Per-file results: `output_dir/{filename}/test_report.md`
+- Aggregated report: `output_dir/FINAL_REPORT.md`
+- All test artifacts organized by filename
+
+---
+
+## Legacy Scripts (Deprecated)
+
+### `accurate_test.sh` - Original tracepoint type testing
+
+**Status:** Replaced by `comprehensive_test.sh`
+
+This script is now **deprecated**. Use `comprehensive_test.sh` instead, which includes all its functionality plus:
+- Auto-detection of input type
+- All compression strategies (not just default)
+- Memory measurements
+- Better reporting
+
+### `strategy_evaluation.sh` - Original strategy comparison
+
+**Status:** Replaced by `comprehensive_test.sh` + `run_all_tests.sh`
+
+This script is now **deprecated**. The new unified approach provides:
+- Support for both CIGAR and tracepoint inputs
+- All tracepoint types (not just standard)
+- Both seek modes (not just Mode A)
+- Better organization and reporting
+
+---
+
+## Utility Scripts
+
+### `normalize_paf.pl`
+
+Normalizes PAF float fields to exactly 3 decimal places for verification.
+
+**Handles all float formats:**
+```perl
+0.993724        →  0.993    # Normal decimals (truncate)
+.0549           →  0.054    # Leading dot (add zero)
+0               →  0.000    # Integer (add decimals)
+1               →  1.000    # Integer (add decimals)
+```
+
+**Usage:**
+```bash
+./test/normalize_paf.pl input.paf > normalized.paf
+
+# With MD5 verification
+./test/normalize_paf.pl file1.paf | md5sum
+./test/normalize_paf.pl file2.paf | md5sum
+```
+
+---
+
+## Test Results Interpretation
+
+### Seek Modes
+
+**Mode A - BpafReader with index:**
+- General-purpose API
+- Includes index lookup overhead
+- Typical use case for applications
+- Times: ~15-25 μs
+
+**Mode B - Standalone functions:**
+- Direct file I/O functions
+- Pre-computed offsets
+- Ultimate performance
+- Times: ~10-20 μs
+
+### Compression Strategies
+
+**Raw:**
+- Best for: Direct tracepoint data with low redundancy
+- Speed: Medium
+- Ratio: Best on unstructured data (6-7x)
+
+**ZigzagDelta (default):**
+- Best for: General-purpose compression
+- Speed: Medium
+- Ratio: Good on most data (2-6x)
+
+**2D-Delta:**
+- Best for: CIGAR-derived PAF with query/target correlation
+- Speed: Medium
+- Ratio: Best on CIGAR data (3-3.5x, 16-20% better than zigzag)
+
+**RLE:**
+- Best for: Highly repetitive alignment blocks
+- Speed: Slower
+- Ratio: Variable (needs optimization)
+
+**BitPacked:**
+- Best for: Narrow value ranges
+- Speed: Fastest compression
+- Ratio: Good when values fit in 8-16 bits
+
+---
+
+## Dependencies
+
+**Required:**
+- Rust toolchain (for compiling test programs)
+- `cigzip` binary (auto-built from `../cigzip`)
+- `lib_bpaf` library (auto-built)
+
+**System tools:**
+- `perl` (for float normalization)
+- `md5sum` (for verification)
+- `bc` (for calculations)
+- `/usr/bin/time` (for memory measurements)
+
+**Auto-built:**
+- Seek test programs (compiled on first run)
+- cigzip and lib_bpaf (if not present)
+
+---
+
+## Test Data Recommendations
+
+**For quick tests (5-10 minutes):**
+- Use 10,000-20,000 records
+- Single file with `comprehensive_test.sh`
+
+**For comprehensive evaluation (20-30 minutes):**
+- Use 20,000+ records per file
+- Multiple files with `run_all_tests.sh`
+- Include both CIGAR and tracepoint inputs
+
+**For production benchmarking:**
+- Use full files (100K+ records)
+- Test on representative data from your pipeline
+- Compare CIGAR vs tracepoint performance
+
+---
+
+## Examples
+
+### Example 1: Quick test of a CIGAR PAF
+
+```bash
+# Test first 10K records
+./test/comprehensive_test.sh alignments.p95.paf.gz /tmp/test 32 edit-distance 10000
+
+# View results
+cat /tmp/test/test_report.md
+```
+
+### Example 2: Full evaluation of multiple datasets
+
+```bash
+# Run complete test suite
+./test/run_all_tests.sh \
+    /data/human.p95.paf.gz \
+    /data/human.sweepga.paf.gz \
+    /data/human.p95.tp.paf \
+    /data/human.sweepga.tp.paf \
+    /tmp/human_eval \
+    50000
+
+# View aggregated results
+cat /tmp/human_eval/FINAL_REPORT.md
+```
+
+### Example 3: Compare strategies for a specific file
+
+```bash
+# Test all strategies on tracepoint PAF
+./test/comprehensive_test.sh my_alignments.tp.paf /tmp/strategy_test
+
+# Compare results
+grep "| zigzag-delta" /tmp/strategy_test/test_report.md
+grep "| 2d-delta" /tmp/strategy_test/test_report.md
+grep "| raw" /tmp/strategy_test/test_report.md
+```
 
 ---
 
 ## Troubleshooting
 
-**Test failures:**
-- Ensure input file has `cg:Z:` or `tp:Z:` tags
-- Check available disk space in `/tmp/` (~500 MB needed)
-- Clear old test files: `rm -f /tmp/test.* /tmp/cigar_sample.paf`
+**Build errors:**
+```bash
+# Manually rebuild cigzip
+cd ../cigzip && cargo build --release
 
-**Out of memory:**
-- Reduce `NUM_RECORDS` in script (default: 20000)
-- Expected memory: 5-10 MB for most datasets
+# Manually rebuild lib_bpaf
+cd .. && cargo build --release
+```
 
-**Compilation errors:**
-- Run `cargo build --release` first
-- Check that `target/release/liblib_bpaf.rlib` exists
+**Seek test failures:**
+```bash
+# Check if binaries exist
+ls -la target/release/seek_mode_* /tmp/seek_mode_*
+
+# Rebuild manually
+cd test && rm /tmp/seek_mode_* && ./comprehensive_test.sh <file>
+```
+
+**Verification failures:**
+```bash
+# Check normalization
+./test/normalize_paf.pl input.paf | head
+./test/normalize_paf.pl decompressed.paf | head
+
+# Manual diff
+diff <(./test/normalize_paf.pl input.paf) <(./test/normalize_paf.pl decomp.paf)
+```
+
+---
+
+## Contributing
+
+When adding new tests:
+1. Add to `comprehensive_test.sh` (main test logic)
+2. Update this README with new test descriptions
+3. Ensure backward compatibility with existing test files
+4. Add examples for new functionality
+
+---
+
+**Last Updated:** 2025-11-14
+**Version:** 2.0 (Unified testing framework)

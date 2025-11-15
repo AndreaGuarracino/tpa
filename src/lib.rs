@@ -1,5 +1,6 @@
 mod binary;
 mod format;
+mod hybrids;
 /// Binary PAF format for efficient storage of sequence alignments with tracepoints
 ///
 /// Format: [Header] → [StringTable] → [Records]
@@ -36,7 +37,7 @@ pub use binary::{
 // Re-export utility functions for external tools
 pub use utils::{read_varint, varint_size};
 
-use crate::binary::{analyze_smart_compression, decompress_varint};
+use crate::binary::{analyze_smart_compression, analyze_correlation, decompress_varint};
 
 use crate::utils::open_paf_reader;
 
@@ -209,9 +210,41 @@ fn compress_paf(
                 CompressionStrategy::Raw(level)
             }
         }
+        CompressionStrategy::AdaptiveCorrelation(level) => {
+            // Analyze correlation and choose optimal strategy
+            let correlation = analyze_correlation(&sample);
+            if correlation > 0.95 {
+                info!("Adaptive: High correlation ({:.4}) → OffsetJoint", correlation);
+                CompressionStrategy::OffsetJoint(level)
+            } else if correlation > 0.80 {
+                info!("Adaptive: Medium correlation ({:.4}) → 2D-Delta", correlation);
+                CompressionStrategy::TwoDimDelta(level)
+            } else if correlation > 0.50 {
+                info!("Adaptive: Low correlation ({:.4}) → ZigzagDelta", correlation);
+                CompressionStrategy::ZigzagDelta(level)
+            } else {
+                info!("Adaptive: Very low correlation ({:.4}) → FrameOfReference", correlation);
+                CompressionStrategy::FrameOfReference(level)
+            }
+        }
         // Respect explicit user choices
         CompressionStrategy::Raw(level) => CompressionStrategy::Raw(level),
         CompressionStrategy::ZigzagDelta(level) => CompressionStrategy::ZigzagDelta(level),
+        CompressionStrategy::TwoDimDelta(level) => CompressionStrategy::TwoDimDelta(level),
+        CompressionStrategy::RunLength(level) => CompressionStrategy::RunLength(level),
+        CompressionStrategy::BitPacked(level) => CompressionStrategy::BitPacked(level),
+        CompressionStrategy::DeltaOfDelta(level) => CompressionStrategy::DeltaOfDelta(level),
+        CompressionStrategy::FrameOfReference(level) => CompressionStrategy::FrameOfReference(level),
+        CompressionStrategy::HybridRLE(level) => CompressionStrategy::HybridRLE(level),
+        CompressionStrategy::OffsetJoint(level) => CompressionStrategy::OffsetJoint(level),
+        CompressionStrategy::XORDelta(level) => CompressionStrategy::XORDelta(level),
+        CompressionStrategy::Dictionary(level) => CompressionStrategy::Dictionary(level),
+        CompressionStrategy::Simple8(level) => CompressionStrategy::Simple8(level),
+        CompressionStrategy::StreamVByte(level) => CompressionStrategy::StreamVByte(level),
+        CompressionStrategy::FastPFOR(level) => CompressionStrategy::FastPFOR(level),
+        CompressionStrategy::Cascaded(level) => CompressionStrategy::Cascaded(level),
+        CompressionStrategy::Simple8bFull(level) => CompressionStrategy::Simple8bFull(level),
+        CompressionStrategy::SelectiveRLE(level) => CompressionStrategy::SelectiveRLE(level),
     };
 
     // Pass 2: Stream write - Header → StringTable → Records

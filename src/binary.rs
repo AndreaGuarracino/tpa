@@ -77,6 +77,45 @@ fn encode_varint_inline(mut value: u64) -> Vec<u8> {
     bytes
 }
 
+/// Analyze query-target correlation for adaptive strategy selection
+pub(crate) fn analyze_correlation(records: &[AlignmentRecord]) -> f64 {
+    // Collect tracepoint pairs
+    let mut query_vals: Vec<i64> = Vec::new();
+    let mut target_vals: Vec<i64> = Vec::new();
+
+    for record in records.iter() {
+        if let TracepointData::Standard(tps) | TracepointData::Fastga(tps) = &record.tracepoints {
+            for (q, t) in tps {
+                query_vals.push(*q as i64);
+                target_vals.push(*t as i64);
+            }
+        }
+    }
+
+    if query_vals.len() < 2 {
+        return 0.0; // Not enough data
+    }
+
+    // Calculate Pearson correlation coefficient
+    let n = query_vals.len() as f64;
+    let sum_q: f64 = query_vals.iter().map(|&x| x as f64).sum();
+    let sum_t: f64 = target_vals.iter().map(|&x| x as f64).sum();
+    let sum_qq: f64 = query_vals.iter().map(|&x| (x as f64) * (x as f64)).sum();
+    let sum_tt: f64 = target_vals.iter().map(|&x| (x as f64) * (x as f64)).sum();
+    let sum_qt: f64 = query_vals.iter().zip(target_vals.iter())
+        .map(|(&q, &t)| (q as f64) * (t as f64))
+        .sum();
+
+    let numerator = n * sum_qt - sum_q * sum_t;
+    let denominator = ((n * sum_qq - sum_q * sum_q) * (n * sum_tt - sum_t * sum_t)).sqrt();
+
+    if denominator.abs() < 1e-10 {
+        return 0.0; // Avoid division by zero
+    }
+
+    (numerator / denominator).abs() // Return absolute value of correlation
+}
+
 /// Empirical strategy selection by actually compressing a subset of records
 pub(crate) fn analyze_smart_compression(records: &[AlignmentRecord], zstd_level: i32) -> bool {
     // Collect sample tracepoints
@@ -352,10 +391,259 @@ fn encode_tracepoint_values(
                 write_varint(&mut buf, zigzag)?;
             }
         }
-        CompressionStrategy::Automatic(_) => {
-            panic!("Automatic strategy must be resolved before encoding")
+        CompressionStrategy::TwoDimDelta(_) => {
+            // For first values: same as ZigzagDelta
+            // For second values: will be handled specially in write_tracepoints
+            let deltas = delta_encode(vals);
+            for &val in &deltas {
+                let zigzag = ((val << 1) ^ (val >> 63)) as u64;
+                write_varint(&mut buf, zigzag)?;
+            }
+        }
+        CompressionStrategy::RunLength(_) => {
+            // RLE: encode (value, run_length) pairs
+            if vals.is_empty() {
+                return Ok(buf);
+            }
+
+            let mut run_val = vals[0];
+            let mut run_len = 1u64;
+
+            for &val in &vals[1..] {
+                if val == run_val {
+                    run_len += 1;
+                } else {
+                    // Write (value, length) pair
+                    write_varint(&mut buf, run_val)?;
+                    write_varint(&mut buf, run_len)?;
+                    run_val = val;
+                    run_len = 1;
+                }
+            }
+            // Write final run
+            write_varint(&mut buf, run_val)?;
+            write_varint(&mut buf, run_len)?;
+        }
+        CompressionStrategy::BitPacked(_) => {
+            // Bit packing: find max value, determine bits needed, pack
+            if vals.is_empty() {
+                return Ok(buf);
+            }
+
+            let max_val = *vals.iter().max().unwrap();
+            let bits_needed = if max_val == 0 { 1 } else { 64 - max_val.leading_zeros() };
+
+            // Store bits_needed (1 byte)
+            buf.push(bits_needed as u8);
+
+            // Simple byte-aligned packing for now (can optimize later)
+            if bits_needed <= 8 {
+                for &val in vals {
+                    buf.push(val as u8);
+                }
+            } else if bits_needed <= 16 {
+                for &val in vals {
+                    buf.extend_from_slice(&(val as u16).to_le_bytes());
+                }
+            } else if bits_needed <= 32 {
+                for &val in vals {
+                    buf.extend_from_slice(&(val as u32).to_le_bytes());
+                }
+            } else {
+                for &val in vals {
+                    buf.extend_from_slice(&val.to_le_bytes());
+                }
+            }
+        }
+        CompressionStrategy::DeltaOfDelta(_) => {
+            // Delta-of-delta (Gorilla-style): delta twice for regularly spaced coordinates
+            if vals.is_empty() {
+                return Ok(buf);
+            }
+            let deltas = delta_encode(vals);
+            let delta_deltas = delta_encode(&deltas.iter().map(|&x| x as u64).collect::<Vec<_>>());
+            for &val in &delta_deltas {
+                let zigzag = ((val << 1) ^ (val >> 63)) as u64;
+                write_varint(&mut buf, zigzag)?;
+            }
+        }
+        CompressionStrategy::FrameOfReference(_) => {
+            // Frame-of-Reference: min + bit-packed offsets
+            if vals.is_empty() {
+                return Ok(buf);
+            }
+            let min_val = *vals.iter().min().unwrap();
+            let max_offset = vals.iter().map(|&v| v - min_val).max().unwrap();
+            let bits_needed = if max_offset == 0 { 1 } else { 64 - max_offset.leading_zeros() };
+
+            // Write min value and bits_needed
+            write_varint(&mut buf, min_val)?;
+            buf.push(bits_needed as u8);
+
+            // Write offsets
+            for &val in vals {
+                let offset = val - min_val;
+                if bits_needed <= 8 {
+                    buf.push(offset as u8);
+                } else if bits_needed <= 16 {
+                    buf.extend_from_slice(&(offset as u16).to_le_bytes());
+                } else if bits_needed <= 32 {
+                    buf.extend_from_slice(&(offset as u32).to_le_bytes());
+                } else {
+                    buf.extend_from_slice(&offset.to_le_bytes());
+                }
+            }
+        }
+        CompressionStrategy::HybridRLE(_) => {
+            // Will be handled specially in write_tracepoints (RLE for target, varint for query)
+            // For now, use regular varint
+            for &val in vals {
+                write_varint(&mut buf, val)?;
+            }
+        }
+        CompressionStrategy::OffsetJoint(_) => {
+            // For first values: regular zigzag delta
+            // For second values: will be handled specially (as offset from first)
+            let deltas = delta_encode(vals);
+            for &val in &deltas {
+                let zigzag = ((val << 1) ^ (val >> 63)) as u64;
+                write_varint(&mut buf, zigzag)?;
+            }
+        }
+        CompressionStrategy::XORDelta(_) => {
+            // XOR-based differential (Gorilla): XOR with predecessor
+            if vals.is_empty() {
+                return Ok(buf);
+            }
+            // First value
+            write_varint(&mut buf, vals[0])?;
+            // XOR subsequent values with predecessor
+            for i in 1..vals.len() {
+                let xor_val = vals[i] ^ vals[i - 1];
+                write_varint(&mut buf, xor_val)?;
+            }
+        }
+        CompressionStrategy::Dictionary(_) => {
+            // Dictionary coding: build dictionary, encode indices
+            if vals.is_empty() {
+                return Ok(buf);
+            }
+            use std::collections::HashMap;
+            let mut dict: Vec<u64> = Vec::new();
+            let mut dict_map: HashMap<u64, u32> = HashMap::new();
+            let mut indices: Vec<u32> = Vec::new();
+
+            // Build dictionary
+            for &val in vals {
+                if !dict_map.contains_key(&val) {
+                    dict_map.insert(val, dict.len() as u32);
+                    dict.push(val);
+                }
+                indices.push(*dict_map.get(&val).unwrap());
+            }
+
+            // Write dictionary size
+            write_varint(&mut buf, dict.len() as u64)?;
+            // Write dictionary values
+            for &val in &dict {
+                write_varint(&mut buf, val)?;
+            }
+            // Write indices
+            for &idx in &indices {
+                write_varint(&mut buf, idx as u64)?;
+            }
+        }
+        CompressionStrategy::Simple8(_) => {
+            // Simple8-style: pack multiple small integers into 64-bit words
+            if vals.is_empty() {
+                return Ok(buf);
+            }
+            // Simplified version: use varint for now (full Simple8 needs selector logic)
+            for &val in vals {
+                write_varint(&mut buf, val)?;
+            }
+        }
+        CompressionStrategy::StreamVByte(_) => {
+            // Stream VByte: separated control and data bytes
+            if vals.is_empty() {
+                return Ok(buf);
+            }
+            let mut control_bytes: Vec<u8> = Vec::new();
+            let mut data_bytes: Vec<u8> = Vec::new();
+
+            for &val in vals {
+                let bytes_needed = if val == 0 { 1 } else { ((64 - val.leading_zeros() + 7) / 8) as usize };
+                // 2 bits per value: 00=1 byte, 01=2 bytes, 10=3 bytes, 11=4 bytes
+                let control = (bytes_needed - 1).min(3) as u8;
+                control_bytes.push(control);
+
+                // Write data bytes
+                for i in 0..bytes_needed {
+                    data_bytes.push(((val >> (i * 8)) & 0xFF) as u8);
+                }
+            }
+
+            // Pack control bytes (4 values per byte, 2 bits each)
+            let mut packed_control: Vec<u8> = Vec::new();
+            for chunk in control_bytes.chunks(4) {
+                let mut byte = 0u8;
+                for (i, &ctrl) in chunk.iter().enumerate() {
+                    byte |= ctrl << (i * 2);
+                }
+                packed_control.push(byte);
+            }
+
+            // Write control length, control bytes, then data bytes
+            write_varint(&mut buf, packed_control.len() as u64)?;
+            buf.extend_from_slice(&packed_control);
+            buf.extend_from_slice(&data_bytes);
+        }
+        CompressionStrategy::FastPFOR(_) => {
+            // FastPFOR: Patched Frame-of-Reference with exceptions
+            buf = crate::hybrids::encode_fastpfor(vals)?;
+        }
+        CompressionStrategy::Cascaded(_) => {
+            // Cascaded compression: Dictionary → RLE → base
+            buf = crate::hybrids::encode_cascaded(vals)?;
+        }
+        CompressionStrategy::Simple8bFull(_) => {
+            // Simple8b-RLE Full: pack into 64-bit words
+            let words = crate::hybrids::encode_simple8b_full(vals)?;
+            for word in words {
+                buf.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+        CompressionStrategy::SelectiveRLE(_) => {
+            // Selective RLE: detect and encode runs
+            buf = crate::hybrids::encode_selective_rle(vals)?;
+        }
+        CompressionStrategy::Automatic(_) | CompressionStrategy::AdaptiveCorrelation(_) => {
+            panic!("Automatic strategies must be resolved before encoding")
         }
     }
+    Ok(buf)
+}
+
+/// Encode second values for 2D-Delta strategy (as delta from first values)
+#[inline]
+fn encode_2d_delta_second_values(
+    first_vals: &[u64],
+    second_vals: &[u64],
+) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(second_vals.len() * 2);
+
+    // Compute differences: second - first
+    let diffs: Vec<i64> = first_vals.iter()
+        .zip(second_vals.iter())
+        .map(|(f, s)| *s as i64 - *f as i64)
+        .collect();
+
+    // Apply zigzag encoding to differences
+    for diff in diffs {
+        let zigzag = ((diff << 1) ^ (diff >> 63)) as u64;
+        write_varint(&mut buf, zigzag)?;
+    }
+
     Ok(buf)
 }
 
@@ -377,8 +665,8 @@ fn decode_tracepoint_values(
             }
             Ok(vals)
         }
-        CompressionStrategy::ZigzagDelta(_) => {
-            // Sigzag + delta decode
+        CompressionStrategy::ZigzagDelta(_) | CompressionStrategy::TwoDimDelta(_) => {
+            // Zigzag + delta decode
             let mut vals = Vec::with_capacity(num_items);
 
             // First value
@@ -395,10 +683,263 @@ fn decode_tracepoint_values(
             }
             Ok(vals)
         }
-        CompressionStrategy::Automatic(_) => {
-            panic!("Automatic strategy must be resolved before decoding")
+        CompressionStrategy::RunLength(_) => {
+            // RLE: decode (value, run_length) pairs
+            let mut vals = Vec::with_capacity(num_items);
+
+            while vals.len() < num_items {
+                let value = read_varint(&mut reader)?;
+                let run_len = read_varint(&mut reader)? as usize;
+
+                for _ in 0..run_len {
+                    vals.push(value);
+                    if vals.len() >= num_items {
+                        break;
+                    }
+                }
+            }
+            Ok(vals)
+        }
+        CompressionStrategy::BitPacked(_) => {
+            // Bit packing: read bits_needed, then unpack
+            if num_items == 0 {
+                return Ok(Vec::new());
+            }
+
+            let bits_needed = reader[0] as u32;
+            reader = &reader[1..];
+
+            let mut vals = Vec::with_capacity(num_items);
+
+            if bits_needed <= 8 {
+                for _ in 0..num_items {
+                    vals.push(reader[0] as u64);
+                    reader = &reader[1..];
+                }
+            } else if bits_needed <= 16 {
+                for _ in 0..num_items {
+                    let val = u16::from_le_bytes([reader[0], reader[1]]) as u64;
+                    vals.push(val);
+                    reader = &reader[2..];
+                }
+            } else if bits_needed <= 32 {
+                for _ in 0..num_items {
+                    let val = u32::from_le_bytes([reader[0], reader[1], reader[2], reader[3]]) as u64;
+                    vals.push(val);
+                    reader = &reader[4..];
+                }
+            } else {
+                for _ in 0..num_items {
+                    let val = u64::from_le_bytes([
+                        reader[0], reader[1], reader[2], reader[3],
+                        reader[4], reader[5], reader[6], reader[7],
+                    ]);
+                    vals.push(val);
+                    reader = &reader[8..];
+                }
+            }
+            Ok(vals)
+        }
+        CompressionStrategy::DeltaOfDelta(_) => {
+            // Delta-of-delta decode
+            if num_items == 0 {
+                return Ok(Vec::new());
+            }
+            let mut delta_deltas = Vec::with_capacity(num_items);
+            for _ in 0..num_items {
+                let zigzag = read_varint(&mut reader)?;
+                let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+                delta_deltas.push(val);
+            }
+            // Apply delta decode twice
+            let deltas = delta_decode(&delta_deltas);
+            let deltas_i64: Vec<i64> = deltas.iter().map(|&x| x as i64).collect();
+            Ok(delta_decode(&deltas_i64))
+        }
+        CompressionStrategy::FrameOfReference(_) => {
+            // Frame-of-Reference decode
+            if num_items == 0 {
+                return Ok(Vec::new());
+            }
+            let min_val = read_varint(&mut reader)?;
+            let bits_needed = reader[0] as u32;
+            reader = &reader[1..];
+
+            let mut vals = Vec::with_capacity(num_items);
+            if bits_needed <= 8 {
+                for _ in 0..num_items {
+                    vals.push(min_val + reader[0] as u64);
+                    reader = &reader[1..];
+                }
+            } else if bits_needed <= 16 {
+                for _ in 0..num_items {
+                    let offset = u16::from_le_bytes([reader[0], reader[1]]) as u64;
+                    vals.push(min_val + offset);
+                    reader = &reader[2..];
+                }
+            } else if bits_needed <= 32 {
+                for _ in 0..num_items {
+                    let offset = u32::from_le_bytes([reader[0], reader[1], reader[2], reader[3]]) as u64;
+                    vals.push(min_val + offset);
+                    reader = &reader[4..];
+                }
+            } else {
+                for _ in 0..num_items {
+                    let offset = u64::from_le_bytes([
+                        reader[0], reader[1], reader[2], reader[3],
+                        reader[4], reader[5], reader[6], reader[7],
+                    ]);
+                    vals.push(min_val + offset);
+                    reader = &reader[8..];
+                }
+            }
+            Ok(vals)
+        }
+        CompressionStrategy::HybridRLE(_) => {
+            // Decode as regular varint (special handling for target in decode_standard_tracepoints)
+            let mut vals = Vec::with_capacity(num_items);
+            for _ in 0..num_items {
+                vals.push(read_varint(&mut reader)?);
+            }
+            Ok(vals)
+        }
+        CompressionStrategy::OffsetJoint(_) => {
+            // Same as ZigzagDelta for first values
+            let mut vals = Vec::with_capacity(num_items);
+            if num_items == 0 {
+                return Ok(vals);
+            }
+            let zigzag = read_varint(&mut reader)?;
+            let first = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+            vals.push(first as u64);
+            for _ in 1..num_items {
+                let zigzag = read_varint(&mut reader)?;
+                let delta = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+                let prev = *vals.last().unwrap() as i64;
+                vals.push((prev + delta) as u64);
+            }
+            Ok(vals)
+        }
+        CompressionStrategy::XORDelta(_) => {
+            // XOR decode
+            if num_items == 0 {
+                return Ok(Vec::new());
+            }
+            let mut vals = Vec::with_capacity(num_items);
+            vals.push(read_varint(&mut reader)?);
+            for _ in 1..num_items {
+                let xor_val = read_varint(&mut reader)?;
+                let prev = *vals.last().unwrap();
+                vals.push(prev ^ xor_val);
+            }
+            Ok(vals)
+        }
+        CompressionStrategy::Dictionary(_) => {
+            // Dictionary decode
+            let dict_size = read_varint(&mut reader)? as usize;
+            let mut dict = Vec::with_capacity(dict_size);
+            for _ in 0..dict_size {
+                dict.push(read_varint(&mut reader)?);
+            }
+            let mut vals = Vec::with_capacity(num_items);
+            for _ in 0..num_items {
+                let idx = read_varint(&mut reader)? as usize;
+                vals.push(dict[idx]);
+            }
+            Ok(vals)
+        }
+        CompressionStrategy::Simple8(_) => {
+            // Simple8 decode (simplified: just varint)
+            let mut vals = Vec::with_capacity(num_items);
+            for _ in 0..num_items {
+                vals.push(read_varint(&mut reader)?);
+            }
+            Ok(vals)
+        }
+        CompressionStrategy::StreamVByte(_) => {
+            // Stream VByte decode
+            if num_items == 0 {
+                return Ok(Vec::new());
+            }
+            let control_len = read_varint(&mut reader)? as usize;
+            let mut control_bytes = vec![0u8; control_len];
+            reader.read_exact(&mut control_bytes)?;
+
+            // Unpack control bytes
+            let mut controls = Vec::new();
+            for &packed in &control_bytes {
+                for i in 0..4 {
+                    controls.push((packed >> (i * 2)) & 0x03);
+                    if controls.len() >= num_items {
+                        break;
+                    }
+                }
+            }
+
+            // Read data bytes according to control
+            let mut vals = Vec::with_capacity(num_items);
+            for &ctrl in controls.iter().take(num_items) {
+                let bytes_needed = (ctrl + 1) as usize;
+                let mut val = 0u64;
+                for i in 0..bytes_needed {
+                    val |= (reader[0] as u64) << (i * 8);
+                    reader = &reader[1..];
+                }
+                vals.push(val);
+            }
+            Ok(vals)
+        }
+        CompressionStrategy::FastPFOR(_) => {
+            // FastPFOR decode
+            crate::hybrids::decode_fastpfor(buf)
+        }
+        CompressionStrategy::Cascaded(_) => {
+            // Cascaded decode
+            crate::hybrids::decode_cascaded(buf)
+        }
+        CompressionStrategy::Simple8bFull(_) => {
+            // Simple8b-RLE Full decode
+            // Convert bytes back to u64 words
+            let mut words = Vec::new();
+            let mut i = 0;
+            while i + 8 <= buf.len() {
+                let word = u64::from_le_bytes([
+                    buf[i], buf[i+1], buf[i+2], buf[i+3],
+                    buf[i+4], buf[i+5], buf[i+6], buf[i+7],
+                ]);
+                words.push(word);
+                i += 8;
+            }
+            crate::hybrids::decode_simple8b_full(&words)
+        }
+        CompressionStrategy::SelectiveRLE(_) => {
+            // Selective RLE decode
+            crate::hybrids::decode_selective_rle(buf)
+        }
+        CompressionStrategy::Automatic(_) | CompressionStrategy::AdaptiveCorrelation(_) => {
+            panic!("Automatic strategies must be resolved before decoding")
         }
     }
+}
+
+/// Decode second values for 2D-Delta strategy (from diff values and first values)
+#[inline]
+fn decode_2d_delta_second_values(
+    buf: &[u8],
+    first_vals: &[u64],
+) -> io::Result<Vec<u64>> {
+    let mut reader = buf;
+    let mut second_vals = Vec::with_capacity(first_vals.len());
+
+    // Decode zigzag-encoded differences and add to first values
+    for &first in first_vals {
+        let zigzag = read_varint(&mut reader)?;
+        let diff = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+        let second = (first as i64 + diff) as u64;
+        second_vals.push(second);
+    }
+
+    Ok(second_vals)
 }
 
 /// Standard/Fastga tracepoint decoding
@@ -461,8 +1002,190 @@ fn decode_standard_tracepoints<R: Read>(
                 tps.push((a, b));
             }
         }
-        CompressionStrategy::Automatic(_) => {
-            panic!("Automatic strategy must be resolved before decoding")
+        CompressionStrategy::TwoDimDelta(_) => {
+            // First values: same as ZigzagDelta
+            let mut first_vals = Vec::with_capacity(num_items);
+            let zigzag_a = read_varint(&mut first_reader)?;
+            let a = ((zigzag_a >> 1) as i64) ^ -((zigzag_a & 1) as i64);
+            first_vals.push(a as usize);
+
+            for _ in 1..num_items {
+                let zigzag_a = read_varint(&mut first_reader)?;
+                let delta_a = ((zigzag_a >> 1) as i64) ^ -((zigzag_a & 1) as i64);
+                let prev_a = *first_vals.last().unwrap() as i64;
+                first_vals.push((prev_a + delta_a) as usize);
+            }
+
+            // Second values: decode as differences from first values
+            for &a in &first_vals {
+                let zigzag_diff = read_varint(&mut second_reader)?;
+                let diff = ((zigzag_diff >> 1) as i64) ^ -((zigzag_diff & 1) as i64);
+                let b = (a as i64 + diff) as usize;
+                tps.push((a, b));
+            }
+        }
+        CompressionStrategy::RunLength(_) => {
+            // RLE decoding for both first and second values
+            let mut first_vals = Vec::with_capacity(num_items);
+            while first_vals.len() < num_items {
+                let value = read_varint(&mut first_reader)? as usize;
+                let run_len = read_varint(&mut first_reader)? as usize;
+                for _ in 0..run_len {
+                    first_vals.push(value);
+                    if first_vals.len() >= num_items {
+                        break;
+                    }
+                }
+            }
+
+            let mut second_vals = Vec::with_capacity(num_items);
+            while second_vals.len() < num_items {
+                let value = read_varint(&mut second_reader)? as usize;
+                let run_len = read_varint(&mut second_reader)? as usize;
+                for _ in 0..run_len {
+                    second_vals.push(value);
+                    if second_vals.len() >= num_items {
+                        break;
+                    }
+                }
+            }
+
+            for (a, b) in first_vals.into_iter().zip(second_vals.into_iter()) {
+                tps.push((a, b));
+            }
+        }
+        CompressionStrategy::BitPacked(_) => {
+            // Bit packing decoding
+            let bits_needed_a = first_reader[0] as u32;
+            first_reader = &first_reader[1..];
+
+            let bits_needed_b = second_reader[0] as u32;
+            second_reader = &second_reader[1..];
+
+            let mut first_vals = Vec::with_capacity(num_items);
+            let mut second_vals = Vec::with_capacity(num_items);
+
+            // Decode first values
+            if bits_needed_a <= 8 {
+                for _ in 0..num_items {
+                    first_vals.push(first_reader[0] as usize);
+                    first_reader = &first_reader[1..];
+                }
+            } else if bits_needed_a <= 16 {
+                for _ in 0..num_items {
+                    let val = u16::from_le_bytes([first_reader[0], first_reader[1]]) as usize;
+                    first_vals.push(val);
+                    first_reader = &first_reader[2..];
+                }
+            } else if bits_needed_a <= 32 {
+                for _ in 0..num_items {
+                    let val = u32::from_le_bytes([first_reader[0], first_reader[1], first_reader[2], first_reader[3]]) as usize;
+                    first_vals.push(val);
+                    first_reader = &first_reader[4..];
+                }
+            } else {
+                for _ in 0..num_items {
+                    let val = u64::from_le_bytes([
+                        first_reader[0], first_reader[1], first_reader[2], first_reader[3],
+                        first_reader[4], first_reader[5], first_reader[6], first_reader[7],
+                    ]) as usize;
+                    first_vals.push(val);
+                    first_reader = &first_reader[8..];
+                }
+            }
+
+            // Decode second values
+            if bits_needed_b <= 8 {
+                for _ in 0..num_items {
+                    second_vals.push(second_reader[0] as usize);
+                    second_reader = &second_reader[1..];
+                }
+            } else if bits_needed_b <= 16 {
+                for _ in 0..num_items {
+                    let val = u16::from_le_bytes([second_reader[0], second_reader[1]]) as usize;
+                    second_vals.push(val);
+                    second_reader = &second_reader[2..];
+                }
+            } else if bits_needed_b <= 32 {
+                for _ in 0..num_items {
+                    let val = u32::from_le_bytes([second_reader[0], second_reader[1], second_reader[2], second_reader[3]]) as usize;
+                    second_vals.push(val);
+                    second_reader = &second_reader[4..];
+                }
+            } else {
+                for _ in 0..num_items {
+                    let val = u64::from_le_bytes([
+                        second_reader[0], second_reader[1], second_reader[2], second_reader[3],
+                        second_reader[4], second_reader[5], second_reader[6], second_reader[7],
+                    ]) as usize;
+                    second_vals.push(val);
+                    second_reader = &second_reader[8..];
+                }
+            }
+
+            for (a, b) in first_vals.into_iter().zip(second_vals.into_iter()) {
+                tps.push((a, b));
+            }
+        }
+        CompressionStrategy::DeltaOfDelta(_) | CompressionStrategy::FrameOfReference(_) |
+        CompressionStrategy::XORDelta(_) | CompressionStrategy::Dictionary(_) |
+        CompressionStrategy::Simple8(_) | CompressionStrategy::StreamVByte(_) |
+        CompressionStrategy::FastPFOR(_) | CompressionStrategy::Cascaded(_) |
+        CompressionStrategy::Simple8bFull(_) | CompressionStrategy::SelectiveRLE(_) => {
+            // These strategies use standard encoding for both streams
+            let first_vals = decode_tracepoint_values(&first_buf, num_items, strategy)?;
+            let second_vals = decode_tracepoint_values(&second_buf, num_items, strategy)?;
+            for (a, b) in first_vals.into_iter().zip(second_vals.into_iter()) {
+                tps.push((a as usize, b as usize));
+            }
+        }
+        CompressionStrategy::HybridRLE(_) => {
+            // Query as varint, target as RLE
+            let mut first_vals = Vec::with_capacity(num_items);
+            for _ in 0..num_items {
+                first_vals.push(read_varint(&mut first_reader)? as usize);
+            }
+
+            // Decode target with RLE
+            let mut second_vals = Vec::with_capacity(num_items);
+            while second_vals.len() < num_items {
+                let value = read_varint(&mut second_reader)? as usize;
+                let run_len = read_varint(&mut second_reader)? as usize;
+                for _ in 0..run_len {
+                    second_vals.push(value);
+                    if second_vals.len() >= num_items {
+                        break;
+                    }
+                }
+            }
+
+            for (a, b) in first_vals.into_iter().zip(second_vals.into_iter()) {
+                tps.push((a, b));
+            }
+        }
+        CompressionStrategy::OffsetJoint(_) => {
+            // First values: zigzag delta
+            let mut first_vals = Vec::with_capacity(num_items);
+            let zigzag_a = read_varint(&mut first_reader)?;
+            let a = ((zigzag_a >> 1) as i64) ^ -((zigzag_a & 1) as i64);
+            first_vals.push(a as usize);
+
+            for _ in 1..num_items {
+                let zigzag_a = read_varint(&mut first_reader)?;
+                let delta_a = ((zigzag_a >> 1) as i64) ^ -((zigzag_a & 1) as i64);
+                let prev_a = *first_vals.last().unwrap() as i64;
+                first_vals.push((prev_a + delta_a) as usize);
+            }
+
+            // Second values: as offset from first
+            for &a in &first_vals {
+                let offset = read_varint(&mut second_reader)? as usize;
+                let b = a + offset;
+                tps.push((a, b));
+            }
+        }
+        CompressionStrategy::Automatic(_) | CompressionStrategy::AdaptiveCorrelation(_) => {
+            panic!("Automatic strategies must be resolved before decoding")
         }
     }
 
@@ -568,7 +1291,46 @@ impl AlignmentRecord {
                     .unzip();
 
                 let first_val_buf = encode_tracepoint_values(&first_vals, strategy)?;
-                let second_val_buf = encode_tracepoint_values(&second_vals, strategy)?;
+                let second_val_buf = match strategy {
+                    CompressionStrategy::TwoDimDelta(_) => {
+                        // Encode second as delta from first
+                        encode_2d_delta_second_values(&first_vals, &second_vals)?
+                    }
+                    CompressionStrategy::OffsetJoint(_) => {
+                        // Encode second as offset from first (simpler than 2D-Delta)
+                        let mut buf = Vec::with_capacity(second_vals.len() * 2);
+                        for (f, s) in first_vals.iter().zip(second_vals.iter()) {
+                            let offset = s - f; // No zigzag, just raw offset
+                            write_varint(&mut buf, offset)?;
+                        }
+                        buf
+                    }
+                    CompressionStrategy::HybridRLE(_) => {
+                        // Encode target with RLE
+                        let mut buf = Vec::with_capacity(second_vals.len() * 2);
+                        if !second_vals.is_empty() {
+                            let mut run_val = second_vals[0];
+                            let mut run_len = 1u64;
+                            for &val in &second_vals[1..] {
+                                if val == run_val {
+                                    run_len += 1;
+                                } else {
+                                    write_varint(&mut buf, run_val)?;
+                                    write_varint(&mut buf, run_len)?;
+                                    run_val = val;
+                                    run_len = 1;
+                                }
+                            }
+                            write_varint(&mut buf, run_val)?;
+                            write_varint(&mut buf, run_len)?;
+                        }
+                        buf
+                    }
+                    _ => {
+                        // Standard encoding
+                        encode_tracepoint_values(&second_vals, strategy)?
+                    }
+                };
 
                 let first_compressed = zstd::encode_all(&first_val_buf[..], strategy.zstd_level())?;
                 let second_compressed =
