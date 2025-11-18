@@ -43,9 +43,10 @@ MAX_COMPLEXITY="${3:-32}"
 COMPLEXITY_METRIC="${4:-edit-distance}"
 NUM_RECORDS="${5:-20000}"
 TEST_MODE="${6:-single}"  # "single" or "dual" - controls strategy testing mode
+THREADS="${7:-1}"  # Number of parallel threads (default: 1)
 
 if [ -z "$INPUT_PAF" ] || [ ! -f "$INPUT_PAF" ]; then
-    echo "Usage: $0 <input.paf[.gz]> [output_dir] [max_complexity] [complexity_metric] [num_records] [test_mode]"
+    echo "Usage: $0 <input.paf[.gz]> [output_dir] [max_complexity] [complexity_metric] [num_records] [test_mode] [threads]"
     echo ""
     echo "Automatically detects input type:"
     echo "  - CIGAR PAF (compressed or uncompressed)"
@@ -54,6 +55,10 @@ if [ -z "$INPUT_PAF" ] || [ ! -f "$INPUT_PAF" ]; then
     echo "Test Modes:"
     echo "  single (default) - Test each strategy symmetrically (first==second)"
     echo "  dual             - Test all 17×17=289 strategy combinations"
+    echo ""
+    echo "Threads:"
+    echo "  Number of tests to run in parallel (default: 1)"
+    echo "  Example: 6 for 6-core CPU"
     echo ""
     echo "Tests:"
     echo "  - All tracepoint types (if CIGAR input)"
@@ -74,13 +79,14 @@ echo "Complexity:  $MAX_COMPLEXITY"
 echo "Metric:      $COMPLEXITY_METRIC"
 echo "Records:     $NUM_RECORDS"
 echo "Test Mode:   $TEST_MODE"
+echo "Threads:     $THREADS"
 echo "========================================="
 echo ""
 
 # Detect input type
 echo "=== Detecting input type ==="
 if [[ "$INPUT_PAF" == *.gz ]]; then
-    FIRST_LINE=$(zcat "$INPUT_PAF" | head -1)
+    FIRST_LINE=$(gzip -cdq "$INPUT_PAF" | head -1)
     IS_COMPRESSED=1
 else
     FIRST_LINE=$(head -1 "$INPUT_PAF")
@@ -103,14 +109,14 @@ echo ""
 if [ "$NUM_RECORDS" -eq 0 ]; then
     echo "=== Using ALL records from input file ==="
     if [ $IS_COMPRESSED -eq 1 ]; then
-        zcat "$INPUT_PAF" > "$OUTPUT_DIR/input_sample.paf"
+        gzip -cdq "$INPUT_PAF" > "$OUTPUT_DIR/input_sample.paf"
     else
         cp "$INPUT_PAF" "$OUTPUT_DIR/input_sample.paf"
     fi
 else
     echo "=== Extracting $NUM_RECORDS records ==="
     if [ $IS_COMPRESSED -eq 1 ]; then
-        zcat "$INPUT_PAF" | head -n "$NUM_RECORDS" > "$OUTPUT_DIR/input_sample.paf"
+        gzip -cdq "$INPUT_PAF" | head -n "$NUM_RECORDS" > "$OUTPUT_DIR/input_sample.paf"
     else
         head -n "$NUM_RECORDS" "$INPUT_PAF" > "$OUTPUT_DIR/input_sample.paf"
     fi
@@ -142,7 +148,35 @@ cd "$REPO_DIR"
 cat > /tmp/seek_mode_a.rs << 'RUST_A'
 use std::env;
 use std::time::Instant;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use lib_bpaf::BpafReader;
+use lib_bpaf::TracepointData;
+
+fn parse_reference(path: &str, limit: usize) -> Vec<Vec<(usize, usize)>> {
+    let file = File::open(path).expect("reference PAF open failed");
+    let reader = BufReader::new(file);
+    let mut refs = Vec::new();
+
+    for line in reader.lines().take(limit) {
+        let line = line.expect("line read");
+        if let Some(tp_idx) = line.find("tp:Z:") {
+            let tp_str = &line[tp_idx + 5..];
+            let tps: Vec<(usize, usize)> = tp_str
+                .split(';')
+                .filter(|s| !s.is_empty())
+                .map(|pair| {
+                    let mut it = pair.split(',');
+                    let a = it.next().unwrap().parse().unwrap();
+                    let b = it.next().unwrap().parse().unwrap();
+                    (a, b)
+                })
+                .collect();
+            refs.push(tps);
+        }
+    }
+    refs
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -150,8 +184,10 @@ fn main() {
     let num_records: u64 = args[2].parse().unwrap();
     let num_positions: usize = args[3].parse().unwrap();
     let iterations_per_pos: usize = args[4].parse().unwrap();
+    let reference_paf = &args[5];
 
     let mut reader = BpafReader::open(bpaf_path).unwrap();
+    let reference = parse_reference(reference_paf, num_records as usize);
 
     // Generate random positions
     use std::collections::HashSet;
@@ -176,11 +212,21 @@ fn main() {
         for _ in 0..iterations_per_pos {
             let start = Instant::now();
             match reader.get_tracepoints(pos) {
-                Ok(_) => {
+                Ok((tp, _, _)) => {
                     let time_us = start.elapsed().as_micros();
                     sum_us += time_us;
                     sum_sq_us += time_us * time_us;
                     success += 1;
+                    if let TracepointData::Standard(tps) = tp {
+                        let expected = reference.get(pos as usize).expect("reference missing");
+                        if expected.as_slice() != tps.as_slice() {
+                            eprintln!("Tracepoint mismatch at record {}", pos);
+                            std::process::exit(1);
+                        }
+                    } else {
+                        eprintln!("Unexpected tracepoint type for validation");
+                        std::process::exit(1);
+                    }
                 }
                 Err(_) => {}
             }
@@ -201,8 +247,34 @@ cat > /tmp/seek_mode_b.rs << 'RUST_B'
 use std::env;
 use std::time::Instant;
 use std::fs::File;
+use std::io::{BufRead, BufReader};
 use lib_bpaf::{BpafReader, read_standard_tracepoints_at_offset,
                read_variable_tracepoints_at_offset, read_mixed_tracepoints_at_offset};
+
+fn parse_reference(path: &str, limit: usize) -> Vec<Vec<(usize, usize)>> {
+    let file = File::open(path).expect("reference PAF open failed");
+    let reader = BufReader::new(file);
+    let mut refs = Vec::new();
+
+    for line in reader.lines().take(limit) {
+        let line = line.expect("line read");
+        if let Some(tp_idx) = line.find("tp:Z:") {
+            let tp_str = &line[tp_idx + 5..];
+            let tps: Vec<(usize, usize)> = tp_str
+                .split(';')
+                .filter(|s| !s.is_empty())
+                .map(|pair| {
+                    let mut it = pair.split(',');
+                    let a = it.next().unwrap().parse().unwrap();
+                    let b = it.next().unwrap().parse().unwrap();
+                    (a, b)
+                })
+                .collect();
+            refs.push(tps);
+        }
+    }
+    refs
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -211,9 +283,12 @@ fn main() {
     let num_positions: usize = args[3].parse().unwrap();
     let iterations_per_pos: usize = args[4].parse().unwrap();
     let tp_type = &args[5];
+    let reference_paf = &args[6];
 
     let mut reader = BpafReader::open(bpaf_path).unwrap();
     let strategy = reader.header().strategy().unwrap();
+    let layer = reader.header().compression_layer();
+    let reference = parse_reference(reference_paf, num_records as usize);
 
     // Generate random positions and get their offsets
     use std::collections::HashSet;
@@ -235,13 +310,13 @@ fn main() {
     let mut success = 0usize;
     let total_tests = num_positions * iterations_per_pos;
 
-    for &offset in &offsets {
+    for (&offset, &record_id) in offsets.iter().zip(positions.iter()) {
         // Warmup
         for _ in 0..3 {
             let _ = match tp_type.as_str() {
-                "standard" => read_standard_tracepoints_at_offset(&mut file, offset, strategy.clone()).map(|_| ()),
-                "variable" => read_variable_tracepoints_at_offset(&mut file, offset).map(|_| ()),
-                "mixed" => read_mixed_tracepoints_at_offset(&mut file, offset).map(|_| ()),
+                "standard" => read_standard_tracepoints_at_offset(&mut file, offset, strategy.clone(), layer),
+                "variable" => read_variable_tracepoints_at_offset(&mut file, offset).map(|_| Vec::new()),
+                "mixed" => read_mixed_tracepoints_at_offset(&mut file, offset).map(|_| Vec::new()),
                 _ => panic!("Invalid tp_type"),
             };
         }
@@ -250,18 +325,28 @@ fn main() {
         for _ in 0..iterations_per_pos {
             let start = Instant::now();
             let result = match tp_type.as_str() {
-                "standard" => read_standard_tracepoints_at_offset(&mut file, offset, strategy.clone()).map(|_| ()),
-                "variable" => read_variable_tracepoints_at_offset(&mut file, offset).map(|_| ()),
-                "mixed" => read_mixed_tracepoints_at_offset(&mut file, offset).map(|_| ()),
+                "standard" => read_standard_tracepoints_at_offset(&mut file, offset, strategy.clone(), layer),
+                "variable" => read_variable_tracepoints_at_offset(&mut file, offset).map(|_| Vec::new()),
+                "mixed" => read_mixed_tracepoints_at_offset(&mut file, offset).map(|_| Vec::new()),
                 _ => panic!("Invalid tp_type"),
             };
 
             match result {
-                Ok(_) => {
+                Ok(res) => {
                     let time_us = start.elapsed().as_micros();
                     sum_us += time_us;
                     sum_sq_us += time_us * time_us;
                     success += 1;
+                    match tp_type.as_str() {
+                        "standard" => {
+                            let expected = reference.get(record_id as usize).expect("reference missing");
+                            if expected.as_slice() != res.as_slice() {
+                                eprintln!("Tracepoint mismatch at record {}", record_id);
+                                std::process::exit(1);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 Err(_) => {}
             }
@@ -479,13 +564,13 @@ test_configuration() {
     fi
     
     # Seek Mode A: 10 positions × 10 iterations (for quick testing)
-    local seek_a_result=$(/tmp/seek_mode_a "$OUTPUT_DIR/${key}.bpaf" "$EXTRACTED" 10 10 2>/dev/null || echo "0 0 0")
+    local seek_a_result=$(/tmp/seek_mode_a "$OUTPUT_DIR/${key}.bpaf" "$EXTRACTED" 10 10 "$tp_paf" 2>/dev/null || echo "0 0 0")
     read -r seek_a_avg seek_a_std seek_a_ratio <<< "$seek_a_result"
     SEEK_A[$key]="$seek_a_avg"
     SEEK_A_STDDEV[$key]="$seek_a_std"
 
     # Seek Mode B: 10 positions × 10 iterations (for quick testing)
-    local seek_b_result=$(/tmp/seek_mode_b "$OUTPUT_DIR/${key}.bpaf" "$EXTRACTED" 10 10 "$tp_type" 2>/dev/null || echo "0 0 0")
+    local seek_b_result=$(/tmp/seek_mode_b "$OUTPUT_DIR/${key}.bpaf" "$EXTRACTED" 10 10 "$tp_type" "$tp_paf" 2>/dev/null || echo "0 0 0")
     read -r seek_b_avg seek_b_std seek_b_ratio <<< "$seek_b_result"
     SEEK_B[$key]="$seek_b_avg"
     SEEK_B_STDDEV[$key]="$seek_b_std"
@@ -593,25 +678,61 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
         LAYERS=("" "-bgzip" "-nocomp")
         total_combos=$((${#BASE_STRATEGIES[@]} * ${#BASE_STRATEGIES[@]} * ${#LAYERS[@]}))
         combo_count=0
-        echo "Testing $total_combos dual strategy combinations (17 first × 17 second × 3 layers)..."
+        echo "Testing $total_combos dual strategy combinations (17 first × 17 second × 3 layers) with $THREADS threads..."
 
+        # Function to run a single test (for parallel execution)
+        run_test() {
+            local tp_type="$1"
+            local first_full="$2"
+            local second_full="$3"
+            local temp_tsv="$4"
+
+            test_configuration "$tp_type" "$first_full" "$second_full" >/dev/null 2>&1
+            output_tsv_row "$tp_type" "$first_full" "$second_full" >> "$temp_tsv"
+        }
+        export -f run_test
+        export -f test_configuration
+        export -f output_tsv_row
+
+        # Create temporary directory for parallel results
+        TEMP_DIR="$OUTPUT_DIR/parallel_tmp"
+        mkdir -p "$TEMP_DIR"
+
+        # Run tests in parallel
+        job_count=0
         for LAYER in "${LAYERS[@]}"; do
             for FIRST in "${BASE_STRATEGIES[@]}"; do
                 for SECOND in "${BASE_STRATEGIES[@]}"; do
                     combo_count=$((combo_count + 1))
-                    if [ $((combo_count % 50)) -eq 0 ]; then
-                        echo "  Progress: $combo_count/$total_combos"
-                    fi
-
-                    # Build full strategy names with layer suffix
                     FIRST_FULL="${FIRST}${LAYER}"
                     SECOND_FULL="${SECOND}${LAYER}"
+                    TEMP_TSV="$TEMP_DIR/test_${combo_count}.tsv"
 
-                    test_configuration "$TP_TYPE" "$FIRST_FULL" "$SECOND_FULL"
-                    output_tsv_row "$TP_TYPE" "$FIRST_FULL" "$SECOND_FULL"
+                    # Run test in background
+                    test_configuration "$TP_TYPE" "$FIRST_FULL" "$SECOND_FULL" >/dev/null 2>&1
+                    output_tsv_row "$TP_TYPE" "$FIRST_FULL" "$SECOND_FULL" >> "$TEMP_TSV" &
+
+                    job_count=$((job_count + 1))
+
+                    # Wait if we've reached the thread limit
+                    if [ $((job_count % THREADS)) -eq 0 ]; then
+                        wait
+                        echo "  Progress: $combo_count/$total_combos"
+                    fi
                 done
             done
         done
+
+        # Wait for remaining jobs
+        wait
+
+        # Merge all temporary TSV files
+        for tsv_file in "$TEMP_DIR"/test_*.tsv; do
+            [ -f "$tsv_file" ] && cat "$tsv_file" >> "$OUTPUT_DIR/results.tsv"
+        done
+
+        # Clean up
+        rm -rf "$TEMP_DIR"
 
         # Also test automatic mode (which internally tests all 867 combinations and selects best)
         echo ""

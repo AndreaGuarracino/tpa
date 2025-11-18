@@ -39,7 +39,8 @@ fn strategy_to_name(strat: &str) -> String {
         "Simple8bFull" => "simple8b-full",
         "SelectiveRLE" => "selective-rle",
         _ => "unknown",
-    }.to_string()
+    }
+    .to_string()
 }
 
 fn main() -> io::Result<()> {

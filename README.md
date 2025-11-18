@@ -77,18 +77,19 @@ For maximum speed when you have pre-computed offsets:
 use lib_bpaf::{read_standard_tracepoints_at_offset,
                read_variable_tracepoints_at_offset,
                read_mixed_tracepoints_at_offset,
-               CompressionStrategy};
+               CompressionStrategy, CompressionLayer};
 use std::fs::File;
 
 // Open file once (reuse for multiple seeks)
 let mut file = File::open("alignments.bpaf")?;
 
-// Pre-computed offsets and strategy from index/header
+// Pre-computed offsets, strategy, and layer from index/header
 let offset = 123456;
 let strategy = CompressionStrategy::ZigzagDelta(3);
+let layer = CompressionLayer::Zstd; // or read from BinaryPafHeader
 
 // Direct tracepoint decoding - no BpafReader overhead
-let standard_tps = read_standard_tracepoints_at_offset(&mut file, offset, strategy)?;
+let standard_tps = read_standard_tracepoints_at_offset(&mut file, offset, strategy, layer)?;
 let variable_tps = read_variable_tracepoints_at_offset(&mut file, offset)?;
 let mixed_tps = read_mixed_tracepoints_at_offset(&mut file, offset)?;
 ```

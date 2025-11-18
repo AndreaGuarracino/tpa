@@ -1,6 +1,4 @@
-use lib_bpaf::{
-    is_binary_paf, BinaryPafHeader, StringTable, varint_size,
-};
+use lib_bpaf::{is_binary_paf, varint_size, BinaryPafHeader, StringTable};
 use std::env;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek};
@@ -35,13 +33,13 @@ impl BpafSizeAnalysis {
 
     fn print_report(&self, header: &BinaryPafHeader, magic: &[u8; 4]) {
         // Calculate header field sizes
-        let magic_size = 4u64;  // "BPAF" magic bytes
-        let version_size = 1u64;  // version byte
-        let strategy_size = 1u64;  // strategy byte
+        let magic_size = 4u64; // "BPAF" magic bytes
+        let version_size = 1u64; // version byte
+        let strategy_size = 1u64; // strategy byte
         let num_records_varint = varint_size(self.num_records);
         let num_strings_varint = varint_size(self.num_strings);
-        let tp_type_size = 1u64;  // TracepointType byte
-        let complexity_metric_size = 1u64;  // ComplexityMetric byte
+        let tp_type_size = 1u64; // TracepointType byte
+        let complexity_metric_size = 1u64; // ComplexityMetric byte
         let max_complexity_varint = varint_size(header.max_complexity());
         let distance_size = match header.distance() {
             lib_bpaf::Distance::Edit => 1u64,
@@ -51,52 +49,95 @@ impl BpafSizeAnalysis {
 
         let magic_str = String::from_utf8_lossy(magic);
         println!("=== BPAF Header ==============");
-        println!("  Magic bytes:                {:>12} bytes - value: \"{}\"", magic_size, magic_str);
-        println!("  Version:                    {:>12} bytes - value: {}", version_size, header.version());
-        println!("  Strategy:                   {:>12} bytes - value: {:?}", strategy_size, header.strategy().unwrap());
-        println!("  Num records (varint):       {:>12} bytes - value: {}", num_records_varint, self.num_records);
-        println!("  Num strings (varint):       {:>12} bytes - value: {}", num_strings_varint, self.num_strings);
-        println!("  Tracepoint type:            {:>12} bytes - value: {:?}", tp_type_size, header.tp_type());
-        println!("  Complexity metric:          {:>12} bytes - value: {:?}", complexity_metric_size, header.complexity_metric());
-        println!("  Max complexity (varint):    {:>12} bytes - value: {}", max_complexity_varint, header.max_complexity());
-        println!("  Distance mode:              {:>12} bytes - value: {:?}", distance_size, header.distance());
+        println!(
+            "  Magic bytes:                {:>12} bytes - value: \"{}\"",
+            magic_size, magic_str
+        );
+        println!(
+            "  Version:                    {:>12} bytes - value: {}",
+            version_size,
+            header.version()
+        );
+        println!(
+            "  Strategy:                   {:>12} bytes - value: {:?}",
+            strategy_size,
+            header.strategy().unwrap()
+        );
+        println!(
+            "  Num records (varint):       {:>12} bytes - value: {}",
+            num_records_varint, self.num_records
+        );
+        println!(
+            "  Num strings (varint):       {:>12} bytes - value: {}",
+            num_strings_varint, self.num_strings
+        );
+        println!(
+            "  Tracepoint type:            {:>12} bytes - value: {:?}",
+            tp_type_size,
+            header.tp_type()
+        );
+        println!(
+            "  Complexity metric:          {:>12} bytes - value: {:?}",
+            complexity_metric_size,
+            header.complexity_metric()
+        );
+        println!(
+            "  Max complexity (varint):    {:>12} bytes - value: {}",
+            max_complexity_varint,
+            header.max_complexity()
+        );
+        println!(
+            "  Distance mode:              {:>12} bytes - value: {:?}",
+            distance_size,
+            header.distance()
+        );
         let header_pct = self.header_size as f64 / self.total_file_size as f64 * 100.0;
-        println!("  Total:                      {:>12} bytes ({} of the file)",
+        println!(
+            "  Total:                      {:>12} bytes ({} of the file)",
             self.header_size,
             Self::format_percentage(header_pct)
         );
 
         println!("\n=== String Table ==============");
-        println!("  String name len varints:    {:>12} bytes  (avg: {:.2})",
+        println!(
+            "  String name len varints:    {:>12} bytes  (avg: {:.2})",
             self.string_name_length_varints,
             self.string_name_length_varints as f64 / self.num_strings as f64
         );
-        println!("  String name bytes:          {:>12} bytes  (avg: {:.2})",
+        println!(
+            "  String name bytes:          {:>12} bytes  (avg: {:.2})",
             self.string_name_bytes,
             self.string_name_bytes as f64 / self.num_strings as f64
         );
-        println!("  Sequence len varints:       {:>12} bytes  (avg: {:.2})",
+        println!(
+            "  Sequence len varints:       {:>12} bytes  (avg: {:.2})",
             self.sequence_length_varints,
             self.sequence_length_varints as f64 / self.num_strings as f64
         );
         let strtab_pct = self.string_table_size as f64 / self.total_file_size as f64 * 100.0;
-        println!("  Total:                      {:>12} bytes  ({} of the file)",
+        println!(
+            "  Total:                      {:>12} bytes  ({} of the file)",
             self.string_table_size,
             Self::format_percentage(strtab_pct)
         );
 
         println!("\n=== Alignment Records ==============");
         let records_pct = self.records_section_size as f64 / self.total_file_size as f64 * 100.0;
-        println!("  Total size:                 {:>12} bytes  ({} of the file)",
+        println!(
+            "  Total size:                 {:>12} bytes  ({} of the file)",
             self.records_section_size,
             Self::format_percentage(records_pct)
         );
-        println!("  Avg bytes per record:       {:>12.2}",
+        println!(
+            "  Avg bytes per record:       {:>12.2}",
             self.records_section_size as f64 / self.num_records as f64
         );
 
         println!("\n=== TOTAL ===");
-        println!("Total file size:              {:>12} bytes  (100.00%)", self.total_file_size);
+        println!(
+            "Total file size:              {:>12} bytes  (100.00%)",
+            self.total_file_size
+        );
     }
 }
 

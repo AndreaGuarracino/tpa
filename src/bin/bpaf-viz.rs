@@ -48,19 +48,13 @@ impl ViewState {
     fn genome_to_pixel(&self, gx: f64, gy: f64, canvas: egui::Rect) -> egui::Pos2 {
         let px = (gx - self.x) / self.scale;
         let py = (gy - self.y) / self.scale;
-        egui::pos2(
-            canvas.min.x + px as f32,
-            canvas.max.y - py as f32,
-        )
+        egui::pos2(canvas.min.x + px as f32, canvas.max.y - py as f32)
     }
 
     fn pixel_to_genome(&self, pos: egui::Pos2, canvas: egui::Rect) -> (f64, f64) {
         let px = (pos.x - canvas.min.x) as f64;
         let py = (canvas.max.y - pos.y) as f64;
-        (
-            self.x + px * self.scale,
-            self.y + py * self.scale,
-        )
+        (self.x + px * self.scale, self.y + py * self.scale)
     }
 
     fn zoom(&mut self, factor: f64, mouse: egui::Pos2, canvas: egui::Rect, plot: &Plot) {
@@ -100,27 +94,35 @@ impl Plot {
         let mut target_seqs: HashMap<u64, (String, u64)> = HashMap::new();
 
         // Collect all records first
-        let segments: Vec<AlignmentRecord> = reader.iter_records()
-            .collect::<Result<Vec<_>, _>>()?;
+        let segments: Vec<AlignmentRecord> =
+            reader.iter_records().collect::<Result<Vec<_>, _>>()?;
 
         // Now access string table
         let string_table = reader.string_table()?;
 
         // Build sequence maps
         for record in &segments {
-            let query_name = string_table.get(record.query_name_id)
-                .unwrap_or("unknown").to_string();
-            let query_len = string_table.get_length(record.query_name_id)
+            let query_name = string_table
+                .get(record.query_name_id)
+                .unwrap_or("unknown")
+                .to_string();
+            let query_len = string_table
+                .get_length(record.query_name_id)
                 .unwrap_or(record.query_end);
 
-            let target_name = string_table.get(record.target_name_id)
-                .unwrap_or("unknown").to_string();
-            let target_len = string_table.get_length(record.target_name_id)
+            let target_name = string_table
+                .get(record.target_name_id)
+                .unwrap_or("unknown")
+                .to_string();
+            let target_len = string_table
+                .get_length(record.target_name_id)
                 .unwrap_or(record.target_end);
 
-            query_seqs.entry(record.query_name_id)
+            query_seqs
+                .entry(record.query_name_id)
                 .or_insert((query_name, query_len));
-            target_seqs.entry(record.target_name_id)
+            target_seqs
+                .entry(record.target_name_id)
                 .or_insert((target_name, target_len));
         }
 
@@ -156,29 +158,40 @@ impl Plot {
         target_boundaries.push((target_total_len, String::new()));
 
         // Convert to genome-wide coordinates
-        let segments: Vec<Segment> = segments.into_iter().map(|rec| {
-            let q_offset = query_offsets[&rec.query_name_id];
-            let t_offset = target_offsets[&rec.target_name_id];
+        let segments: Vec<Segment> = segments
+            .into_iter()
+            .map(|rec| {
+                let q_offset = query_offsets[&rec.query_name_id];
+                let t_offset = target_offsets[&rec.target_name_id];
 
-            let reverse = rec.strand == '-';
-            let (bbeg, bend) = if reverse {
-                (t_offset + rec.target_end, t_offset + rec.target_start)
-            } else {
-                (t_offset + rec.target_start, t_offset + rec.target_end)
-            };
+                let reverse = rec.strand == '-';
+                let (bbeg, bend) = if reverse {
+                    (t_offset + rec.target_end, t_offset + rec.target_start)
+                } else {
+                    (t_offset + rec.target_start, t_offset + rec.target_end)
+                };
 
-            Segment {
-                abeg: q_offset + rec.query_start,
-                aend: q_offset + rec.query_end,
-                bbeg,
-                bend,
-                reverse,
-            }
-        }).collect();
+                Segment {
+                    abeg: q_offset + rec.query_start,
+                    aend: q_offset + rec.query_end,
+                    bbeg,
+                    bend,
+                    reverse,
+                }
+            })
+            .collect();
 
         println!("Loaded {} segments", segments.len());
-        println!("Query: {} sequences, {} bp", query_boundaries.len() - 1, query_total_len);
-        println!("Target: {} sequences, {} bp", target_boundaries.len() - 1, target_total_len);
+        println!(
+            "Query: {} sequences, {} bp",
+            query_boundaries.len() - 1,
+            query_total_len
+        );
+        println!(
+            "Target: {} sequences, {} bp",
+            target_boundaries.len() - 1,
+            target_total_len
+        );
 
         Ok(Plot {
             segments,
@@ -189,21 +202,28 @@ impl Plot {
         })
     }
 
-    fn query_visible(&self, view: &ViewState, canvas_width: f32, canvas_height: f32) -> Vec<&Segment> {
+    fn query_visible(
+        &self,
+        view: &ViewState,
+        canvas_width: f32,
+        canvas_height: f32,
+    ) -> Vec<&Segment> {
         let x_min = view.x;
         let x_max = view.x + canvas_width as f64 * view.scale;
         let y_min = view.y;
         let y_max = view.y + canvas_height as f64 * view.scale;
 
-        self.segments.iter().filter(|seg| {
-            let seg_x_min = seg.abeg.min(seg.aend) as f64;
-            let seg_x_max = seg.abeg.max(seg.aend) as f64;
-            let seg_y_min = seg.bbeg.min(seg.bend) as f64;
-            let seg_y_max = seg.bbeg.max(seg.bend) as f64;
+        self.segments
+            .iter()
+            .filter(|seg| {
+                let seg_x_min = seg.abeg.min(seg.aend) as f64;
+                let seg_x_max = seg.abeg.max(seg.aend) as f64;
+                let seg_y_min = seg.bbeg.min(seg.bend) as f64;
+                let seg_y_max = seg.bbeg.max(seg.bend) as f64;
 
-            seg_x_max >= x_min && seg_x_min <= x_max &&
-            seg_y_max >= y_min && seg_y_min <= y_max
-        }).collect()
+                seg_x_max >= x_min && seg_x_min <= x_max && seg_y_max >= y_min && seg_y_min <= y_max
+            })
+            .collect()
     }
 }
 
@@ -244,10 +264,8 @@ impl BpafViz {
     }
 
     fn render_canvas(&mut self, ui: &mut egui::Ui) {
-        let (response, painter) = ui.allocate_painter(
-            ui.available_size(),
-            egui::Sense::click_and_drag(),
-        );
+        let (response, painter) =
+            ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
 
         let canvas = response.rect;
 
@@ -274,11 +292,21 @@ impl BpafViz {
         }
 
         // Draw alignments
-        let visible = self.plot.query_visible(&self.view, canvas.width(), canvas.height());
+        let visible = self
+            .plot
+            .query_visible(&self.view, canvas.width(), canvas.height());
         for seg in visible {
-            let p1 = self.view.genome_to_pixel(seg.abeg as f64, seg.bbeg as f64, canvas);
-            let p2 = self.view.genome_to_pixel(seg.aend as f64, seg.bend as f64, canvas);
-            let color = if seg.reverse { self.reverse_color } else { self.forward_color };
+            let p1 = self
+                .view
+                .genome_to_pixel(seg.abeg as f64, seg.bbeg as f64, canvas);
+            let p2 = self
+                .view
+                .genome_to_pixel(seg.aend as f64, seg.bend as f64, canvas);
+            let color = if seg.reverse {
+                self.reverse_color
+            } else {
+                self.forward_color
+            };
             painter.line_segment([p1, p2], (1.0, color));
         }
 

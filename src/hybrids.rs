@@ -29,11 +29,19 @@ pub fn encode_fastpfor(vals: &[u64]) -> io::Result<Vec<u8>> {
         let p95_idx = (sorted_offsets.len() as f64 * 0.95) as usize;
         let p95_val = sorted_offsets.get(p95_idx).copied().unwrap_or(0);
 
-        let base_bits = if p95_val == 0 { 1 } else { 64 - p95_val.leading_zeros() };
+        let base_bits = if p95_val == 0 {
+            1
+        } else {
+            64 - p95_val.leading_zeros()
+        };
         let base_bits = base_bits.min(32) as u8; // Cap at 32 bits
 
         // Find exceptions (values that don't fit in base_bits)
-        let threshold = if base_bits >= 64 { u64::MAX } else { (1u64 << base_bits) - 1 };
+        let threshold = if base_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << base_bits) - 1
+        };
         let mut exceptions = Vec::new();
 
         for (idx, &offset) in offsets.iter().enumerate() {
@@ -43,7 +51,7 @@ pub fn encode_fastpfor(vals: &[u64]) -> io::Result<Vec<u8>> {
         }
 
         // Write block header
-        write_varint(&mut buf, chunk.len() as u64)?;  // Block size
+        write_varint(&mut buf, chunk.len() as u64)?; // Block size
         write_varint(&mut buf, min_val)?;
         buf.push(base_bits);
         write_varint(&mut buf, exceptions.len() as u64)?;
@@ -56,8 +64,10 @@ pub fn encode_fastpfor(vals: &[u64]) -> io::Result<Vec<u8>> {
                 9..=16 => {
                     buf.push((base_val & 0xFF) as u8);
                     buf.push(((base_val >> 8) & 0xFF) as u8);
-                },
-                _ => { write_varint(&mut buf, base_val)?; },
+                }
+                _ => {
+                    write_varint(&mut buf, base_val)?;
+                }
             }
         }
 
@@ -78,39 +88,41 @@ pub fn decode_fastpfor(data: &[u8]) -> io::Result<Vec<u64>> {
 
     while !reader.is_empty() {
         // Read block header
-        let block_size = read_varint(&mut reader)? as usize;  // Block size
+        let block_size = read_varint(&mut reader)? as usize; // Block size
 
-        if reader.is_empty() { break; }
+        if reader.is_empty() {
+            break;
+        }
         let min_val = read_varint(&mut reader)?;
 
-        if reader.is_empty() { break; }
+        if reader.is_empty() {
+            break;
+        }
         let mut base_bits_buf = [0u8; 1];
         reader.read_exact(&mut base_bits_buf)?;
         let base_bits = base_bits_buf[0];
 
         let exception_count = read_varint(&mut reader)?;
 
-        let threshold = if base_bits >= 64 { u64::MAX } else { (1u64 << base_bits) - 1 };
-
         // Read base values
         let mut block_vals = Vec::with_capacity(block_size);
         for _ in 0..block_size {
-            if reader.is_empty() { break; }
+            if reader.is_empty() {
+                break;
+            }
 
             let base_val = match base_bits {
                 1..=8 => {
                     let mut buf = [0u8; 1];
                     reader.read_exact(&mut buf)?;
                     buf[0] as u64
-                },
+                }
                 9..=16 => {
                     let mut buf = [0u8; 2];
                     reader.read_exact(&mut buf)?;
                     buf[0] as u64 | ((buf[1] as u64) << 8)
-                },
-                _ => {
-                    read_varint(&mut reader)?
                 }
+                _ => read_varint(&mut reader)?,
             };
 
             block_vals.push(min_val + base_val);
@@ -118,7 +130,9 @@ pub fn decode_fastpfor(data: &[u8]) -> io::Result<Vec<u64>> {
 
         // Apply exceptions
         for _ in 0..exception_count {
-            if reader.len() < 2 { break; }
+            if reader.len() < 2 {
+                break;
+            }
             let mut idx_buf = [0u8; 2];
             reader.read_exact(&mut idx_buf)?;
             let idx = idx_buf[0] as usize | ((idx_buf[1] as usize) << 8);
@@ -169,7 +183,9 @@ pub fn encode_cascaded(vals: &[u64]) -> io::Result<Vec<u8>> {
         }
 
         // Create reverse mapping
-        let dict_map: HashMap<u64, u8> = freq_vec.iter().take(dict_size)
+        let dict_map: HashMap<u64, u8> = freq_vec
+            .iter()
+            .take(dict_size)
             .enumerate()
             .map(|(i, &(val, _))| (val, i as u8))
             .collect();
@@ -249,7 +265,7 @@ pub fn decode_cascaded(data: &[u8]) -> io::Result<Vec<u64>> {
                     }
                 }
             }
-        },
+        }
         2 => {
             // Delta mode
             if reader.is_empty() {
@@ -266,9 +282,12 @@ pub fn decode_cascaded(data: &[u8]) -> io::Result<Vec<u64>> {
                 let prev = *result.last().unwrap();
                 result.push((prev as i64).wrapping_add(delta) as u64);
             }
-        },
+        }
         _ => {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Unknown cascaded mode"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unknown cascaded mode",
+            ));
         }
     }
 
@@ -327,8 +346,10 @@ pub fn decode_selective_rle(data: &[u8]) -> io::Result<Vec<u64>> {
             let val = read_varint(&mut reader)?;
             result.push(val);
         } else {
-            return Err(io::Error::new(io::ErrorKind::InvalidData,
-                format!("Invalid SelectiveRLE marker: {}", marker[0])));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid SelectiveRLE marker: {}", marker[0]),
+            ));
         }
     }
 
@@ -364,22 +385,38 @@ pub fn encode_simple8b_full(vals: &[u64]) -> io::Result<Vec<u64>> {
         // Selector 15: Uncompressed
 
         let modes = [
-            (60, 1), (30, 2), (20, 3), (15, 4), (12, 5), (10, 6),
-            (8, 7), (7, 8), (6, 10), (5, 12), (4, 15), (3, 20), (2, 30), (1, 60)
+            (60, 1),
+            (30, 2),
+            (20, 3),
+            (15, 4),
+            (12, 5),
+            (10, 6),
+            (8, 7),
+            (7, 8),
+            (6, 10),
+            (5, 12),
+            (4, 15),
+            (3, 20),
+            (2, 30),
+            (1, 60),
         ];
 
         let mut best_selector = 15u64; // Default: uncompressed
-        let mut best_count = 1;
 
         for (selector, (count, bits)) in modes.iter().enumerate() {
-            if *count > remaining { continue; }
+            if *count > remaining {
+                continue;
+            }
 
-            let max_val = if *bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
-            let can_pack = vals[i..i+count].iter().all(|&v| v <= max_val);
+            let max_val = if *bits >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
+            let can_pack = vals[i..i + count].iter().all(|&v| v <= max_val);
 
             if can_pack {
                 best_selector = selector as u64;
-                best_count = *count;
                 break;
             }
         }
@@ -409,8 +446,20 @@ pub fn decode_simple8b_full(words: &[u64]) -> io::Result<Vec<u64>> {
     let mut result = Vec::new();
 
     let modes = [
-        (60, 1), (30, 2), (20, 3), (15, 4), (12, 5), (10, 6),
-        (8, 7), (7, 8), (6, 10), (5, 12), (4, 15), (3, 20), (2, 30), (1, 60)
+        (60, 1),
+        (30, 2),
+        (20, 3),
+        (15, 4),
+        (12, 5),
+        (10, 6),
+        (8, 7),
+        (7, 8),
+        (6, 10),
+        (5, 12),
+        (4, 15),
+        (3, 20),
+        (2, 30),
+        (1, 60),
     ];
 
     for &word in words {
@@ -419,7 +468,11 @@ pub fn decode_simple8b_full(words: &[u64]) -> io::Result<Vec<u64>> {
 
         if selector < 14 {
             let (count, bits) = modes[selector as usize];
-            let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+            let mask = if bits >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
 
             for j in 0..count {
                 let val = (data >> (j * bits)) & mask;

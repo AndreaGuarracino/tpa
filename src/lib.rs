@@ -1,7 +1,6 @@
 mod binary;
 mod format;
 mod hybrids;
-mod advanced_codecs;
 /// Binary PAF format for efficient storage of sequence alignments with tracepoints
 ///
 /// Format: [Header] → [StringTable] → [Records]
@@ -10,7 +9,7 @@ mod advanced_codecs;
 /// - Records: Core PAF fields + compressed tracepoints
 mod utils;
 
-use log::{error, info};
+use log::{info, warn};
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
@@ -21,23 +20,31 @@ use lib_tracepoints::{
 };
 pub use lib_wfa2::affine_wavefront::Distance;
 
-pub use format::{AlignmentRecord, BinaryPafHeader, CompressionLayer, CompressionStrategy, StringTable, Tag, TagValue};
+pub use format::{
+    AlignmentRecord, BinaryPafHeader, CompressionLayer, CompressionStrategy, StringTable, Tag,
+    TagValue,
+};
 pub use lib_tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 
 use crate::format::parse_tag;
 use crate::utils::{parse_u8, parse_usize};
 
 pub use binary::{
-    build_index, BpafIndex, BpafReader, RecordIterator, BINARY_MAGIC,
-    // Standalone functions for ultimate performance
-    read_standard_tracepoints_at_offset, read_variable_tracepoints_at_offset,
+    build_index,
     read_mixed_tracepoints_at_offset,
+    // Standalone functions for ultimate performance
+    read_standard_tracepoints_at_offset,
+    read_variable_tracepoints_at_offset,
+    BpafIndex,
+    BpafReader,
+    RecordIterator,
+    BINARY_MAGIC,
 };
 
 // Re-export utility functions for external tools
 pub use utils::{read_varint, varint_size};
 
-use crate::binary::{analyze_smart_dual_compression, analyze_correlation, decompress_varint};
+use crate::binary::{analyze_correlation, analyze_smart_dual_compression, decompress_varint};
 
 use crate::utils::open_paf_reader;
 
@@ -94,23 +101,23 @@ pub fn compress_paf_with_cigar_dual(
 ) -> io::Result<()> {
     // Extract zstd level from first strategy
     let zstd_level = match &first_strategy {
-        CompressionStrategy::Raw(lvl) |
-        CompressionStrategy::ZigzagDelta(lvl) |
-        CompressionStrategy::TwoDimDelta(lvl) |
-        CompressionStrategy::RunLength(lvl) |
-        CompressionStrategy::BitPacked(lvl) |
-        CompressionStrategy::DeltaOfDelta(lvl) |
-        CompressionStrategy::FrameOfReference(lvl) |
-        CompressionStrategy::HybridRLE(lvl) |
-        CompressionStrategy::OffsetJoint(lvl) |
-        CompressionStrategy::XORDelta(lvl) |
-        CompressionStrategy::Dictionary(lvl) |
-        CompressionStrategy::Simple8(lvl) |
-        CompressionStrategy::StreamVByte(lvl) |
-        CompressionStrategy::FastPFOR(lvl) |
-        CompressionStrategy::Cascaded(lvl) |
-        CompressionStrategy::Simple8bFull(lvl) |
-        CompressionStrategy::SelectiveRLE(lvl) => *lvl,
+        CompressionStrategy::Raw(lvl)
+        | CompressionStrategy::ZigzagDelta(lvl)
+        | CompressionStrategy::TwoDimDelta(lvl)
+        | CompressionStrategy::RunLength(lvl)
+        | CompressionStrategy::BitPacked(lvl)
+        | CompressionStrategy::DeltaOfDelta(lvl)
+        | CompressionStrategy::FrameOfReference(lvl)
+        | CompressionStrategy::HybridRLE(lvl)
+        | CompressionStrategy::OffsetJoint(lvl)
+        | CompressionStrategy::XORDelta(lvl)
+        | CompressionStrategy::Dictionary(lvl)
+        | CompressionStrategy::Simple8(lvl)
+        | CompressionStrategy::StreamVByte(lvl)
+        | CompressionStrategy::FastPFOR(lvl)
+        | CompressionStrategy::Cascaded(lvl)
+        | CompressionStrategy::Simple8bFull(lvl)
+        | CompressionStrategy::SelectiveRLE(lvl) => *lvl,
         CompressionStrategy::Dual(_, _, lvl) => *lvl,
         CompressionStrategy::Automatic(lvl) => *lvl,
         CompressionStrategy::AdaptiveCorrelation(lvl) => *lvl,
@@ -202,23 +209,23 @@ pub fn compress_paf_with_tracepoints_dual(
 ) -> io::Result<()> {
     // Extract zstd level from first strategy (both should have same level in practice)
     let zstd_level = match &first_strategy {
-        CompressionStrategy::Raw(lvl) |
-        CompressionStrategy::ZigzagDelta(lvl) |
-        CompressionStrategy::TwoDimDelta(lvl) |
-        CompressionStrategy::RunLength(lvl) |
-        CompressionStrategy::BitPacked(lvl) |
-        CompressionStrategy::DeltaOfDelta(lvl) |
-        CompressionStrategy::FrameOfReference(lvl) |
-        CompressionStrategy::HybridRLE(lvl) |
-        CompressionStrategy::OffsetJoint(lvl) |
-        CompressionStrategy::XORDelta(lvl) |
-        CompressionStrategy::Dictionary(lvl) |
-        CompressionStrategy::Simple8(lvl) |
-        CompressionStrategy::StreamVByte(lvl) |
-        CompressionStrategy::FastPFOR(lvl) |
-        CompressionStrategy::Cascaded(lvl) |
-        CompressionStrategy::Simple8bFull(lvl) |
-        CompressionStrategy::SelectiveRLE(lvl) => *lvl,
+        CompressionStrategy::Raw(lvl)
+        | CompressionStrategy::ZigzagDelta(lvl)
+        | CompressionStrategy::TwoDimDelta(lvl)
+        | CompressionStrategy::RunLength(lvl)
+        | CompressionStrategy::BitPacked(lvl)
+        | CompressionStrategy::DeltaOfDelta(lvl)
+        | CompressionStrategy::FrameOfReference(lvl)
+        | CompressionStrategy::HybridRLE(lvl)
+        | CompressionStrategy::OffsetJoint(lvl)
+        | CompressionStrategy::XORDelta(lvl)
+        | CompressionStrategy::Dictionary(lvl)
+        | CompressionStrategy::Simple8(lvl)
+        | CompressionStrategy::StreamVByte(lvl)
+        | CompressionStrategy::FastPFOR(lvl)
+        | CompressionStrategy::Cascaded(lvl)
+        | CompressionStrategy::Simple8bFull(lvl)
+        | CompressionStrategy::SelectiveRLE(lvl) => *lvl,
         CompressionStrategy::Dual(_, _, lvl) => *lvl,
         CompressionStrategy::Automatic(lvl) => *lvl,
         CompressionStrategy::AdaptiveCorrelation(lvl) => *lvl,
@@ -257,7 +264,7 @@ pub fn decompress_bpaf(input_path: &str, output_path: &str) -> io::Result<()> {
 
     let header = BinaryPafHeader::read(&mut reader)?;
 
-    if header.version < 1 || header.version > 2 {
+    if header.version != 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Unsupported format version: {}", header.version),
@@ -294,7 +301,7 @@ fn compress_paf(
         strategy
     );
 
-    const SAMPLE_SIZE: usize = 1000;  // Sample size for empirical compression test to decide strategy
+    const SAMPLE_SIZE: usize = 1000; // Sample size for empirical compression test to decide strategy
 
     // Pass 1: Build string table + collect sample for analysis
     let mut string_table = StringTable::new();
@@ -324,11 +331,15 @@ fn compress_paf(
                 max_complexity as usize,
                 &complexity_metric,
             )
-        }
-        .map_err(|e| {
-            error!("Line {}: {}", line_num + 1, e);
-            e
-        })?;
+        };
+
+        let record = match record {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Skipping malformed line {}: {}", line_num + 1, e);
+                continue;
+            }
+        };
 
         if sample.len() < SAMPLE_SIZE {
             sample.push(record);
@@ -348,26 +359,43 @@ fn compress_paf(
     let (chosen_strategy, chosen_layer) = match strategy {
         CompressionStrategy::Automatic(level) => {
             // Run empirical compression test for DUAL strategies (test all 17×17×3 = 867 combinations)
-            let (best_first, best_second, best_layer) = analyze_smart_dual_compression(&sample, level);
-            info!("Automatic: Selected {} → {} with layer {:?}", best_first, best_second, best_layer);
+            let (best_first, best_second, best_layer) =
+                analyze_smart_dual_compression(&sample, level);
+            info!(
+                "Automatic: Selected {} → {} with layer {:?}",
+                best_first, best_second, best_layer
+            );
             // Wrap in Dual strategy
-            let dual_strategy = CompressionStrategy::Dual(Box::new(best_first), Box::new(best_second), level);
+            let dual_strategy =
+                CompressionStrategy::Dual(Box::new(best_first), Box::new(best_second), level);
             (dual_strategy, best_layer)
         }
         CompressionStrategy::AdaptiveCorrelation(level) => {
             // Analyze correlation and choose optimal strategy
             let correlation = analyze_correlation(&sample);
             let chosen = if correlation > 0.95 {
-                info!("Adaptive: High correlation ({:.4}) → OffsetJoint", correlation);
+                info!(
+                    "Adaptive: High correlation ({:.4}) → OffsetJoint",
+                    correlation
+                );
                 CompressionStrategy::OffsetJoint(level)
             } else if correlation > 0.80 {
-                info!("Adaptive: Medium correlation ({:.4}) → 2D-Delta", correlation);
+                info!(
+                    "Adaptive: Medium correlation ({:.4}) → 2D-Delta",
+                    correlation
+                );
                 CompressionStrategy::TwoDimDelta(level)
             } else if correlation > 0.50 {
-                info!("Adaptive: Low correlation ({:.4}) → ZigzagDelta", correlation);
+                info!(
+                    "Adaptive: Low correlation ({:.4}) → ZigzagDelta",
+                    correlation
+                );
                 CompressionStrategy::ZigzagDelta(level)
             } else {
-                info!("Adaptive: Very low correlation ({:.4}) → FrameOfReference", correlation);
+                info!(
+                    "Adaptive: Very low correlation ({:.4}) → FrameOfReference",
+                    correlation
+                );
                 CompressionStrategy::FrameOfReference(level)
             };
             // Use user-specified layer or default
@@ -390,6 +418,7 @@ fn compress_paf(
         record_count,
         string_table.len() as u64,
         chosen_strategy.clone(),
+        chosen_layer,
         tp_type,
         complexity_metric,
         max_complexity,
@@ -403,7 +432,7 @@ fn compress_paf(
     // Write records with chosen strategy
     let mut writer = BufWriter::new(&mut output);
     let input = open_paf_reader(input_path)?;
-    for line_result in input.lines() {
+    for (line_num, line_result) in input.lines().enumerate() {
         let line = line_result?;
         if line.trim().is_empty() || line.starts_with('#') {
             continue;
@@ -425,7 +454,15 @@ fn compress_paf(
                 max_complexity as usize,
                 &complexity_metric,
             )
-        }?;
+        };
+
+        let record = match record {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Skipping malformed line {}: {}", line_num + 1, e);
+                continue;
+            }
+        };
 
         // Write with chosen strategy and layer
         record.write(&mut writer, chosen_strategy.clone(), chosen_layer)?;

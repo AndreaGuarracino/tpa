@@ -11,7 +11,10 @@ fi
 # Wrapper script to run comprehensive tests on multiple PAF files
 # Aggregates results into a final report
 #
-# Usage: ./run_all_tests.sh [num_records] [output_base] [paf1] [paf2] ... [pafN]
+# Usage: ./run_all_tests.sh [-t threads] [num_records] [output_base] [paf1] [paf2] ... [pafN]
+#
+# Options:
+#   -t threads   - Number of parallel threads (default: 1)
 #
 # Arguments:
 #   num_records  - Number of records to test per file (default: 50, 0 = all records)
@@ -21,8 +24,18 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPREHENSIVE_TEST="$SCRIPT_DIR/comprehensive_test.sh"
 
+# Parse options
+THREADS=1
+while getopts "t:" opt; do
+    case $opt in
+        t) THREADS="$OPTARG" ;;
+        *) echo "Usage: $0 [-t threads] [num_records] [output_base] [paf1] ... [pafN]"; exit 1 ;;
+    esac
+done
+shift $((OPTIND-1))
+
 # Parse arguments
-NUM_RECORDS="${1:-50}"  # 0 means use ALL records
+NUM_RECORDS="${1:-100}"  # 0 means use ALL records
 OUTPUT_BASE="${2:-$SCRIPT_DIR/bpaf_all_tests}"
 
 # Default test files
@@ -56,6 +69,7 @@ echo ""
 echo "Running comprehensive tests on ${#TEST_FILES[@]} files..."
 echo "Output directory: $OUTPUT_BASE"
 echo "Records per file: $NUM_RECORDS"
+echo "Parallel threads: $THREADS"
 echo "Master TSV: $MASTER_TSV"
 echo ""
 
@@ -77,7 +91,10 @@ done
 if [ ${#VALID_FILES[@]} -eq 0 ]; then
     echo "Error: No valid input files found"
     echo ""
-    echo "Usage: $0 [num_records] [output_base] [paf1] [paf2] ... [pafN]"
+    echo "Usage: $0 [-t threads] [num_records] [output_base] [paf1] [paf2] ... [pafN]"
+    echo ""
+    echo "Options:"
+    echo "  -t threads   - Number of parallel threads (default: 1)"
     echo ""
     echo "Arguments:"
     echo "  num_records  - Number of records to test per file (default: 50)"
@@ -91,9 +108,10 @@ if [ ${#VALID_FILES[@]} -eq 0 ]; then
     echo ""
     echo "Examples:"
     echo "  $0                                    # Use all defaults"
-    echo "  $0 100                                # Test 100 records per file"
-    echo "  $0 200 /tmp/results                   # 200 records, custom output dir"
-    echo "  $0 50 /tmp/out file1.paf file2.paf    # Custom files"
+    echo "  $0 -t 6                               # Use defaults with 6 threads"
+    echo "  $0 -t 6 100                           # 6 threads, 100 records per file"
+    echo "  $0 -t 6 200 /tmp/results              # 6 threads, custom output"
+    echo "  $0 -t 6 50 /tmp/out file1.paf file2.paf  # Custom files"
     exit 1
 fi
 
@@ -117,7 +135,7 @@ for i in "${!VALID_FILES[@]}"; do
     echo "###################################################################"
     echo ""
     
-    $COMPREHENSIVE_TEST "$PAF" "$OUT_DIR" 32 edit-distance "$NUM_RECORDS" dual
+    $COMPREHENSIVE_TEST "$PAF" "$OUT_DIR" 32 edit-distance "$NUM_RECORDS" dual "$THREADS"
 
     # Append TSV data (skip header)
     if [ -f "$OUT_DIR/results.tsv" ]; then
@@ -155,7 +173,7 @@ for i in "${!VALID_FILES[@]}"; do
     
     # Detect type
     if [[ "$PAF" == *.gz ]]; then
-        FIRST_LINE=$(zcat "$PAF" | head -1)
+        FIRST_LINE=$(gzip -cdq "$PAF" | head -1)
     else
         FIRST_LINE=$(head -1 "$PAF")
     fi

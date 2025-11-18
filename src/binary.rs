@@ -17,18 +17,22 @@ use crate::utils::*;
 /// Compress data using the specified compression layer
 fn compress_with_layer(data: &[u8], layer: CompressionLayer, level: i32) -> io::Result<Vec<u8>> {
     match layer {
-        CompressionLayer::Zstd => {
-            zstd::encode_all(data, level).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("Zstd compression failed: {}", e))
-            })
-        }
+        CompressionLayer::Zstd => zstd::encode_all(data, level).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("Zstd compression failed: {}", e),
+            )
+        }),
         CompressionLayer::Bgzip => {
             // Use bgzip crate for BGZF compression
             use bgzip::write::BGZFWriter;
             let mut compressed = Vec::new();
             {
                 let compression = bgzip::Compression::new(level as u32).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid bgzip compression level: {}", e))
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Invalid bgzip compression level: {}", e),
+                    )
                 })?;
                 let mut writer = BGZFWriter::new(&mut compressed, compression);
                 writer.write_all(data)?;
@@ -42,33 +46,36 @@ fn compress_with_layer(data: &[u8], layer: CompressionLayer, level: i32) -> io::
     }
 }
 
-/// Decompress data by auto-detecting the compression format
-/// BGZF has magic bytes 1f 8b at start (gzip header)
-/// Zstd has magic bytes 28 b5 2f fd
-/// No magic bytes = uncompressed data
-fn decompress_auto(data: &[u8]) -> io::Result<Vec<u8>> {
-    if data.len() < 2 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Data too short"));
-    }
-
-    // Check for BGZF/gzip magic bytes (1f 8b)
-    if data[0] == 0x1f && data[1] == 0x8b {
-        // Use bgzip crate for BGZF decompression
-        use bgzip::read::BGZFReader;
-        let mut reader = BGZFReader::new(data).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("BGZF decompression failed: {}", e))
-        })?;
-        let mut decompressed = Vec::new();
-        reader.read_to_end(&mut decompressed)?;
-        Ok(decompressed)
-    } else if data.len() >= 4 && data[0] == 0x28 && data[1] == 0xb5 && data[2] == 0x2f && data[3] == 0xfd {
-        // Zstd magic bytes detected
-        zstd::decode_all(data).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("Zstd decompression failed: {}", e))
-        })
-    } else {
-        // No recognized compression magic bytes - assume uncompressed
-        Ok(data.to_vec())
+/// Decompress data using the explicitly recorded compression layer
+fn decompress_with_layer(data: &[u8], layer: CompressionLayer) -> io::Result<Vec<u8>> {
+    match layer {
+        CompressionLayer::Zstd => {
+            if data.is_empty() {
+                return Ok(Vec::new());
+            }
+            zstd::decode_all(data).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Zstd decompression failed: {}", e),
+                )
+            })
+        }
+        CompressionLayer::Bgzip => {
+            if data.is_empty() {
+                return Ok(Vec::new());
+            }
+            use bgzip::read::BGZFReader;
+            let mut reader = BGZFReader::new(data).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("BGZF decompression failed: {}", e),
+                )
+            })?;
+            let mut decompressed = Vec::new();
+            reader.read_to_end(&mut decompressed)?;
+            Ok(decompressed)
+        }
+        CompressionLayer::Nocomp => Ok(data.to_vec()),
     }
 }
 
@@ -117,12 +124,14 @@ fn delta_decode(deltas: &[i64]) -> Vec<u64> {
 
 /// Zigzag encode a signed value to unsigned
 #[inline]
+#[allow(dead_code)]
 fn encode_zigzag(val: i64) -> u64 {
     ((val << 1) ^ (val >> 63)) as u64
 }
 
 /// Helper function to encode varint inline (same as utils::encode_varint)
 #[inline]
+#[allow(dead_code)]
 fn encode_varint_inline(mut value: u64) -> Vec<u8> {
     let mut bytes = Vec::new();
     loop {
@@ -164,7 +173,9 @@ pub(crate) fn analyze_correlation(records: &[AlignmentRecord]) -> f64 {
     let sum_t: f64 = target_vals.iter().map(|&x| x as f64).sum();
     let sum_qq: f64 = query_vals.iter().map(|&x| (x as f64) * (x as f64)).sum();
     let sum_tt: f64 = target_vals.iter().map(|&x| (x as f64) * (x as f64)).sum();
-    let sum_qt: f64 = query_vals.iter().zip(target_vals.iter())
+    let sum_qt: f64 = query_vals
+        .iter()
+        .zip(target_vals.iter())
         .map(|(&q, &t)| (q as f64) * (t as f64))
         .sum();
 
@@ -180,7 +191,10 @@ pub(crate) fn analyze_correlation(records: &[AlignmentRecord]) -> f64 {
 
 /// Empirical DUAL strategy selection - tests all combinations of first × second × layer
 /// Returns the best performing first strategy, second strategy, and compression layer
-pub(crate) fn analyze_smart_dual_compression(records: &[AlignmentRecord], zstd_level: i32) -> (CompressionStrategy, CompressionStrategy, CompressionLayer) {
+pub(crate) fn analyze_smart_dual_compression(
+    records: &[AlignmentRecord],
+    zstd_level: i32,
+) -> (CompressionStrategy, CompressionStrategy, CompressionLayer) {
     use crate::format::CompressionLayer;
 
     // Collect sample tracepoints
@@ -202,7 +216,7 @@ pub(crate) fn analyze_smart_dual_compression(records: &[AlignmentRecord], zstd_l
         return (
             CompressionStrategy::Raw(zstd_level),
             CompressionStrategy::Raw(zstd_level),
-            CompressionLayer::Zstd
+            CompressionLayer::Zstd,
         );
     }
 
@@ -245,17 +259,24 @@ pub(crate) fn analyze_smart_dual_compression(records: &[AlignmentRecord], zstd_l
                     &all_second_vals,
                     first_strat.clone(),
                     second_strat.clone(),
-                    *layer  // Pass layer explicitly
+                    *layer, // Pass layer explicitly
                 ) {
                     Ok(size) => size,
                     Err(_) => {
-                        debug!("Dual strategy {}→{} with layer {:?} failed, skipping",
-                            first_strat, second_strat, layer);
+                        debug!(
+                            "Dual strategy {}→{} with layer {:?} failed, skipping",
+                            first_strat, second_strat, layer
+                        );
                         continue;
                     }
                 };
 
-                results.push((first_strat.clone(), second_strat.clone(), *layer, total_size));
+                results.push((
+                    first_strat.clone(),
+                    second_strat.clone(),
+                    *layer,
+                    total_size,
+                ));
             }
         }
     }
@@ -266,7 +287,7 @@ pub(crate) fn analyze_smart_dual_compression(records: &[AlignmentRecord], zstd_l
         return (
             CompressionStrategy::Raw(zstd_level),
             CompressionStrategy::Raw(zstd_level),
-            CompressionLayer::Zstd
+            CompressionLayer::Zstd,
         );
     }
 
@@ -305,7 +326,15 @@ pub(crate) fn analyze_smart_dual_compression(records: &[AlignmentRecord], zstd_l
         } else {
             0.0
         };
-        debug!("  {}. {}→{} with {:?} - {} bytes (+{:.2}%)", i + 1, first, second, layer, size, pct_worse);
+        debug!(
+            "  {}. {}→{} with {:?} - {} bytes (+{:.2}%)",
+            i + 1,
+            first,
+            second,
+            layer,
+            size,
+            pct_worse
+        );
     }
 
     (best_first, best_second, best_layer)
@@ -317,7 +346,7 @@ fn test_dual_strategy_on_sample(
     second_vals: &[u64],
     first_strategy: CompressionStrategy,
     second_strategy: CompressionStrategy,
-    layer: CompressionLayer,  // Explicit layer parameter
+    layer: CompressionLayer, // Explicit layer parameter
 ) -> io::Result<usize> {
     // Encode first values with first strategy
     let first_buf = encode_tracepoint_values(first_vals, first_strategy.clone())?;
@@ -328,9 +357,7 @@ fn test_dual_strategy_on_sample(
             // Second values encoded as delta from first
             encode_2d_delta_second_values(first_vals, second_vals)?
         }
-        _ => {
-            encode_tracepoint_values(second_vals, second_strategy.clone())?
-        }
+        _ => encode_tracepoint_values(second_vals, second_strategy.clone())?,
     };
 
     // Compress both with the SPECIFIED compression layer (explicit, not thread-local)
@@ -425,6 +452,7 @@ pub(crate) fn decompress_varint<R: Read>(
             &mut reader,
             strategy.clone(),
             header.tracepoint_type,
+            header.compression_layer,
         )?;
         write_paf_line_with_tracepoints(&mut writer, &record, &string_table)?;
     }
@@ -438,6 +466,7 @@ fn read_record<R: Read>(
     reader: &mut R,
     strategy: CompressionStrategy,
     tp_type: TracepointType,
+    layer: CompressionLayer,
 ) -> io::Result<AlignmentRecord> {
     let query_name_id = read_varint(reader)?;
     let query_start = read_varint(reader)?;
@@ -454,7 +483,7 @@ fn read_record<R: Read>(
     reader.read_exact(&mut mapq_buf)?;
     let mapping_quality = mapq_buf[0];
 
-    let tracepoints = read_tracepoints(reader, tp_type, strategy)?;
+    let tracepoints = read_tracepoints(reader, tp_type, strategy, layer)?;
 
     let num_tags = read_varint(reader)? as usize;
     let mut tags = Vec::with_capacity(num_tags);
@@ -482,11 +511,18 @@ fn read_tracepoints<R: Read>(
     reader: &mut R,
     tp_type: TracepointType,
     strategy: CompressionStrategy,
+    layer: CompressionLayer,
 ) -> io::Result<TracepointData> {
     let num_items = read_varint(reader)? as usize;
     match tp_type {
         TracepointType::Standard | TracepointType::Fastga => {
-            let tps = decode_standard_tracepoints(reader, num_items, strategy)?;
+            if num_items == 0 {
+                return Ok(match tp_type {
+                    TracepointType::Standard => TracepointData::Standard(Vec::new()),
+                    _ => TracepointData::Fastga(Vec::new()),
+                });
+            }
+            let tps = decode_standard_tracepoints(reader, num_items, strategy, layer)?;
             Ok(match tp_type {
                 TracepointType::Standard => TracepointData::Standard(tps),
                 _ => TracepointData::Fastga(tps),
@@ -505,10 +541,7 @@ fn read_tracepoints<R: Read>(
 
 /// Encode tracepoint values based on compression strategy
 #[inline]
-fn encode_tracepoint_values(
-    vals: &[u64],
-    strategy: CompressionStrategy,
-) -> io::Result<Vec<u8>> {
+fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(vals.len() * 2);
     match strategy {
         CompressionStrategy::Raw(_) => {
@@ -565,7 +598,11 @@ fn encode_tracepoint_values(
             }
 
             let max_val = *vals.iter().max().unwrap();
-            let bits_needed = if max_val == 0 { 1 } else { 64 - max_val.leading_zeros() };
+            let bits_needed = if max_val == 0 {
+                1
+            } else {
+                64 - max_val.leading_zeros()
+            };
 
             // Store bits_needed (1 byte)
             buf.push(bits_needed as u8);
@@ -608,7 +645,11 @@ fn encode_tracepoint_values(
             }
             let min_val = *vals.iter().min().unwrap();
             let max_offset = vals.iter().map(|&v| v - min_val).max().unwrap();
-            let bits_needed = if max_offset == 0 { 1 } else { 64 - max_offset.leading_zeros() };
+            let bits_needed = if max_offset == 0 {
+                1
+            } else {
+                64 - max_offset.leading_zeros()
+            };
 
             // Write min value and bits_needed
             write_varint(&mut buf, min_val)?;
@@ -706,7 +747,11 @@ fn encode_tracepoint_values(
             let mut data_bytes: Vec<u8> = Vec::new();
 
             for &val in vals {
-                let bytes_needed = if val == 0 { 1 } else { ((64 - val.leading_zeros() + 7) / 8) as usize };
+                let bytes_needed = if val == 0 {
+                    1
+                } else {
+                    ((64 - val.leading_zeros() + 7) / 8) as usize
+                };
                 // 2 bits per value: 00=1 byte, 01=2 bytes, 10=3 bytes, 11=4 bytes
                 let control = (bytes_needed - 1).min(3) as u8;
                 control_bytes.push(control);
@@ -763,14 +808,12 @@ fn encode_tracepoint_values(
 
 /// Encode second values for 2D-Delta strategy (as delta from first values)
 #[inline]
-fn encode_2d_delta_second_values(
-    first_vals: &[u64],
-    second_vals: &[u64],
-) -> io::Result<Vec<u8>> {
+fn encode_2d_delta_second_values(first_vals: &[u64], second_vals: &[u64]) -> io::Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(second_vals.len() * 2);
 
     // Compute differences: second - first
-    let diffs: Vec<i64> = first_vals.iter()
+    let diffs: Vec<i64> = first_vals
+        .iter()
         .zip(second_vals.iter())
         .map(|(f, s)| *s as i64 - *f as i64)
         .collect();
@@ -861,15 +904,16 @@ fn decode_tracepoint_values(
                 }
             } else if bits_needed <= 32 {
                 for _ in 0..num_items {
-                    let val = u32::from_le_bytes([reader[0], reader[1], reader[2], reader[3]]) as u64;
+                    let val =
+                        u32::from_le_bytes([reader[0], reader[1], reader[2], reader[3]]) as u64;
                     vals.push(val);
                     reader = &reader[4..];
                 }
             } else {
                 for _ in 0..num_items {
                     let val = u64::from_le_bytes([
-                        reader[0], reader[1], reader[2], reader[3],
-                        reader[4], reader[5], reader[6], reader[7],
+                        reader[0], reader[1], reader[2], reader[3], reader[4], reader[5],
+                        reader[6], reader[7],
                     ]);
                     vals.push(val);
                     reader = &reader[8..];
@@ -916,15 +960,16 @@ fn decode_tracepoint_values(
                 }
             } else if bits_needed <= 32 {
                 for _ in 0..num_items {
-                    let offset = u32::from_le_bytes([reader[0], reader[1], reader[2], reader[3]]) as u64;
+                    let offset =
+                        u32::from_le_bytes([reader[0], reader[1], reader[2], reader[3]]) as u64;
                     vals.push(min_val + offset);
                     reader = &reader[4..];
                 }
             } else {
                 for _ in 0..num_items {
                     let offset = u64::from_le_bytes([
-                        reader[0], reader[1], reader[2], reader[3],
-                        reader[4], reader[5], reader[6], reader[7],
+                        reader[0], reader[1], reader[2], reader[3], reader[4], reader[5],
+                        reader[6], reader[7],
                     ]);
                     vals.push(min_val + offset);
                     reader = &reader[8..];
@@ -1041,8 +1086,14 @@ fn decode_tracepoint_values(
             let mut i = 0;
             while i + 8 <= buf.len() {
                 let word = u64::from_le_bytes([
-                    buf[i], buf[i+1], buf[i+2], buf[i+3],
-                    buf[i+4], buf[i+5], buf[i+6], buf[i+7],
+                    buf[i],
+                    buf[i + 1],
+                    buf[i + 2],
+                    buf[i + 3],
+                    buf[i + 4],
+                    buf[i + 5],
+                    buf[i + 6],
+                    buf[i + 7],
                 ]);
                 words.push(word);
                 i += 8;
@@ -1064,10 +1115,8 @@ fn decode_tracepoint_values(
 
 /// Decode second values for 2D-Delta strategy (from diff values and first values)
 #[inline]
-fn decode_2d_delta_second_values(
-    buf: &[u8],
-    first_vals: &[u64],
-) -> io::Result<Vec<u64>> {
+#[allow(dead_code)]
+fn decode_2d_delta_second_values(buf: &[u8], first_vals: &[u64]) -> io::Result<Vec<u64>> {
     let mut reader = buf;
     let mut second_vals = Vec::with_capacity(first_vals.len());
 
@@ -1088,6 +1137,7 @@ fn decode_standard_tracepoints<R: Read>(
     reader: &mut R,
     num_items: usize,
     strategy: CompressionStrategy,
+    layer: CompressionLayer,
 ) -> io::Result<Vec<(usize, usize)>> {
     // Read compressed blocks
     let first_len = read_varint(reader)? as usize;
@@ -1098,9 +1148,9 @@ fn decode_standard_tracepoints<R: Read>(
     let mut second_compressed = vec![0u8; second_len];
     reader.read_exact(&mut second_compressed)?;
 
-    // Decompress (auto-detect compression format)
-    let first_buf = decompress_auto(&first_compressed[..])?;
-    let second_buf = decompress_auto(&second_compressed[..])?;
+    // Decompress using explicit layer
+    let first_buf = decompress_with_layer(&first_compressed[..], layer)?;
+    let second_buf = decompress_with_layer(&second_compressed[..], layer)?;
 
     // Decode directly to (usize, usize) tuples
     let mut first_reader = &first_buf[..];
@@ -1219,15 +1269,26 @@ fn decode_standard_tracepoints<R: Read>(
                 }
             } else if bits_needed_a <= 32 {
                 for _ in 0..num_items {
-                    let val = u32::from_le_bytes([first_reader[0], first_reader[1], first_reader[2], first_reader[3]]) as usize;
+                    let val = u32::from_le_bytes([
+                        first_reader[0],
+                        first_reader[1],
+                        first_reader[2],
+                        first_reader[3],
+                    ]) as usize;
                     first_vals.push(val);
                     first_reader = &first_reader[4..];
                 }
             } else {
                 for _ in 0..num_items {
                     let val = u64::from_le_bytes([
-                        first_reader[0], first_reader[1], first_reader[2], first_reader[3],
-                        first_reader[4], first_reader[5], first_reader[6], first_reader[7],
+                        first_reader[0],
+                        first_reader[1],
+                        first_reader[2],
+                        first_reader[3],
+                        first_reader[4],
+                        first_reader[5],
+                        first_reader[6],
+                        first_reader[7],
                     ]) as usize;
                     first_vals.push(val);
                     first_reader = &first_reader[8..];
@@ -1248,15 +1309,26 @@ fn decode_standard_tracepoints<R: Read>(
                 }
             } else if bits_needed_b <= 32 {
                 for _ in 0..num_items {
-                    let val = u32::from_le_bytes([second_reader[0], second_reader[1], second_reader[2], second_reader[3]]) as usize;
+                    let val = u32::from_le_bytes([
+                        second_reader[0],
+                        second_reader[1],
+                        second_reader[2],
+                        second_reader[3],
+                    ]) as usize;
                     second_vals.push(val);
                     second_reader = &second_reader[4..];
                 }
             } else {
                 for _ in 0..num_items {
                     let val = u64::from_le_bytes([
-                        second_reader[0], second_reader[1], second_reader[2], second_reader[3],
-                        second_reader[4], second_reader[5], second_reader[6], second_reader[7],
+                        second_reader[0],
+                        second_reader[1],
+                        second_reader[2],
+                        second_reader[3],
+                        second_reader[4],
+                        second_reader[5],
+                        second_reader[6],
+                        second_reader[7],
                     ]) as usize;
                     second_vals.push(val);
                     second_reader = &second_reader[8..];
@@ -1267,11 +1339,16 @@ fn decode_standard_tracepoints<R: Read>(
                 tps.push((a, b));
             }
         }
-        CompressionStrategy::DeltaOfDelta(_) | CompressionStrategy::FrameOfReference(_) |
-        CompressionStrategy::XORDelta(_) | CompressionStrategy::Dictionary(_) |
-        CompressionStrategy::Simple8(_) | CompressionStrategy::StreamVByte(_) |
-        CompressionStrategy::FastPFOR(_) | CompressionStrategy::Cascaded(_) |
-        CompressionStrategy::Simple8bFull(_) | CompressionStrategy::SelectiveRLE(_) => {
+        CompressionStrategy::DeltaOfDelta(_)
+        | CompressionStrategy::FrameOfReference(_)
+        | CompressionStrategy::XORDelta(_)
+        | CompressionStrategy::Dictionary(_)
+        | CompressionStrategy::Simple8(_)
+        | CompressionStrategy::StreamVByte(_)
+        | CompressionStrategy::FastPFOR(_)
+        | CompressionStrategy::Cascaded(_)
+        | CompressionStrategy::Simple8bFull(_)
+        | CompressionStrategy::SelectiveRLE(_) => {
             // These strategies use standard encoding for both streams
             let first_vals = decode_tracepoint_values(&first_buf, num_items, strategy.clone())?;
             let second_vals = decode_tracepoint_values(&second_buf, num_items, strategy)?;
@@ -1330,7 +1407,8 @@ fn decode_standard_tracepoints<R: Read>(
         CompressionStrategy::Dual(first_strat, second_strat, _) => {
             // Dual strategy: decode first_vals and second_vals independently
             let first_vals = decode_tracepoint_values(&first_buf, num_items, *first_strat.clone())?;
-            let second_vals = decode_tracepoint_values(&second_buf, num_items, *second_strat.clone())?;
+            let second_vals =
+                decode_tracepoint_values(&second_buf, num_items, *second_strat.clone())?;
             for (a, b) in first_vals.into_iter().zip(second_vals.into_iter()) {
                 tps.push((a as usize, b as usize));
             }
@@ -1433,18 +1511,21 @@ impl AlignmentRecord {
             TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
                 write_varint(writer, tps.len() as u64)?;
                 if tps.is_empty() {
+                    // Still emit empty compressed blocks to keep stream aligned
+                    write_varint(writer, 0)?;
+                    write_varint(writer, 0)?;
                     return Ok(());
                 }
-                let (first_vals, second_vals): (Vec<u64>, Vec<u64>) = tps
-                    .iter()
-                    .map(|(a, b)| (*a as u64, *b as u64))
-                    .unzip();
+                let (first_vals, second_vals): (Vec<u64>, Vec<u64>) =
+                    tps.iter().map(|(a, b)| (*a as u64, *b as u64)).unzip();
 
                 let (first_val_buf, second_val_buf) = match &strategy {
                     CompressionStrategy::Dual(first_strat, second_strat, _) => {
                         // Dual strategy: encode first_vals and second_vals independently
-                        let first_buf = encode_tracepoint_values(&first_vals, *first_strat.clone())?;
-                        let second_buf = encode_tracepoint_values(&second_vals, *second_strat.clone())?;
+                        let first_buf =
+                            encode_tracepoint_values(&first_vals, *first_strat.clone())?;
+                        let second_buf =
+                            encode_tracepoint_values(&second_vals, *second_strat.clone())?;
                         (first_buf, second_buf)
                     }
                     _ => {
@@ -1495,7 +1576,8 @@ impl AlignmentRecord {
                 };
 
                 // Use the explicitly passed layer parameter
-                let first_compressed = compress_with_layer(&first_val_buf[..], layer, strategy.zstd_level())?;
+                let first_compressed =
+                    compress_with_layer(&first_val_buf[..], layer, strategy.zstd_level())?;
                 let second_compressed =
                     compress_with_layer(&second_val_buf[..], layer, strategy.zstd_level())?;
 
@@ -1622,7 +1704,7 @@ pub fn build_index(bpaf_path: &str) -> io::Result<BpafIndex> {
     let mut reader = BufReader::with_capacity(131072, file);
 
     let header = BinaryPafHeader::read(&mut reader)?;
-    if header.version < 1 || header.version > 2 {
+    if header.version != 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Unsupported format version: {}", header.version),
@@ -1769,7 +1851,7 @@ impl BpafReader {
 
         let mut file = File::open(bpaf_path)?;
         let header = BinaryPafHeader::read(&mut file)?;
-        if header.version < 1 || header.version > 2 {
+        if header.version != 1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Unsupported format version: {}", header.version),
@@ -1842,6 +1924,7 @@ impl BpafReader {
             &mut self.file,
             strategy,
             self.header.tracepoint_type,
+            self.header.compression_layer,
         )
     }
 
@@ -1893,6 +1976,7 @@ impl BpafReader {
             &mut self.file,
             tp_type,
             strategy,
+            self.header.compression_layer,
         )?;
 
         Ok((tracepoints, complexity_metric, max_complexity))
@@ -1918,12 +2002,16 @@ pub fn read_standard_tracepoints_at_offset<R: Read + Seek>(
     file: &mut R,
     offset: u64,
     strategy: CompressionStrategy,
+    layer: CompressionLayer,
 ) -> io::Result<Vec<(usize, usize)>> {
     file.seek(SeekFrom::Start(offset))?;
     // Buffer small reads (varints + compressed block lengths)
     let mut buffered = BufReader::with_capacity(64, file);
     let num_items = read_varint(&mut buffered)? as usize;
-    decode_standard_tracepoints(&mut buffered, num_items, strategy)
+    if num_items == 0 {
+        return Ok(Vec::new());
+    }
+    decode_standard_tracepoints(&mut buffered, num_items, strategy, layer)
 }
 
 /// Fastest access: decode variable tracepoints directly from file at offset.

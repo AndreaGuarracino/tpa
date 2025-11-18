@@ -64,16 +64,27 @@ pub fn read_varint<R: Read>(reader: &mut R) -> io::Result<u64> {
 /// using LEB128 variable-length encoding (7 bits per byte + continuation bit).
 #[inline]
 pub fn varint_size(value: u64) -> u64 {
-    if value < (1 << 7) { 1 }
-    else if value < (1 << 14) { 2 }
-    else if value < (1 << 21) { 3 }
-    else if value < (1 << 28) { 4 }
-    else if value < (1 << 35) { 5 }
-    else if value < (1 << 42) { 6 }
-    else if value < (1 << 49) { 7 }
-    else if value < (1 << 56) { 8 }
-    else if value < (1 << 63) { 9 }
-    else { 10 }
+    if value < (1 << 7) {
+        1
+    } else if value < (1 << 14) {
+        2
+    } else if value < (1 << 21) {
+        3
+    } else if value < (1 << 28) {
+        4
+    } else if value < (1 << 35) {
+        5
+    } else if value < (1 << 42) {
+        6
+    } else if value < (1 << 49) {
+        7
+    } else if value < (1 << 56) {
+        8
+    } else if value < (1 << 63) {
+        9
+    } else {
+        10
+    }
 }
 
 // ============================================================================

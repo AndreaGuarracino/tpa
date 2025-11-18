@@ -10,11 +10,9 @@
 /// Examples:
 ///   seek_bench alignments.paf.gz 10000 100 100     # Auto-detect CIGAR or tracepoint
 ///   seek_bench alignments.bpaf 10000 100 100       # BPAF format
-
 use std::env;
 use std::fs::File;
 use std::io::{self, BufRead, Read};
-use std::path::Path;
 use std::time::Instant;
 
 // For bgzipped PAF files
@@ -25,15 +23,20 @@ use noodles::bgzf::VirtualPosition;
 use lib_bpaf::BpafReader;
 
 enum FileFormat {
-    CigarPaf,
-    TracepointPaf,
+    CigarPafBgz,
+    TracepointPafBgz,
+    CigarPafPlain,
+    TracepointPafPlain,
     Bpaf,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() != 5 {
-        eprintln!("Usage: {} <file> <num_records> <num_positions> <iterations>", args[0]);
+        eprintln!(
+            "Usage: {} <file> <num_records> <num_positions> <iterations>",
+            args[0]
+        );
         eprintln!();
         eprintln!("Auto-detects format:");
         eprintln!("  *.bpaf           - BPAF binary format");
@@ -46,11 +49,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let file_path = &args[1];
-    let num_records: usize = args[2].parse()
+    let num_records: usize = args[2]
+        .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid num_records"))?;
-    let num_positions: usize = args[3].parse()
+    let num_positions: usize = args[3]
+        .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid num_positions"))?;
-    let iterations: usize = args[4].parse()
+    let iterations: usize = args[4]
+        .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid iterations"))?;
 
     let format = detect_format(file_path)?;
@@ -60,13 +66,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Format: BPAF");
             benchmark_bpaf(file_path, num_records, num_positions, iterations)?;
         }
-        FileFormat::CigarPaf => {
+        FileFormat::CigarPafBgz => {
             eprintln!("Format: CIGAR PAF (bgzipped)");
-            benchmark_cigar_paf(file_path, num_records, num_positions, iterations)?;
+            benchmark_cigar_paf_bgz(file_path, num_records, num_positions, iterations)?;
         }
-        FileFormat::TracepointPaf => {
+        FileFormat::TracepointPafBgz => {
             eprintln!("Format: Tracepoint PAF (bgzipped)");
-            benchmark_tracepoint_paf(file_path, num_records, num_positions, iterations)?;
+            benchmark_tracepoint_paf_bgz(file_path, num_records, num_positions, iterations)?;
+        }
+        FileFormat::CigarPafPlain => {
+            eprintln!("Format: CIGAR PAF (plain)");
+            benchmark_cigar_paf_plain(file_path, num_records, num_positions, iterations)?;
+        }
+        FileFormat::TracepointPafPlain => {
+            eprintln!("Format: Tracepoint PAF (plain)");
+            benchmark_tracepoint_paf_plain(file_path, num_records, num_positions, iterations)?;
         }
     }
 
@@ -74,24 +88,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn detect_format(path: &str) -> Result<FileFormat, Box<dyn std::error::Error>> {
-    let path_obj = Path::new(path);
-
     // Check extension
     if path.ends_with(".bpaf") {
         return Ok(FileFormat::Bpaf);
     }
 
     if path.ends_with(".paf.gz") || path.ends_with(".paf") {
-        // Read first line to detect tags
-        let file = File::open(path)?;
-        let mut reader = BgzfReader::new(file);
         let mut line = Vec::new();
-        reader.read_until(b'\n', &mut line)?;
+        let is_bgz = path.ends_with(".paf.gz");
+
+        if is_bgz {
+            // Read first line to detect tags
+            let file = File::open(path)?;
+            let mut reader = BgzfReader::new(file);
+            reader.read_until(b'\n', &mut line)?;
+        } else {
+            let file = File::open(path)?;
+            let mut reader = io::BufReader::new(file);
+            reader.read_until(b'\n', &mut line)?;
+        }
 
         if line.windows(5).any(|w| w == b"cg:Z:") {
-            return Ok(FileFormat::CigarPaf);
+            return Ok(if is_bgz {
+                FileFormat::CigarPafBgz
+            } else {
+                FileFormat::CigarPafPlain
+            });
         } else if line.windows(5).any(|w| w == b"tp:Z:") {
-            return Ok(FileFormat::TracepointPaf);
+            return Ok(if is_bgz {
+                FileFormat::TracepointPafBgz
+            } else {
+                FileFormat::TracepointPafPlain
+            });
         }
 
         return Err("PAF file has neither cg:Z: nor tp:Z: tags".into());
@@ -108,7 +136,11 @@ fn benchmark_bpaf(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = BpafReader::open(path)?;
     let total_records = reader.header().num_records() as usize;
-    let test_records = if num_records == 0 { total_records } else { num_records.min(total_records) };
+    let test_records = if num_records == 0 {
+        total_records
+    } else {
+        num_records.min(total_records)
+    };
 
     if test_records == 0 {
         println!("No records to benchmark");
@@ -147,14 +179,14 @@ fn benchmark_bpaf(
     Ok(())
 }
 
-fn benchmark_cigar_paf(
+fn benchmark_cigar_paf_bgz(
     path: &str,
     num_records: usize,
     num_positions: usize,
     iterations: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Build index
-    let entries = build_cigar_index(path, num_records)?;
+    let entries = build_cigar_index_bgz(path, num_records)?;
     if entries.is_empty() {
         println!("No CIGAR entries to benchmark");
         return Ok(());
@@ -196,14 +228,14 @@ fn benchmark_cigar_paf(
     Ok(())
 }
 
-fn benchmark_tracepoint_paf(
+fn benchmark_tracepoint_paf_bgz(
     path: &str,
     num_records: usize,
     num_positions: usize,
     iterations: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Build index
-    let entries = build_tracepoint_index(path, num_records)?;
+    let entries = build_tracepoint_index_bgz(path, num_records)?;
     if entries.is_empty() {
         println!("No tracepoint entries to benchmark");
         return Ok(());
@@ -245,21 +277,122 @@ fn benchmark_tracepoint_paf(
     Ok(())
 }
 
+fn benchmark_cigar_paf_plain(
+    path: &str,
+    num_records: usize,
+    num_positions: usize,
+    iterations: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let entries = build_cigar_index_plain(path, num_records)?;
+    if entries.is_empty() {
+        println!("No CIGAR entries to benchmark");
+        return Ok(());
+    }
+
+    eprintln!("Indexed {} CIGAR entries (plain)", entries.len());
+
+    let test_positions: Vec<usize> = (0..entries.len())
+        .step_by(entries.len() / num_positions.min(entries.len()).max(1))
+        .take(num_positions)
+        .collect();
+
+    let mut file = File::open(path)?;
+    let mut reader = io::BufReader::new(file);
+    let mut times = Vec::new();
+
+    for &idx in &test_positions {
+        let entry = &entries[idx];
+        let mut buffer = vec![0u8; entry.len];
+
+        // Warmup
+        for _ in 0..3 {
+            reader.seek(io::SeekFrom::Start(entry.pos))?;
+            reader.read_exact(&mut buffer)?;
+        }
+
+        // Measure
+        for _ in 0..iterations {
+            let start = Instant::now();
+            reader.seek(io::SeekFrom::Start(entry.pos))?;
+            reader.read_exact(&mut buffer)?;
+            times.push(start.elapsed().as_micros() as f64);
+        }
+    }
+
+    print_stats("CIGAR PAF (plain)", &times);
+    Ok(())
+}
+
+fn benchmark_tracepoint_paf_plain(
+    path: &str,
+    num_records: usize,
+    num_positions: usize,
+    iterations: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let entries = build_tracepoint_index_plain(path, num_records)?;
+    if entries.is_empty() {
+        println!("No tracepoint entries to benchmark");
+        return Ok(());
+    }
+
+    eprintln!("Indexed {} tracepoint entries (plain)", entries.len());
+
+    let test_positions: Vec<usize> = (0..entries.len())
+        .step_by(entries.len() / num_positions.min(entries.len()).max(1))
+        .take(num_positions)
+        .collect();
+
+    let mut reader = io::BufReader::new(File::open(path)?);
+    let mut times = Vec::new();
+    let mut buffer = Vec::new();
+
+    for &idx in &test_positions {
+        let entry = &entries[idx];
+        buffer.resize(entry.len, 0);
+
+        // Warmup
+        for _ in 0..3 {
+            reader.seek(io::SeekFrom::Start(entry.pos))?;
+            reader.read_exact(&mut buffer)?;
+        }
+
+        // Measure
+        for _ in 0..iterations {
+            let start = Instant::now();
+            reader.seek(io::SeekFrom::Start(entry.pos))?;
+            reader.read_exact(&mut buffer)?;
+            times.push(start.elapsed().as_micros() as f64);
+        }
+    }
+
+    print_stats("Tracepoint PAF (plain)", &times);
+    Ok(())
+}
+
 // Helper structs and functions
 
 #[derive(Clone, Copy)]
-struct CigarEntry {
+struct CigarEntryBgz {
     pos: VirtualPosition,
     len: usize,
 }
 
 #[derive(Clone, Copy)]
-struct TracepointEntry {
+struct TracepointEntryBgz {
     pos: VirtualPosition,
     len: usize,
 }
 
-fn build_cigar_index(path: &str, limit: usize) -> Result<Vec<CigarEntry>, Box<dyn std::error::Error>> {
+#[derive(Clone, Copy)]
+struct PlainEntry {
+    pos: u64,
+    len: usize,
+}
+
+fn build_cigar_index_bgz(
+    path: &str,
+    limit: usize,
+) -> Result<Vec<CigarEntryBgz>, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let mut reader = BgzfReader::new(file);
     let mut line = Vec::new();
@@ -286,7 +419,10 @@ fn build_cigar_index(path: &str, limit: usize) -> Result<Vec<CigarEntry>, Box<dy
             }
 
             if len > 0 {
-                entries.push(CigarEntry { pos: cigar_pos, len });
+                entries.push(CigarEntryBgz {
+                    pos: cigar_pos,
+                    len,
+                });
             }
         }
     }
@@ -294,7 +430,10 @@ fn build_cigar_index(path: &str, limit: usize) -> Result<Vec<CigarEntry>, Box<dy
     Ok(entries)
 }
 
-fn build_tracepoint_index(path: &str, limit: usize) -> Result<Vec<TracepointEntry>, Box<dyn std::error::Error>> {
+fn build_tracepoint_index_bgz(
+    path: &str,
+    limit: usize,
+) -> Result<Vec<TracepointEntryBgz>, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let mut reader = BgzfReader::new(file);
     let mut line = Vec::new();
@@ -321,7 +460,67 @@ fn build_tracepoint_index(path: &str, limit: usize) -> Result<Vec<TracepointEntr
             }
 
             if len > 0 {
-                entries.push(TracepointEntry { pos: tp_pos, len });
+                entries.push(TracepointEntryBgz { pos: tp_pos, len });
+            }
+        }
+    }
+
+    Ok(entries)
+}
+
+fn build_cigar_index_plain(
+    path: &str,
+    limit: usize,
+) -> Result<Vec<PlainEntry>, Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let mut reader = io::BufReader::new(file);
+    let mut line = Vec::new();
+    let mut entries = Vec::new();
+
+    loop {
+        let pos = reader.stream_position()?;
+        line.clear();
+        let bytes_read = reader.read_until(b'\n', &mut line)?;
+        if bytes_read == 0 || entries.len() >= limit {
+            break;
+        }
+
+        if let Some((offset, len)) = find_tag_offset_and_len(&line, b"cg:Z:") {
+            if len > 0 {
+                entries.push(PlainEntry {
+                    pos: pos + offset as u64,
+                    len,
+                });
+            }
+        }
+    }
+
+    Ok(entries)
+}
+
+fn build_tracepoint_index_plain(
+    path: &str,
+    limit: usize,
+) -> Result<Vec<PlainEntry>, Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let mut reader = io::BufReader::new(file);
+    let mut line = Vec::new();
+    let mut entries = Vec::new();
+
+    loop {
+        let pos = reader.stream_position()?;
+        line.clear();
+        let bytes_read = reader.read_until(b'\n', &mut line)?;
+        if bytes_read == 0 || entries.len() >= limit {
+            break;
+        }
+
+        if let Some((offset, len)) = find_tag_offset_and_len(&line, b"tp:Z:") {
+            if len > 0 {
+                entries.push(PlainEntry {
+                    pos: pos + offset as u64,
+                    len,
+                });
             }
         }
     }
@@ -363,6 +562,13 @@ fn print_stats(format: &str, times: &[f64]) {
     let min = times.iter().cloned().fold(f64::INFINITY, f64::min);
     let max = times.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
 
-    println!("{} avg_us={:.2} stddev_us={:.2} min_us={:.2} max_us={:.2} samples={}",
-        format, avg, stddev, min, max, times.len());
+    println!(
+        "{} avg_us={:.2} stddev_us={:.2} min_us={:.2} max_us={:.2} samples={}",
+        format,
+        avg,
+        stddev,
+        min,
+        max,
+        times.len()
+    );
 }
