@@ -1124,11 +1124,36 @@ fn decode_2d_delta_second_values(buf: &[u8], first_vals: &[u64]) -> io::Result<V
     for &first in first_vals {
         let zigzag = read_varint(&mut reader)?;
         let diff = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
-        let second = (first as i64 + diff) as u64;
-        second_vals.push(second);
+        let second = safe_signed_add(first as i64, diff)?;
+        second_vals.push(second as u64);
+    }
+
+    // Ensure we consumed exactly what we expected; leftover bytes indicate corruption
+    if !reader.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("2d-delta decoding left {} unused bytes", reader.len()),
+        ));
     }
 
     Ok(second_vals)
+}
+
+#[inline]
+fn safe_signed_add(base: i64, delta: i64) -> io::Result<i64> {
+    let val = base.checked_add(delta).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("tracepoint delta overflow: base={base} delta={delta}"),
+        )
+    })?;
+    if val < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("tracepoint delta underflow: base={base} delta={delta}"),
+        ));
+    }
+    Ok(val)
 }
 
 /// Standard/Fastga tracepoint decoding
@@ -1170,10 +1195,10 @@ fn decode_standard_tracepoints<R: Read>(
         CompressionStrategy::ZigzagDelta(_) => {
             // First values
             let zigzag_a = read_varint(&mut first_reader)?;
-            let a = (((zigzag_a >> 1) as i64) ^ -((zigzag_a & 1) as i64)) as usize;
+            let a = safe_signed_add(0, ((zigzag_a >> 1) as i64) ^ -((zigzag_a & 1) as i64))? as usize;
 
             let zigzag_b = read_varint(&mut second_reader)?;
-            let b = (((zigzag_b >> 1) as i64) ^ -((zigzag_b & 1) as i64)) as usize;
+            let b = safe_signed_add(0, ((zigzag_b >> 1) as i64) ^ -((zigzag_b & 1) as i64))? as usize;
 
             tps.push((a, b));
 
@@ -1182,12 +1207,12 @@ fn decode_standard_tracepoints<R: Read>(
                 let zigzag_a = read_varint(&mut first_reader)?;
                 let delta_a = ((zigzag_a >> 1) as i64) ^ -((zigzag_a & 1) as i64);
                 let prev_a = tps.last().unwrap().0 as i64;
-                let a = (prev_a + delta_a) as usize;
+                let a = safe_signed_add(prev_a, delta_a)? as usize;
 
                 let zigzag_b = read_varint(&mut second_reader)?;
                 let delta_b = ((zigzag_b >> 1) as i64) ^ -((zigzag_b & 1) as i64);
                 let prev_b = tps.last().unwrap().1 as i64;
-                let b = (prev_b + delta_b) as usize;
+                let b = safe_signed_add(prev_b, delta_b)? as usize;
 
                 tps.push((a, b));
             }
@@ -1196,21 +1221,21 @@ fn decode_standard_tracepoints<R: Read>(
             // First values: same as ZigzagDelta
             let mut first_vals = Vec::with_capacity(num_items);
             let zigzag_a = read_varint(&mut first_reader)?;
-            let a = ((zigzag_a >> 1) as i64) ^ -((zigzag_a & 1) as i64);
+            let a = safe_signed_add(0, ((zigzag_a >> 1) as i64) ^ -((zigzag_a & 1) as i64))?;
             first_vals.push(a as usize);
 
             for _ in 1..num_items {
                 let zigzag_a = read_varint(&mut first_reader)?;
                 let delta_a = ((zigzag_a >> 1) as i64) ^ -((zigzag_a & 1) as i64);
                 let prev_a = *first_vals.last().unwrap() as i64;
-                first_vals.push((prev_a + delta_a) as usize);
+                first_vals.push(safe_signed_add(prev_a, delta_a)? as usize);
             }
 
             // Second values: decode as differences from first values
             for &a in &first_vals {
                 let zigzag_diff = read_varint(&mut second_reader)?;
                 let diff = ((zigzag_diff >> 1) as i64) ^ -((zigzag_diff & 1) as i64);
-                let b = (a as i64 + diff) as usize;
+                let b = safe_signed_add(a as i64, diff)? as usize;
                 tps.push((a, b));
             }
         }
@@ -1375,6 +1400,16 @@ fn decode_standard_tracepoints<R: Read>(
                     }
                 }
             }
+            if second_vals.len() != num_items {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "hybrid-rle decode length mismatch: expected {} got {}",
+                        num_items,
+                        second_vals.len()
+                    ),
+                ));
+            }
 
             for (a, b) in first_vals.into_iter().zip(second_vals.into_iter()) {
                 tps.push((a, b));
@@ -1384,20 +1419,21 @@ fn decode_standard_tracepoints<R: Read>(
             // First values: zigzag delta
             let mut first_vals = Vec::with_capacity(num_items);
             let zigzag_a = read_varint(&mut first_reader)?;
-            let a = ((zigzag_a >> 1) as i64) ^ -((zigzag_a & 1) as i64);
+            let a = safe_signed_add(0, ((zigzag_a >> 1) as i64) ^ -((zigzag_a & 1) as i64))?;
             first_vals.push(a as usize);
 
             for _ in 1..num_items {
                 let zigzag_a = read_varint(&mut first_reader)?;
                 let delta_a = ((zigzag_a >> 1) as i64) ^ -((zigzag_a & 1) as i64);
                 let prev_a = *first_vals.last().unwrap() as i64;
-                first_vals.push((prev_a + delta_a) as usize);
+                first_vals.push(safe_signed_add(prev_a, delta_a)? as usize);
             }
 
             // Second values: as offset from first
             for &a in &first_vals {
-                let offset = read_varint(&mut second_reader)? as usize;
-                let b = a + offset;
+                let offset_zigzag = read_varint(&mut second_reader)?;
+                let offset = ((offset_zigzag >> 1) as i64) ^ -((offset_zigzag & 1) as i64);
+                let b = safe_signed_add(a as i64, offset)? as usize;
                 tps.push((a, b));
             }
         }
@@ -1406,9 +1442,68 @@ fn decode_standard_tracepoints<R: Read>(
         }
         CompressionStrategy::Dual(first_strat, second_strat, _) => {
             // Dual strategy: decode first_vals and second_vals independently
-            let first_vals = decode_tracepoint_values(&first_buf, num_items, *first_strat.clone())?;
-            let second_vals =
-                decode_tracepoint_values(&second_buf, num_items, *second_strat.clone())?;
+            let first_vals =
+                decode_tracepoint_values(&first_buf, num_items, *first_strat.clone())?;
+
+            // Decode second, with special handling for 2d-delta and offset-joint which depend on first_vals
+            let second_vals: Vec<u64> = match *second_strat.clone() {
+                CompressionStrategy::TwoDimDelta(_) => {
+                    decode_2d_delta_second_values(&second_buf, &first_vals)?
+                }
+                CompressionStrategy::OffsetJoint(_) => {
+                    let mut reader = &second_buf[..];
+                    let mut vals = Vec::with_capacity(num_items);
+                    for a in &first_vals {
+                        let zigzag = read_varint(&mut reader)?;
+                        let diff = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+                        let b = safe_signed_add(*a as i64, diff)?;
+                        vals.push(b as u64);
+                    }
+                    if !reader.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "offset-joint residual bytes after decode: {}",
+                                reader.len()
+                            ),
+                        ));
+                    }
+                    vals
+                }
+                CompressionStrategy::HybridRLE(_) => {
+                    let mut reader = &second_buf[..];
+                    let mut vals = Vec::with_capacity(num_items);
+                    while vals.len() < num_items {
+                        let value = read_varint(&mut reader)? as u64;
+                        let run_len = read_varint(&mut reader)? as usize;
+                        for _ in 0..run_len {
+                            vals.push(value);
+                            if vals.len() >= num_items {
+                                break;
+                            }
+                        }
+                    }
+                    if vals.len() != num_items {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "hybrid-rle dual decode length mismatch: expected {} got {}",
+                                num_items,
+                                vals.len()
+                            ),
+                        ));
+                    }
+                    if !reader.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("hybrid-rle residual bytes after decode: {}", reader.len()),
+                        ));
+                    }
+                    vals
+                }
+                _ => decode_tracepoint_values(&second_buf, num_items, *second_strat.clone())?,
+            };
+
             for (a, b) in first_vals.into_iter().zip(second_vals.into_iter()) {
                 tps.push((a as usize, b as usize));
             }
@@ -1524,8 +1619,42 @@ impl AlignmentRecord {
                         // Dual strategy: encode first_vals and second_vals independently
                         let first_buf =
                             encode_tracepoint_values(&first_vals, *first_strat.clone())?;
-                        let second_buf =
-                            encode_tracepoint_values(&second_vals, *second_strat.clone())?;
+                        let second_buf = match *second_strat.clone() {
+                            CompressionStrategy::TwoDimDelta(_) => {
+                                encode_2d_delta_second_values(&first_vals, &second_vals)?
+                            }
+                            CompressionStrategy::OffsetJoint(_) => {
+                                let mut buf = Vec::with_capacity(second_vals.len() * 2);
+                                for (f, s) in first_vals.iter().zip(second_vals.iter()) {
+                                    let diff = *s as i64 - *f as i64;
+                                    let zigzag = ((diff << 1) ^ (diff >> 63)) as u64;
+                                    write_varint(&mut buf, zigzag)?;
+                                }
+                                buf
+                            }
+                            CompressionStrategy::HybridRLE(_) => {
+                                // Encode target with RLE (value, run_len)
+                                let mut buf = Vec::with_capacity(second_vals.len() * 2);
+                                if !second_vals.is_empty() {
+                                    let mut run_val = second_vals[0];
+                                    let mut run_len = 1u64;
+                                    for &val in &second_vals[1..] {
+                                        if val == run_val {
+                                            run_len += 1;
+                                        } else {
+                                            write_varint(&mut buf, run_val)?;
+                                            write_varint(&mut buf, run_len)?;
+                                            run_val = val;
+                                            run_len = 1;
+                                        }
+                                    }
+                                    write_varint(&mut buf, run_val)?;
+                                    write_varint(&mut buf, run_len)?;
+                                }
+                                buf
+                            }
+                            _ => encode_tracepoint_values(&second_vals, *second_strat.clone())?,
+                        };
                         (first_buf, second_buf)
                     }
                     _ => {
@@ -1537,11 +1666,12 @@ impl AlignmentRecord {
                                 encode_2d_delta_second_values(&first_vals, &second_vals)?
                             }
                             CompressionStrategy::OffsetJoint(_) => {
-                                // Encode second as offset from first (simpler than 2D-Delta)
+                                // Encode second as signed offset from first (zigzag)
                                 let mut buf = Vec::with_capacity(second_vals.len() * 2);
                                 for (f, s) in first_vals.iter().zip(second_vals.iter()) {
-                                    let offset = s - f; // No zigzag, just raw offset
-                                    write_varint(&mut buf, offset)?;
+                                    let diff = *s as i64 - *f as i64;
+                                    let zigzag = ((diff << 1) ^ (diff >> 63)) as u64;
+                                    write_varint(&mut buf, zigzag)?;
                                 }
                                 buf
                             }

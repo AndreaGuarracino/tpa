@@ -18,22 +18,66 @@ CIGZIP_DIR="${CIGZIP_DIR:-/home/guarracino/git/cigzip}"
 CIGZIP="$CIGZIP_DIR/target/release/cigzip"
 NORMALIZE="python3 $SCRIPT_DIR/normalize_paf.py"
 
+# Safe numeric ratio helper
+safe_ratio() {
+    local num="$1"
+    local den="$2"
+    local decimals="${3:-3}"
+
+    python3 - "$num" "$den" "$decimals" <<'PY'
+import sys
+num, den, dec = sys.argv[1], sys.argv[2], int(sys.argv[3])
+try:
+    n = int(num)
+    d = int(den)
+    if d == 0:
+        raise ZeroDivisionError
+    print(f"{n / d:.{dec}f}")
+except Exception:
+    print(f"{0:.{dec}f}")
+PY
+}
+
 # Helper functions for unit conversion
 time_to_seconds() {
     local time_str="$1"
+    if [ -z "$time_str" ]; then
+        echo "0"
+        return
+    fi
     # Convert MM:SS.MS format to seconds
     if [[ "$time_str" =~ ^([0-9]+):([0-9]+\.[0-9]+)$ ]]; then
         local minutes="${BASH_REMATCH[1]}"
         local seconds="${BASH_REMATCH[2]}"
         awk "BEGIN {printf \"%.3f\", $minutes * 60 + $seconds}"
-    else
+    elif [[ "$time_str" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
         echo "$time_str"
+    else
+        echo "0"
     fi
 }
 
 kb_to_mb() {
     local kb="$1"
-    awk "BEGIN {printf \"%.2f\", $kb / 1024}"
+    python3 - "$kb" <<'PY'
+import sys
+val = sys.argv[1]
+try:
+    kb = float(val)
+    print(f"{kb/1024:.2f}")
+except Exception:
+    print("0.00")
+PY
+}
+
+normalize_time_field() {
+    local val="$1"
+    # Convert common placeholders to numeric zero for TSV
+    if [ -z "$val" ] || [ "$val" = "N/A" ]; then
+        echo "0"
+    else
+        echo "$val"
+    fi
 }
 
 # Parameters
@@ -123,7 +167,7 @@ else
 fi
 
 EXTRACTED=$(wc -l < "$OUTPUT_DIR/input_sample.paf")
-SIZE=$(stat -c %s "$OUTPUT_DIR/input_sample.paf" 2>/dev/null || stat -f %z "$OUTPUT_DIR/input_sample.paf")
+SIZE=$(stat -c %s "$OUTPUT_DIR/input_sample.paf" || stat -f %z "$OUTPUT_DIR/input_sample.paf")
 echo "Extracted: $EXTRACTED records ($SIZE bytes)"
 echo ""
 
@@ -410,9 +454,9 @@ else
     # Already tracepoints - detect which type
     TP_TYPES=("standard")
     cp "$OUTPUT_DIR/input_sample.paf" "$OUTPUT_DIR/standard.tp.paf"
-    # No encoding needed - set to N/A
-    ENCODE_TIME["standard"]="N/A"
-    ENCODE_MEM["standard"]="N/A"
+    # No encoding needed - use numeric zeroes to keep TSV fields valid
+    ENCODE_TIME["standard"]="0"
+    ENCODE_MEM["standard"]="0"
     echo "✓ Using existing tracepoint PAF"
     echo ""
 fi
@@ -429,11 +473,12 @@ if command -v bgzip &> /dev/null; then
             # Extract compression metrics
             BGZIP_TIME[$TP_TYPE]=$(grep "Elapsed (wall clock)" "$OUTPUT_DIR/${TP_TYPE}_bgzip.log" | awk '{print $8}')
             BGZIP_MEM[$TP_TYPE]=$(grep "Maximum resident set size" "$OUTPUT_DIR/${TP_TYPE}_bgzip.log" | awk '{print $6}')
-            BGZIP_SIZE[$TP_TYPE]=$(stat -f%z "${TP_PAF}.gz" 2>/dev/null || stat -c%s "${TP_PAF}.gz")
-            TP_SIZE[$TP_TYPE]=$(stat -f%z "$TP_PAF" 2>/dev/null || stat -c%s "$TP_PAF")
+            BGZIP_SIZE[$TP_TYPE]=$(stat -f%z "${TP_PAF}.gz" || stat -c%s "${TP_PAF}.gz")
+            TP_SIZE[$TP_TYPE]=$(stat -f%z "$TP_PAF" || stat -c%s "$TP_PAF")
 
+            ratio_bgzip=$(safe_ratio "${TP_SIZE[$TP_TYPE]}" "${BGZIP_SIZE[$TP_TYPE]}" 2)
             echo "    Uncompressed: $(numfmt --to=iec ${TP_SIZE[$TP_TYPE]})"
-            echo "    BGZIP:        $(numfmt --to=iec ${BGZIP_SIZE[$TP_TYPE]}) ($(awk "BEGIN {printf \"%.2f\", ${TP_SIZE[$TP_TYPE]}/${BGZIP_SIZE[$TP_TYPE]}}")x compression)"
+            echo "    BGZIP:        $(numfmt --to=iec ${BGZIP_SIZE[$TP_TYPE]}) (${ratio_bgzip}x compression)"
         fi
     done
     echo "✓ BGZIP compression complete"
@@ -503,18 +548,20 @@ test_configuration() {
 
     # Store tracepoint PAF size (only once per type)
     if [ -z "${TP_SIZE[$tp_type]}" ]; then
-        TP_SIZE[$tp_type]=$(stat -c %s "$tp_paf" 2>/dev/null || stat -f %z "$tp_paf")
+        TP_SIZE[$tp_type]=$(stat -c %s "$tp_paf" || stat -f %z "$tp_paf")
     fi
 
     # Compress - use cigzip for all modes
     if [ "$TEST_MODE" = "dual" ]; then
         # Special handling for automatic mode (selects both strategies internally)
         if [ "$first_strategy" = "automatic" ]; then
+            echo "      [automatic] compress starting..." >&2
             /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.bpaf" \
                 --type "$tp_type" --max-complexity "$MAX_COMPLEXITY" \
                 --complexity-metric "$COMPLEXITY_METRIC" --distance gap-affine --penalties 5,8,2 \
                 --strategy "$first_strategy" 2>&1 | \
-                tee "$OUTPUT_DIR/${key}_compress.log" >/dev/null
+                tee "$OUTPUT_DIR/${key}_compress.log" >&2
+            echo "      [automatic] compress finished" >&2
         else
             # Use cigzip with dual strategies (--strategy and --strategy-second)
             /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.bpaf" \
@@ -538,24 +585,51 @@ test_configuration() {
 
     COMPRESS_TIME[$key]=$(grep "Elapsed (wall clock)" "$OUTPUT_DIR/${key}_compress.log" | awk '{print $8}')
     COMPRESS_MEM[$key]=$(grep "Maximum resident set size" "$OUTPUT_DIR/${key}_compress.log" | awk '{print $6}')
-    COMPRESS_SIZE[$key]=$(stat -c %s "$OUTPUT_DIR/${key}.bpaf" 2>/dev/null || stat -f %z "$OUTPUT_DIR/${key}.bpaf")
+    COMPRESS_SIZE[$key]=$(stat -c %s "$OUTPUT_DIR/${key}.bpaf" || stat -f %z "$OUTPUT_DIR/${key}.bpaf")
 
     # Extract actual strategies from BPAF header using bpaf-view
-    local strategy_output=$("$REPO_DIR/target/release/bpaf-view" --strategies "$OUTPUT_DIR/${key}.bpaf" 2>/dev/null || echo "unknown	unknown")
+    local strategy_output=$("$REPO_DIR/target/release/bpaf-view" --strategies "$OUTPUT_DIR/${key}.bpaf" || echo "unknown	unknown")
     read -r first_strat second_strat <<< "$strategy_output"
     STRATEGY_FIRST[$key]="$first_strat"
     STRATEGY_SECOND[$key]="$second_strat"
     
     # Decompress
-    /usr/bin/time -v $CIGZIP decompress -i "$OUTPUT_DIR/${key}.bpaf" \
-        -o "$OUTPUT_DIR/${key}_decomp.paf" 2>&1 | tee "$OUTPUT_DIR/${key}_decompress.log" >/dev/null
+    if [ "$first_strategy" = "automatic" ]; then
+        echo "      [automatic] decompress starting..." >&2
+        /usr/bin/time -v $CIGZIP decompress -i "$OUTPUT_DIR/${key}.bpaf" \
+            -o "$OUTPUT_DIR/${key}_decomp.paf" 2>&1 | tee "$OUTPUT_DIR/${key}_decompress.log" >&2
+        echo "      [automatic] decompress finished" >&2
+    else
+        /usr/bin/time -v $CIGZIP decompress -i "$OUTPUT_DIR/${key}.bpaf" \
+            -o "$OUTPUT_DIR/${key}_decomp.paf" 2>&1 | tee "$OUTPUT_DIR/${key}_decompress.log" >/dev/null
+    fi
     
     DECOMPRESS_TIME[$key]=$(grep "Elapsed (wall clock)" "$OUTPUT_DIR/${key}_decompress.log" | awk '{print $8}')
     DECOMPRESS_MEM[$key]=$(grep "Maximum resident set size" "$OUTPUT_DIR/${key}_decompress.log" | awk '{print $6}')
     
     # Verify
-    local orig_md5=$($NORMALIZE "$tp_paf" | md5sum | cut -d' ' -f1)
-    local decomp_md5=$($NORMALIZE "$OUTPUT_DIR/${key}_decomp.paf" | md5sum | cut -d' ' -f1)
+    if [ "$first_strategy" = "automatic" ]; then
+        echo "      [automatic] normalize (orig) -> ${OUTPUT_DIR}/${key}_normalize_orig.txt" >&2
+        if cat "$tp_paf" | $NORMALIZE > "$OUTPUT_DIR/${key}_normalize_orig.txt" 2> "$OUTPUT_DIR/${key}_normalize_orig.err"; then
+            echo "      [automatic] normalize (orig) done" >&2
+        else
+            echo "      [automatic] normalize (orig) failed" >&2
+        fi
+
+        echo "      [automatic] normalize (decomp) -> ${OUTPUT_DIR}/${key}_normalize_decomp.txt" >&2
+        if cat "$OUTPUT_DIR/${key}_decomp.paf" | $NORMALIZE > "$OUTPUT_DIR/${key}_normalize_decomp.txt" 2> "$OUTPUT_DIR/${key}_normalize_decomp.err"; then
+            echo "      [automatic] normalize (decomp) done" >&2
+        else
+            echo "      [automatic] normalize (decomp) failed" >&2
+        fi
+
+        orig_md5=$(md5sum "$OUTPUT_DIR/${key}_normalize_orig.txt" | cut -d' ' -f1)
+        decomp_md5=$(md5sum "$OUTPUT_DIR/${key}_normalize_decomp.txt" | cut -d' ' -f1)
+        echo "      [automatic] checksum compare: orig=$orig_md5 decomp=$decomp_md5" >&2
+    else
+        orig_md5=$(cat "$tp_paf" | $NORMALIZE | md5sum | cut -d' ' -f1)
+        decomp_md5=$(cat "$OUTPUT_DIR/${key}_decomp.paf" | $NORMALIZE | md5sum | cut -d' ' -f1)
+    fi
     
     if [ "$orig_md5" = "$decomp_md5" ]; then
         VERIFIED[$key]="✓"
@@ -564,20 +638,61 @@ test_configuration() {
     fi
     
     # Seek Mode A: 10 positions × 10 iterations (for quick testing)
-    local seek_a_result=$(/tmp/seek_mode_a "$OUTPUT_DIR/${key}.bpaf" "$EXTRACTED" 10 10 "$tp_paf" 2>/dev/null || echo "0 0 0")
+    local seek_a_result=$(/tmp/seek_mode_a "$OUTPUT_DIR/${key}.bpaf" "$EXTRACTED" 10 10 "$tp_paf" || echo "0 0 0")
     read -r seek_a_avg seek_a_std seek_a_ratio <<< "$seek_a_result"
     SEEK_A[$key]="$seek_a_avg"
     SEEK_A_STDDEV[$key]="$seek_a_std"
 
     # Seek Mode B: 10 positions × 10 iterations (for quick testing)
-    local seek_b_result=$(/tmp/seek_mode_b "$OUTPUT_DIR/${key}.bpaf" "$EXTRACTED" 10 10 "$tp_type" "$tp_paf" 2>/dev/null || echo "0 0 0")
+    local seek_b_result=$(/tmp/seek_mode_b "$OUTPUT_DIR/${key}.bpaf" "$EXTRACTED" 10 10 "$tp_type" "$tp_paf" || echo "0 0 0")
     read -r seek_b_avg seek_b_std seek_b_ratio <<< "$seek_b_result"
     SEEK_B[$key]="$seek_b_avg"
     SEEK_B_STDDEV[$key]="$seek_b_std"
-    SEEK_SUCCESS_RATIO[$key]="$seek_b_ratio"  # Using Mode B ratio (both should be identical)
+    SEEK_SUCCESS_RATIO[$key]="${seek_b_ratio:-0}"  # Using Mode B ratio (both should be identical)
 
-    # Cleanup
-    rm -f "$OUTPUT_DIR/${key}_compress.log" "$OUTPUT_DIR/${key}_decompress.log" "$OUTPUT_DIR/${key}_decomp.paf"
+    # Determine pass/fail for logging
+    local failure_reasons=()
+    if [ "${VERIFIED[$key]}" != "✓" ]; then
+        failure_reasons+=("verification:${orig_md5}->${decomp_md5}")
+    fi
+    local seek_ratio_value="${SEEK_SUCCESS_RATIO[$key]}"
+    if ! printf '%s' "$seek_ratio_value" | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then
+        failure_reasons+=("seek:non-numeric:${seek_ratio_value}")
+    else
+        if ! awk "BEGIN{exit !($seek_ratio_value >= 1)}"; then
+            failure_reasons+=("seek:${seek_ratio_value}")
+        fi
+    fi
+
+    if [ ${#failure_reasons[@]} -gt 0 ]; then
+        {
+            echo "tp_type=$tp_type"
+            echo "first=$first_strategy"
+            echo "second=$second_strategy"
+            echo "key=$key"
+            echo "bpaf=$OUTPUT_DIR/${key}.bpaf"
+            echo "decomp=$OUTPUT_DIR/${key}_decomp.paf"
+            echo "compress_log=$OUTPUT_DIR/${key}_compress.log"
+            echo "decompress_log=$OUTPUT_DIR/${key}_decompress.log"
+            if [ "$first_strategy" = "automatic" ]; then
+                echo "normalize_orig=$OUTPUT_DIR/${key}_normalize_orig.txt"
+                echo "normalize_decomp=$OUTPUT_DIR/${key}_normalize_decomp.txt"
+            fi
+            echo "orig_md5=$orig_md5"
+            echo "decomp_md5=$decomp_md5"
+            echo "seek_ratio=${seek_ratio_value}"
+            echo "seek_a_avg=$seek_a_avg seek_b_avg=$seek_b_avg"
+            echo "failure_reason=$(IFS=','; echo \"${failure_reasons[*]}\")"
+            echo "---"
+        } >> "$OUTPUT_DIR/failing_strategies.log"
+    else
+        # Cleanup on success
+        rm -f "$OUTPUT_DIR/${key}_compress.log" "$OUTPUT_DIR/${key}_decompress.log" "$OUTPUT_DIR/${key}_decomp.paf"
+        if [ "$first_strategy" = "automatic" ]; then
+            rm -f "$OUTPUT_DIR/${key}_normalize_orig.txt" "$OUTPUT_DIR/${key}_normalize_orig.err" \
+                  "$OUTPUT_DIR/${key}_normalize_decomp.txt" "$OUTPUT_DIR/${key}_normalize_decomp.err"
+        fi
+    fi
 }
 
 # TSV output function
@@ -599,22 +714,28 @@ output_tsv_row() {
         strategy_label="${first_strategy}→${second_strategy}"
     fi
 
-    # Calculate ratios
-    local tp_size_bytes=${TP_SIZE[$tp_type]}
-    local bpaf_size_bytes=${COMPRESS_SIZE[$key]}
-    local ratio_orig_to_tp=$(awk "BEGIN {printf \"%.3f\", $SIZE / $tp_size_bytes}")
-    local ratio_tp_to_bpaf=$(awk "BEGIN {printf \"%.3f\", $tp_size_bytes / $bpaf_size_bytes}")
-    local ratio_orig_to_bpaf=$(awk "BEGIN {printf \"%.3f\", $SIZE / $bpaf_size_bytes}")
+    # Calculate ratios with guards to avoid division by zero or empty values
+    local tp_size_bytes=${TP_SIZE[$tp_type]:-0}
+    local bpaf_size_bytes=${COMPRESS_SIZE[$key]:-0}
+
+    local ratio_orig_to_tp
+    ratio_orig_to_tp=$(safe_ratio "$SIZE" "$tp_size_bytes" 3)
+
+    local ratio_tp_to_bpaf
+    ratio_tp_to_bpaf=$(safe_ratio "$tp_size_bytes" "$bpaf_size_bytes" 3)
+
+    local ratio_orig_to_bpaf
+    ratio_orig_to_bpaf=$(safe_ratio "$SIZE" "$bpaf_size_bytes" 3)
 
     # Convert times to seconds
-    local encode_time_sec=$(time_to_seconds "${ENCODE_TIME[$tp_type]}")
-    local compress_time_sec=$(time_to_seconds "${COMPRESS_TIME[$key]}")
-    local decompress_time_sec=$(time_to_seconds "${DECOMPRESS_TIME[$key]}")
+    local encode_time_sec=$(time_to_seconds "$(normalize_time_field "${ENCODE_TIME[$tp_type]}")")
+    local compress_time_sec=$(time_to_seconds "$(normalize_time_field "${COMPRESS_TIME[$key]}")")
+    local decompress_time_sec=$(time_to_seconds "$(normalize_time_field "${DECOMPRESS_TIME[$key]}")")
 
     # Convert memory to MB
-    local encode_mem_mb=$(kb_to_mb "${ENCODE_MEM[$tp_type]}")
-    local compress_mem_mb=$(kb_to_mb "${COMPRESS_MEM[$key]}")
-    local decompress_mem_mb=$(kb_to_mb "${DECOMPRESS_MEM[$key]}")
+    local encode_mem_mb=$(kb_to_mb "$(normalize_time_field "${ENCODE_MEM[$tp_type]}")")
+    local compress_mem_mb=$(kb_to_mb "$(normalize_time_field "${COMPRESS_MEM[$key]}")")
+    local decompress_mem_mb=$(kb_to_mb "$(normalize_time_field "${DECOMPRESS_MEM[$key]}")")
 
     # Verification status
     local verified="${VERIFIED[$key]}"
@@ -622,6 +743,9 @@ output_tsv_row() {
     if [ "$verified" = "✓" ]; then
         verified_text="yes"
     fi
+
+    # Seek success ratio fallback
+    local seek_success=${SEEK_SUCCESS_RATIO[$key]:-0}
 
     # Dataset name from input file
     local dataset_name=$(basename "$INPUT_PAF" .paf.gz | sed 's/.paf$//')
@@ -657,7 +781,7 @@ output_tsv_row() {
         "${SEEK_A_STDDEV[$key]}" \
         "${SEEK_B[$key]}" \
         "${SEEK_B_STDDEV[$key]}" \
-        "${SEEK_SUCCESS_RATIO[$key]}" \
+        "$seek_success" \
         >> "$tsv_file"
 }
 
@@ -687,7 +811,7 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
             local second_full="$3"
             local temp_tsv="$4"
 
-            test_configuration "$tp_type" "$first_full" "$second_full" >/dev/null 2>&1
+            test_configuration "$tp_type" "$first_full" "$second_full"
             output_tsv_row "$tp_type" "$first_full" "$second_full" >> "$temp_tsv"
         }
         export -f run_test
@@ -709,8 +833,7 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
                     TEMP_TSV="$TEMP_DIR/test_${combo_count}.tsv"
 
                     # Run test in background
-                    test_configuration "$TP_TYPE" "$FIRST_FULL" "$SECOND_FULL" >/dev/null 2>&1
-                    output_tsv_row "$TP_TYPE" "$FIRST_FULL" "$SECOND_FULL" >> "$TEMP_TSV" &
+                    run_test "$TP_TYPE" "$FIRST_FULL" "$SECOND_FULL" "$TEMP_TSV" &
 
                     job_count=$((job_count + 1))
 
@@ -741,14 +864,14 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
 
         # Extract the strategies that automatic mode selected from the BPAF header
         auto_bpaf="$OUTPUT_DIR/${TP_TYPE}_automatic.bpaf"
-        selected_strategies=$("$REPO_DIR/target/release/bpaf-view" --strategies "$auto_bpaf" 2>/dev/null)
+        selected_strategies=$("$REPO_DIR/target/release/bpaf-view" --strategies "$auto_bpaf")
         first_selected=$(echo "$selected_strategies" | cut -f1)
         second_selected=$(echo "$selected_strategies" | cut -f2)
 
         echo "  → Automatic selected: $first_selected → $second_selected"
 
-        # Output TSV row with the actual selected strategies (not "automatic")
-        output_tsv_row "$TP_TYPE" "$first_selected" "$second_selected"
+        # Output TSV row for the automatic run (metrics recorded under "automatic" key)
+        output_tsv_row "$TP_TYPE" "automatic"
 
         echo ""
         echo "✓ Completed 868 tests: 867 explicit dual combinations + 1 automatic"
@@ -793,7 +916,7 @@ DUAL_NOTE
 
     for TP_TYPE in "${TP_TYPES[@]}"; do
         tp_size_bytes=${TP_SIZE[$TP_TYPE]}
-        tp_size_mb=$(awk "BEGIN {printf \"%.2f\", $tp_size_bytes / 1024 / 1024}")
+            tp_size_mb=$(safe_ratio "$tp_size_bytes" 1048576 2)
         echo "- $TP_TYPE: $tp_size_bytes bytes ($tp_size_mb MB)" >> "$REPORT"
     done
     echo "" >> "$REPORT"
@@ -802,13 +925,13 @@ else
     for TP_TYPE in "${TP_TYPES[@]}"; do
         # Calculate baseline sizes
         tp_size_bytes=${TP_SIZE[$TP_TYPE]}
-        tp_size_mb=$(awk "BEGIN {printf \"%.2f\", $tp_size_bytes / 1024 / 1024}")
+            tp_size_mb=$(safe_ratio "$tp_size_bytes" 1048576 2)
 
         cat >> "$REPORT" << SECTION
 ## Tracepoint Type: ${TP_TYPE^^}
 
 **Baseline Sizes:**
-- Original Input (CIGAR PAF): $SIZE bytes ($(awk "BEGIN {printf \"%.2f\", $SIZE / 1024 / 1024}") MB)
+- Original Input (CIGAR PAF): $SIZE bytes ($(python3 - <<'PY'\nsize = int($SIZE)\nprint(f\"{size/1024/1024:.2f}\")\nPY\n) MB)
 - Tracepoint PAF ($TP_TYPE): $tp_size_bytes bytes ($tp_size_mb MB)
 
 | Strategy | Compressed Size (bytes) | BPAF Ratio | End-to-End Ratio | Compress Time | Compress Mem (KB) | Decompress Time | Decompress Mem (KB) | Seek A (μs) | Seek B (μs) | Verified |
@@ -819,8 +942,8 @@ SECTION
             key="${TP_TYPE}_${STRATEGY}"
 
             # Calculate both ratios
-            bpaf_ratio=$(awk "BEGIN {printf \"%.2f\", $tp_size_bytes / ${COMPRESS_SIZE[$key]}}" 2>/dev/null || echo "N/A")
-            e2e_ratio=$(awk "BEGIN {printf \"%.2f\", $SIZE / ${COMPRESS_SIZE[$key]}}" 2>/dev/null || echo "N/A")
+            bpaf_ratio=$(safe_ratio "$tp_size_bytes" "${COMPRESS_SIZE[$key]}" 2)
+            e2e_ratio=$(safe_ratio "$SIZE" "${COMPRESS_SIZE[$key]}" 2)
 
             cat >> "$REPORT" << ROW
 | $STRATEGY | ${COMPRESS_SIZE[$key]} | ${bpaf_ratio}x | ${e2e_ratio}x | ${COMPRESS_TIME[$key]} | ${COMPRESS_MEM[$key]} | ${DECOMPRESS_TIME[$key]} | ${DECOMPRESS_MEM[$key]} | ${SEEK_A[$key]} | ${SEEK_B[$key]} | ${VERIFIED[$key]} |
