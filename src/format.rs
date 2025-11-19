@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
 /// Compression layer to use for final compression
+pub const BPAF_VERSION: u8 = 1;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompressionLayer {
     /// Zstd compression (default)
@@ -34,14 +36,36 @@ impl CompressionLayer {
             _ => Err(format!("Invalid compression layer code: {}", value)),
         }
     }
+
+    /// Return a stable, human-readable label for this layer
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CompressionLayer::Zstd => "zstd",
+            CompressionLayer::Bgzip => "bgzip",
+            CompressionLayer::Nocomp => "nocomp",
+        }
+    }
+
+    /// Enumerate all supported compression layers
+    pub fn all() -> [CompressionLayer; 3] {
+        [
+            CompressionLayer::Zstd,
+            CompressionLayer::Bgzip,
+            CompressionLayer::Nocomp,
+        ]
+    }
 }
 
 #[derive(Clone, Debug)]
 pub enum CompressionStrategy {
-    /// Automatic strategy selection based on data analysis
-    /// - Runs heuristic to choose optimal strategy
+    /// Automatic-fast strategy selection (samples first N records)
+    /// - Tests every concrete strategy × layer on a 1,000-record sample
     /// - Configurable compression level (max 22, default: 3)
-    Automatic(i32),
+    AutomaticFast(i32),
+    /// Automatic-slow strategy selection (uses entire file)
+    /// - Tests every concrete strategy × layer on all records
+    /// - Configurable compression level (max 22, default: 3)
+    AutomaticSlow(i32),
     /// Raw encoding (no preprocessing) + Zstd
     /// - Optimal for low complexity data
     /// - Configurable compression level (max 22, default: 3)
@@ -106,12 +130,6 @@ pub enum CompressionStrategy {
     /// - Optimal for byte-range data (1.1-4.0 billion ints/sec)
     /// - Configurable compression level (max 22, default: 3)
     StreamVByte(i32),
-    /// Adaptive Correlation-based strategy selection
-    /// - Automatically switches between strategies based on correlation
-    /// - Measures ρ per block: >0.95 → joint, >0.50 → delta, <0.50 → FOR
-    /// - Optimal for heterogeneous data patterns
-    /// - Configurable compression level (max 22, default: 3)
-    AdaptiveCorrelation(i32),
     /// FastPFOR - Patched Frame-of-Reference with exceptions
     /// - Groups integers into 128-value blocks with optimal bit-width
     /// - Stores exceptions separately for outliers
@@ -183,8 +201,6 @@ impl CompressionStrategy {
                 | "simple8"
                 | "stream-vbyte"
                 | "streamvbyte"
-                | "adaptive-correlation"
-                | "adaptive"
                 | "fastpfor"
                 | "fast-pfor"
                 | "cascaded"
@@ -195,6 +211,31 @@ impl CompressionStrategy {
                 | "rice"
                 | "huffman"
         )
+    }
+
+    /// Return every concrete strategy variant (excludes meta-strategies such as Automatic/Dual)
+    pub fn concrete_strategies(level: i32) -> Vec<Self> {
+        vec![
+            CompressionStrategy::Raw(level),
+            CompressionStrategy::ZigzagDelta(level),
+            CompressionStrategy::TwoDimDelta(level),
+            CompressionStrategy::RunLength(level),
+            CompressionStrategy::BitPacked(level),
+            CompressionStrategy::DeltaOfDelta(level),
+            CompressionStrategy::FrameOfReference(level),
+            CompressionStrategy::HybridRLE(level),
+            CompressionStrategy::OffsetJoint(level),
+            CompressionStrategy::XORDelta(level),
+            CompressionStrategy::Dictionary(level),
+            CompressionStrategy::Simple8(level),
+            CompressionStrategy::StreamVByte(level),
+            CompressionStrategy::FastPFOR(level),
+            CompressionStrategy::Cascaded(level),
+            CompressionStrategy::Simple8bFull(level),
+            CompressionStrategy::SelectiveRLE(level),
+            CompressionStrategy::Rice(level),
+            CompressionStrategy::Huffman(level),
+        ]
     }
 
     /// Parse strategy from string with compression layer
@@ -243,7 +284,10 @@ impl CompressionStrategy {
         }
 
         let strategy = match strategy_name.as_str() {
-            "automatic" => Ok(CompressionStrategy::Automatic(compression_level)),
+            "automatic" | "automatic-fast" => {
+                Ok(CompressionStrategy::AutomaticFast(compression_level))
+            }
+            "automatic-slow" => Ok(CompressionStrategy::AutomaticSlow(compression_level)),
             "raw" => Ok(CompressionStrategy::Raw(compression_level)),
             "zigzag-delta" => Ok(CompressionStrategy::ZigzagDelta(compression_level)),
             "2d-delta" => Ok(CompressionStrategy::TwoDimDelta(compression_level)),
@@ -257,7 +301,6 @@ impl CompressionStrategy {
             "dictionary" | "dict" => Ok(CompressionStrategy::Dictionary(compression_level)),
             "simple8" => Ok(CompressionStrategy::Simple8(compression_level)),
             "stream-vbyte" | "streamvbyte" => Ok(CompressionStrategy::StreamVByte(compression_level)),
-            "adaptive-correlation" | "adaptive" => Ok(CompressionStrategy::AdaptiveCorrelation(compression_level)),
             "fastpfor" | "fast-pfor" => Ok(CompressionStrategy::FastPFOR(compression_level)),
             "cascaded" => Ok(CompressionStrategy::Cascaded(compression_level)),
             "simple8b-full" | "simple8bfull" => Ok(CompressionStrategy::Simple8bFull(compression_level)),
@@ -344,7 +387,8 @@ impl CompressionStrategy {
     /// Parse a single strategy name into a CompressionStrategy enum
     fn parse_single_strategy(name: &str, level: i32) -> Result<CompressionStrategy, String> {
         match name {
-            "automatic" => Ok(CompressionStrategy::Automatic(level)),
+            "automatic" | "automatic-fast" => Ok(CompressionStrategy::AutomaticFast(level)),
+            "automatic-slow" => Ok(CompressionStrategy::AutomaticSlow(level)),
             "raw" => Ok(CompressionStrategy::Raw(level)),
             "zigzag-delta" => Ok(CompressionStrategy::ZigzagDelta(level)),
             "2d-delta" => Ok(CompressionStrategy::TwoDimDelta(level)),
@@ -358,9 +402,6 @@ impl CompressionStrategy {
             "dictionary" | "dict" => Ok(CompressionStrategy::Dictionary(level)),
             "simple8" => Ok(CompressionStrategy::Simple8(level)),
             "stream-vbyte" | "streamvbyte" => Ok(CompressionStrategy::StreamVByte(level)),
-            "adaptive-correlation" | "adaptive" => {
-                Ok(CompressionStrategy::AdaptiveCorrelation(level))
-            }
             "fastpfor" | "fast-pfor" => Ok(CompressionStrategy::FastPFOR(level)),
             "cascaded" => Ok(CompressionStrategy::Cascaded(level)),
             "simple8b-full" | "simple8bfull" => Ok(CompressionStrategy::Simple8bFull(level)),
@@ -386,6 +427,8 @@ impl CompressionStrategy {
     pub fn variants() -> &'static [&'static str] {
         &[
             "automatic",
+            "automatic-fast",
+            "automatic-slow",
             "raw",
             "zigzag-delta",
             "2d-delta",
@@ -399,7 +442,6 @@ impl CompressionStrategy {
             "dictionary",
             "simple8",
             "stream-vbyte",
-            "adaptive-correlation",
             "rice",
             "huffman",
         ]
@@ -408,7 +450,7 @@ impl CompressionStrategy {
     /// Convert to strategy code for file header
     fn to_code(&self) -> u8 {
         match self {
-            CompressionStrategy::Automatic(_) | CompressionStrategy::AdaptiveCorrelation(_) => {
+            CompressionStrategy::AutomaticFast(_) | CompressionStrategy::AutomaticSlow(_) => {
                 panic!("Automatic strategies must be resolved before writing")
             }
             CompressionStrategy::Dual(_, _, _) => {
@@ -468,7 +510,8 @@ impl CompressionStrategy {
     /// Get zstd compression level for this strategy
     pub fn zstd_level(&self) -> i32 {
         match self {
-            CompressionStrategy::Automatic(level) => *level,
+            CompressionStrategy::AutomaticFast(level) => *level,
+            CompressionStrategy::AutomaticSlow(level) => *level,
             CompressionStrategy::Dual(_, _, level) => *level,
             CompressionStrategy::Raw(level) => *level,
             CompressionStrategy::ZigzagDelta(level) => *level,
@@ -483,7 +526,6 @@ impl CompressionStrategy {
             CompressionStrategy::Dictionary(level) => *level,
             CompressionStrategy::Simple8(level) => *level,
             CompressionStrategy::StreamVByte(level) => *level,
-            CompressionStrategy::AdaptiveCorrelation(level) => *level,
             CompressionStrategy::FastPFOR(level) => *level,
             CompressionStrategy::Cascaded(level) => *level,
             CompressionStrategy::Simple8bFull(level) => *level,
@@ -497,8 +539,11 @@ impl CompressionStrategy {
 impl std::fmt::Display for CompressionStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CompressionStrategy::Automatic(level) => {
-                write!(f, "Automatic (level {})", level)
+            CompressionStrategy::AutomaticFast(level) => {
+                write!(f, "AutomaticFast (level {})", level)
+            }
+            CompressionStrategy::AutomaticSlow(level) => {
+                write!(f, "AutomaticSlow (level {})", level)
             }
             CompressionStrategy::Dual(first, second, level) => {
                 write!(f, "Dual({} : {}, level {})", first, second, level)
@@ -542,9 +587,6 @@ impl std::fmt::Display for CompressionStrategy {
             CompressionStrategy::StreamVByte(level) => {
                 write!(f, "StreamVByte (level {})", level)
             }
-            CompressionStrategy::AdaptiveCorrelation(level) => {
-                write!(f, "AdaptiveCorrelation (level {})", level)
-            }
             CompressionStrategy::FastPFOR(level) => {
                 write!(f, "FastPFOR (level {})", level)
             }
@@ -571,7 +613,8 @@ pub struct BinaryPafHeader {
     pub(crate) version: u8,
     pub(crate) first_strategy_code: u8,
     pub(crate) second_strategy_code: u8,
-    pub(crate) compression_layer: CompressionLayer,
+    pub(crate) first_layer: CompressionLayer,
+    pub(crate) second_layer: CompressionLayer,
     pub(crate) num_records: u64,
     pub(crate) num_strings: u64,
     pub(crate) tracepoint_type: TracepointType,
@@ -586,7 +629,8 @@ impl BinaryPafHeader {
         num_records: u64,
         num_strings: u64,
         strategy: CompressionStrategy,
-        compression_layer: CompressionLayer,
+        first_layer: CompressionLayer,
+        second_layer: CompressionLayer,
         tracepoint_type: TracepointType,
         complexity_metric: ComplexityMetric,
         max_complexity: u64,
@@ -601,10 +645,11 @@ impl BinaryPafHeader {
         };
 
         Self {
-            version: 1,
+            version: BPAF_VERSION,
             first_strategy_code,
             second_strategy_code,
-            compression_layer,
+            first_layer,
+            second_layer,
             num_records,
             num_strings,
             tracepoint_type,
@@ -678,16 +723,22 @@ impl BinaryPafHeader {
         self.max_complexity
     }
 
-    /// Get compression layer
-    pub fn compression_layer(&self) -> CompressionLayer {
-        self.compression_layer
+    /// Compression layer for first values
+    pub fn first_layer(&self) -> CompressionLayer {
+        self.first_layer
+    }
+
+    /// Compression layer for second values
+    pub fn second_layer(&self) -> CompressionLayer {
+        self.second_layer
     }
 
     pub(crate) fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_all(BINARY_MAGIC)?;
         writer.write_all(&[
             self.version,
-            self.compression_layer.to_u8(),
+            self.first_layer.to_u8(),
+            self.second_layer.to_u8(),
             self.first_strategy_code,
             self.second_strategy_code,
         ])?;
@@ -709,20 +760,22 @@ impl BinaryPafHeader {
         }
 
         // Fixed header layout (version 1):
-        // [version][compression_layer][first_strategy][second_strategy]
-        let mut header_bytes = [0u8; 4];
+        // [version][first_layer][second_layer][first_strategy][second_strategy]
+        let mut header_bytes = [0u8; 5];
         reader.read_exact(&mut header_bytes)?;
         let version = header_bytes[0];
-        if version != 1 {
+        if version != BPAF_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Unsupported format version: {}", version),
             ));
         }
-        let compression_layer = CompressionLayer::from_u8(header_bytes[1])
+        let first_layer = CompressionLayer::from_u8(header_bytes[1])
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let first_strategy_code = header_bytes[2];
-        let second_strategy_code = header_bytes[3];
+        let second_layer = CompressionLayer::from_u8(header_bytes[2])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let first_strategy_code = header_bytes[3];
+        let second_strategy_code = header_bytes[4];
 
         let num_records = read_varint(reader)?;
         let num_strings = read_varint(reader)?;
@@ -746,7 +799,8 @@ impl BinaryPafHeader {
             version,
             first_strategy_code,
             second_strategy_code,
-            compression_layer,
+            first_layer,
+            second_layer,
             num_records,
             num_strings,
             tracepoint_type,

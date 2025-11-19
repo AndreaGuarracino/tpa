@@ -42,6 +42,8 @@ def normalize_strategy_pair(row):
 
 def format_bytes(bytes_val):
     """Convert bytes to human-readable format"""
+    if bytes_val is None or (isinstance(bytes_val, float) and np.isnan(bytes_val)):
+        return "unknown"
     for unit in ['B', 'KB', 'MB', 'GB']:
         if bytes_val < 1024.0:
             return f"{bytes_val:.2f} {unit}"
@@ -309,8 +311,49 @@ def main():
 
     print(f"Reading test results from: {tsv_file}")
 
-    # Read TSV
-    df = pd.read_csv(tsv_file, sep='\t')
+    # Read TSV (handle legacy exports that include dataset name in the index)
+    expected_cols = [
+        'dataset_name', 'dataset_type', 'original_size_bytes', 'num_records',
+        'encoding_type', 'encoding_runtime_sec', 'encoding_memory_mb',
+        'tp_file_size_bytes', 'max_complexity', 'complexity_metric',
+        'compression_strategy', 'strategy_first', 'strategy_second',
+        'layer_first', 'layer_second', 'compression_runtime_sec',
+        'compression_memory_mb', 'bpaf_size_bytes', 'ratio_orig_to_tp',
+        'ratio_tp_to_bpaf', 'ratio_orig_to_bpaf', 'decompression_runtime_sec',
+        'decompression_memory_mb', 'verification_passed',
+        'seek_positions_tested', 'seek_iterations_per_position',
+        'seek_total_tests', 'seek_mode_a_avg_us', 'seek_mode_a_stddev_us',
+        'seek_mode_b_avg_us', 'seek_mode_b_stddev_us', 'seek_success_ratio'
+    ]
+
+    df = pd.read_csv(tsv_file, sep='\t', index_col=False, engine='python')
+    if isinstance(df.index, pd.MultiIndex):
+        df = df.reset_index()
+
+    if 'layer_first' not in df.columns:
+        layer_candidates = {'zstd', 'bgzip', 'nocomp'}
+        if 'compression_runtime_sec' in df.columns and df['compression_runtime_sec'].astype(str).str.lower().isin(layer_candidates).all():
+            df = pd.read_csv(tsv_file, sep='\t', names=expected_cols, header=0, skiprows=1, engine='python')
+            if isinstance(df.index, pd.MultiIndex):
+                df = df.reset_index()
+
+    numeric_cols = [
+        'original_size_bytes', 'num_records', 'encoding_runtime_sec', 'encoding_memory_mb',
+        'tp_file_size_bytes', 'max_complexity', 'compression_runtime_sec',
+        'compression_memory_mb', 'bpaf_size_bytes', 'ratio_orig_to_tp', 'ratio_tp_to_bpaf',
+        'ratio_orig_to_bpaf', 'decompression_runtime_sec', 'decompression_memory_mb',
+        'seek_positions_tested', 'seek_iterations_per_position', 'seek_total_tests',
+        'seek_mode_a_avg_us', 'seek_mode_a_stddev_us', 'seek_mode_b_avg_us',
+        'seek_mode_b_stddev_us', 'seek_success_ratio'
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    if 'dataset_name' in df.columns:
+        df['dataset_name'] = df['dataset_name'].astype(str)
+    if 'dataset_type' in df.columns:
+        df['dataset_type'] = df['dataset_type'].astype(str)
 
     print(f"Loaded {len(df)} test results")
     print(f"Found {df['dataset_name'].nunique()} unique datasets")

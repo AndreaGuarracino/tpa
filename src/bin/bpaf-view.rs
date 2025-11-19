@@ -12,7 +12,9 @@ fn print_usage() {
     eprintln!("  - Alignment records in PAF format with tp:Z: tags");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --strategies    Output only first_strategy<TAB>second_strategy");
+    eprintln!(
+        "  --strategies    Output first_strategy<TAB>second_strategy<TAB>first_layer<TAB>second_layer"
+    );
 }
 
 fn strategy_to_name(strat: &str) -> String {
@@ -81,8 +83,13 @@ fn main() -> io::Result<()> {
 
         let first_name = strategy_to_name(&format!("{:?}", first_strat));
         let second_name = strategy_to_name(&format!("{:?}", second_strat));
+        let first_layer = header.first_layer().as_str();
+        let second_layer = header.second_layer().as_str();
 
-        println!("{}\t{}", first_name, second_name);
+        println!(
+            "{}\t{}\t{}\t{}",
+            first_name, second_name, first_layer, second_layer
+        );
         return Ok(());
     }
 
@@ -102,6 +109,8 @@ fn main() -> io::Result<()> {
 
     let strategy = header.strategy()?;
     println!("Compression strategy: {}", strategy);
+    println!("First stream layer: {}", header.first_layer().as_str());
+    println!("Second stream layer: {}", header.second_layer().as_str());
 
     println!("Tracepoint type: {:?}", header.tp_type());
     println!("Complexity metric: {:?}", header.complexity_metric());

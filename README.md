@@ -6,7 +6,8 @@ Binary format for genomic sequence alignments with tracepoints.
 
 - **O(1) random access**: External index for instant record lookup
 - **Fast varint compression**:
-  - **Automatic (default)**: Samples data to choose between raw or delta+zigzag encoding
+  - **Automatic-Fast (default)**: Samples the first 1,000 records and tests every concrete strategy × compression layer per stream, then locks in the best first/second combination
+  - **Automatic-Slow**: Runs the same exhaustive search but evaluates all records (highest compression fidelity)
   - **ZigzagDelta**: Delta + zigzag transform + varint + zstd
   - **Raw**: Plain varints + zstd
   - **Rice / Huffman**: Block-local entropy coding over zigzag deltas, still byte-aligned for random seeks
@@ -22,8 +23,11 @@ Binary format for genomic sequence alignments with tracepoints.
 
 ### Header (metadata + strategy)
 - Magic: `BPAF` (4 bytes)
-- Version: `1` (1 byte)
-- Strategy: `0-1` (1 byte) - 0=Raw, 1=ZigzagDelta (Automatic resolves to one of these)
+- Version: `2` (1 byte)
+- First compression layer: `0=Zstd, 1=Bgzip, 2=Nocomp` (1 byte)
+- Second compression layer: `0=Zstd, 1=Bgzip, 2=Nocomp` (1 byte)
+- First strategy code: `0-20` (1 byte)
+- Second strategy code: `0-20` (1 byte)
 - Record count: varint
 - String count: varint
 - Tracepoint type: `1` byte
@@ -87,10 +91,17 @@ let mut file = File::open("alignments.bpaf")?;
 // Pre-computed offsets, strategy, and layer from index/header
 let offset = 123456;
 let strategy = CompressionStrategy::ZigzagDelta(3);
-let layer = CompressionLayer::Zstd; // or read from BinaryPafHeader
+let first_layer = CompressionLayer::Zstd; // or read from BinaryPafHeader
+let second_layer = CompressionLayer::Zstd;
 
 // Direct tracepoint decoding - no BpafReader overhead
-let standard_tps = read_standard_tracepoints_at_offset(&mut file, offset, strategy, layer)?;
+let standard_tps = read_standard_tracepoints_at_offset(
+    &mut file,
+    offset,
+    strategy,
+    first_layer,
+    second_layer,
+)?;
 let variable_tps = read_variable_tracepoints_at_offset(&mut file, offset)?;
 let mixed_tps = read_mixed_tracepoints_at_offset(&mut file, offset)?;
 ```
@@ -114,11 +125,14 @@ for record in reader.iter_records() {
 ```rust
 use lib_bpaf::{compress_paf_with_tracepoints, CompressionStrategy};
 
-// Automatic (default): Analyzes data to choose delta vs raw + varint + zstd
+// Automatic-Fast (default): Analyzes data and tries every strategy/layer per stream
 // - Samples first 1000 records to determine optimal encoding
 // - Handles all tracepoint types automatically
 // - Enables O(1) random tracepoint access
-compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::Automatic(3))?;
+compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::AutomaticFast(3))?;
+
+// Automatic-Slow: same search but uses ALL records for scoring
+compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::AutomaticSlow(3))?;
 
 // ZigzagDelta: Delta + zigzag transform (both values) + varint + zstd
 // - Always uses delta encoding for tracepoints
@@ -145,7 +159,8 @@ compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionSt
 ```
 
 **Strategy guide:**
-- **Automatic (default)**: Best for most use cases, analyzes data to choose Raw or ZigzagDelta
+- **Automatic-Fast (default)**: Best for most use cases, analyzes the first/second streams independently (all strategies × layers) on a 1,000-record sample and stores the winning combination
+- **Automatic-Slow**: Use when you want the absolute best compression and can afford analyzing the entire file
 - **ZigzagDelta**: Use when tracepoint values are mostly increasing
 - **Raw**: Use when tracepoint values jump frequently
 - **BlockwiseAdaptive**: Adaptive selection per record using advanced codecs

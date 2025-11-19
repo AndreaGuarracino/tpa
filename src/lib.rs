@@ -26,7 +26,7 @@ pub use format::{
 };
 pub use lib_tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 
-use crate::format::parse_tag;
+use crate::format::{parse_tag, BPAF_VERSION};
 use crate::utils::{parse_u8, parse_usize};
 
 pub use binary::{
@@ -44,9 +44,20 @@ pub use binary::{
 // Re-export utility functions for external tools
 pub use utils::{read_varint, varint_size};
 
-use crate::binary::{analyze_correlation, analyze_smart_dual_compression, decompress_varint};
+use crate::binary::{analyze_smart_dual_compression, decompress_varint};
 
 use crate::utils::open_paf_reader;
+
+pub(crate) fn ensure_tracepoints(data: &TracepointData) {
+    let has = match data {
+        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => !tps.is_empty(),
+        TracepointData::Variable(tps) => !tps.is_empty(),
+        TracepointData::Mixed(items) => !items.is_empty(),
+    };
+    if !has {
+        panic!("Encountered record without tracepoints");
+    }
+}
 
 // ============================================================================
 // PUBLIC API
@@ -121,8 +132,8 @@ pub fn compress_paf_with_cigar_dual(
         | CompressionStrategy::Rice(lvl)
         | CompressionStrategy::Huffman(lvl) => *lvl,
         CompressionStrategy::Dual(_, _, lvl) => *lvl,
-        CompressionStrategy::Automatic(lvl) => *lvl,
-        CompressionStrategy::AdaptiveCorrelation(lvl) => *lvl,
+        CompressionStrategy::AutomaticFast(lvl) => *lvl,
+        CompressionStrategy::AutomaticSlow(lvl) => *lvl,
     };
 
     // Create Dual strategy
@@ -231,8 +242,8 @@ pub fn compress_paf_with_tracepoints_dual(
         | CompressionStrategy::Rice(lvl)
         | CompressionStrategy::Huffman(lvl) => *lvl,
         CompressionStrategy::Dual(_, _, lvl) => *lvl,
-        CompressionStrategy::Automatic(lvl) => *lvl,
-        CompressionStrategy::AdaptiveCorrelation(lvl) => *lvl,
+        CompressionStrategy::AutomaticFast(lvl) => *lvl,
+        CompressionStrategy::AutomaticSlow(lvl) => *lvl,
     };
 
     // Create Dual strategy
@@ -268,7 +279,7 @@ pub fn decompress_bpaf(input_path: &str, output_path: &str) -> io::Result<()> {
 
     let header = BinaryPafHeader::read(&mut reader)?;
 
-    if header.version != 1 {
+    if header.version != BPAF_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Unsupported format version: {}", header.version),
@@ -305,12 +316,18 @@ fn compress_paf(
         strategy
     );
 
-    const SAMPLE_SIZE: usize = 1000; // Sample size for empirical compression test to decide strategy
+    const FAST_SAMPLE_SIZE: usize = 1000; // Sample size for automatic-fast analysis
 
     // Pass 1: Build string table + collect sample for analysis
     let mut string_table = StringTable::new();
     let mut sample = Vec::new();
     let mut record_count = 0u64;
+
+    let sample_cap = match &strategy {
+        CompressionStrategy::AutomaticFast(_) => Some(FAST_SAMPLE_SIZE),
+        CompressionStrategy::AutomaticSlow(_) => None,
+        _ => Some(FAST_SAMPLE_SIZE),
+    };
 
     let input = open_paf_reader(input_path)?;
     for (line_num, line_result) in input.lines().enumerate() {
@@ -345,7 +362,11 @@ fn compress_paf(
             }
         };
 
-        if sample.len() < SAMPLE_SIZE {
+        let should_sample = match sample_cap {
+            Some(cap) => sample.len() < cap,
+            None => true,
+        };
+        if should_sample {
             sample.push(record);
         }
         record_count += 1;
@@ -360,53 +381,20 @@ fn compress_paf(
     }
 
     // Choose strategy based on user's preference
-    let (chosen_strategy, chosen_layer) = match strategy {
-        CompressionStrategy::Automatic(level) => {
-            // Run empirical compression test for DUAL strategies (test all 17×17×3 = 867 combinations)
-            let (best_first, best_second, best_layer) =
+    let (chosen_strategy, first_layer, second_layer) = match strategy {
+        CompressionStrategy::AutomaticFast(level) => {
+            // Run empirical compression test per stream (limited sample)
+            let (dual_strategy, best_first_layer, best_second_layer) =
                 analyze_smart_dual_compression(&sample, level);
-            info!(
-                "Automatic: Selected {} → {} with layer {:?}",
-                best_first, best_second, best_layer
-            );
-            // Wrap in Dual strategy
-            let dual_strategy =
-                CompressionStrategy::Dual(Box::new(best_first), Box::new(best_second), level);
-            (dual_strategy, best_layer)
+            (dual_strategy, best_first_layer, best_second_layer)
         }
-        CompressionStrategy::AdaptiveCorrelation(level) => {
-            // Analyze correlation and choose optimal strategy
-            let correlation = analyze_correlation(&sample);
-            let chosen = if correlation > 0.95 {
-                info!(
-                    "Adaptive: High correlation ({:.4}) → OffsetJoint",
-                    correlation
-                );
-                CompressionStrategy::OffsetJoint(level)
-            } else if correlation > 0.80 {
-                info!(
-                    "Adaptive: Medium correlation ({:.4}) → 2D-Delta",
-                    correlation
-                );
-                CompressionStrategy::TwoDimDelta(level)
-            } else if correlation > 0.50 {
-                info!(
-                    "Adaptive: Low correlation ({:.4}) → ZigzagDelta",
-                    correlation
-                );
-                CompressionStrategy::ZigzagDelta(level)
-            } else {
-                info!(
-                    "Adaptive: Very low correlation ({:.4}) → FrameOfReference",
-                    correlation
-                );
-                CompressionStrategy::FrameOfReference(level)
-            };
-            // Use user-specified layer or default
-            (chosen, user_specified_layer)
+        CompressionStrategy::AutomaticSlow(level) => {
+            let (dual_strategy, best_first_layer, best_second_layer) =
+                analyze_smart_dual_compression(&sample, level);
+            (dual_strategy, best_first_layer, best_second_layer)
         }
         // Respect explicit user choices - use user-specified layer
-        strategy => (strategy, user_specified_layer),
+        strategy => (strategy, user_specified_layer, user_specified_layer),
     };
 
     // Pass 2: Stream write - Header → StringTable → Records
@@ -422,7 +410,8 @@ fn compress_paf(
         record_count,
         string_table.len() as u64,
         chosen_strategy.clone(),
-        chosen_layer,
+        first_layer,
+        second_layer,
         tp_type,
         complexity_metric,
         max_complexity,
@@ -469,7 +458,12 @@ fn compress_paf(
         };
 
         // Write with chosen strategy and layer
-        record.write(&mut writer, chosen_strategy.clone(), chosen_layer)?;
+        record.write(
+            &mut writer,
+            chosen_strategy.clone(),
+            first_layer,
+            second_layer,
+        )?;
     }
     writer.flush()?;
 
@@ -610,6 +604,8 @@ fn parse_paf(
 
         parse_tracepoints(tp_data, tp_type)?
     };
+
+    ensure_tracepoints(&tracepoints);
 
     Ok(AlignmentRecord {
         query_name_id,

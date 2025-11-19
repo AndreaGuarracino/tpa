@@ -344,7 +344,8 @@ fn main() {
 
     let mut reader = BpafReader::open(bpaf_path).unwrap();
     let strategy = reader.header().strategy().unwrap();
-    let layer = reader.header().compression_layer();
+    let first_layer = reader.header().first_layer();
+    let second_layer = reader.header().second_layer();
     let reference = parse_reference(reference_paf, num_records as usize);
 
     // Generate random positions and get their offsets
@@ -371,7 +372,13 @@ fn main() {
         // Warmup
         for _ in 0..3 {
             let _ = match tp_type.as_str() {
-                "standard" => read_standard_tracepoints_at_offset(&mut file, offset, strategy.clone(), layer),
+                "standard" => read_standard_tracepoints_at_offset(
+                    &mut file,
+                    offset,
+                    strategy.clone(),
+                    first_layer,
+                    second_layer,
+                ),
                 "variable" => read_variable_tracepoints_at_offset(&mut file, offset).map(|_| Vec::new()),
                 "mixed" => read_mixed_tracepoints_at_offset(&mut file, offset).map(|_| Vec::new()),
                 _ => panic!("Invalid tp_type"),
@@ -382,7 +389,13 @@ fn main() {
         for _ in 0..iterations_per_pos {
             let start = Instant::now();
             let result = match tp_type.as_str() {
-                "standard" => read_standard_tracepoints_at_offset(&mut file, offset, strategy.clone(), layer),
+                "standard" => read_standard_tracepoints_at_offset(
+                    &mut file,
+                    offset,
+                    strategy.clone(),
+                    first_layer,
+                    second_layer,
+                ),
                 "variable" => read_variable_tracepoints_at_offset(&mut file, offset).map(|_| Vec::new()),
                 "mixed" => read_mixed_tracepoints_at_offset(&mut file, offset).map(|_| Vec::new()),
                 _ => panic!("Invalid tp_type"),
@@ -445,6 +458,7 @@ declare -A VERIFIED
 declare -A TP_SIZE
 declare -A BGZIP_TIME BGZIP_MEM BGZIP_SIZE
 declare -A STRATEGY_FIRST STRATEGY_SECOND
+declare -A LAYER_FIRST LAYER_SECOND
 
 # Determine tracepoint types to test
 if [ "$INPUT_TYPE" = "cigar" ]; then
@@ -524,27 +538,27 @@ BASE_STRATEGIES=(
     "huffman"
 )
 
-# Build full strategy list: base+zstd, base-bgzip, and base-nocomp
+LAYER_SUFFIXES=(
+    ""
+    "-bgzip"
+    "-nocomp"
+)
+
+# Build full strategy list
 STRATEGIES=()
 
-# Add all base strategies with default zstd compression
-for strategy in "${BASE_STRATEGIES[@]}"; do
-    STRATEGIES+=("$strategy")
+# Add all base strategies across layer suffixes
+for layer in "${LAYER_SUFFIXES[@]}"; do
+    for strategy in "${BASE_STRATEGIES[@]}"; do
+        STRATEGIES+=("${strategy}${layer}")
+    done
 done
 
-# Add all base strategies with bgzip compression
-for strategy in "${BASE_STRATEGIES[@]}"; do
-    STRATEGIES+=("${strategy}-bgzip")
+# Add meta-strategies (automatic-fast/slow)
+AUTO_STRATEGIES=("automatic-fast" "automatic-slow")
+for auto in "${AUTO_STRATEGIES[@]}"; do
+    STRATEGIES+=("$auto")
 done
-
-# Add all base strategies with no compression layer (level 0)
-for strategy in "${BASE_STRATEGIES[@]}"; do
-    STRATEGIES+=("${strategy}-nocomp")
-done
-
-# Add meta-strategies (they choose a concrete strategy, so no variants needed)
-STRATEGIES+=("automatic")
-STRATEGIES+=("adaptive-correlation")
 
 # Test function
 test_configuration() {
@@ -552,6 +566,10 @@ test_configuration() {
     local first_strategy="$2"
     local second_strategy="${3:-$2}"  # Default to first_strategy if not provided (single mode)
     local tp_paf="$OUTPUT_DIR/${tp_type}.tp.paf"
+    local is_auto=0
+    if [[ "$first_strategy" == automatic* ]]; then
+        is_auto=1
+    fi
 
     # Create key from strategies
     local key="${tp_type}_${first_strategy}"
@@ -568,15 +586,14 @@ test_configuration() {
 
     # Compress - use cigzip for all modes
     if [ "$TEST_MODE" = "dual" ]; then
-        # Special handling for automatic mode (selects both strategies internally)
-        if [ "$first_strategy" = "automatic" ]; then
-            echo "      [automatic] compress starting..." >&2
+        if [ $is_auto -eq 1 ]; then
+            echo "      [$first_strategy] compress starting..." >&2
             /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.bpaf" \
                 --type "$tp_type" --max-complexity "$MAX_COMPLEXITY" \
                 --complexity-metric "$COMPLEXITY_METRIC" --distance gap-affine --penalties 5,8,2 \
                 --strategy "$first_strategy" 2>&1 | \
                 tee "$OUTPUT_DIR/${key}_compress.log" >&2
-            echo "      [automatic] compress finished" >&2
+            echo "      [$first_strategy] compress finished" >&2
         else
             # Use cigzip with dual strategies (--strategy and --strategy-second)
             /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.bpaf" \
@@ -603,17 +620,19 @@ test_configuration() {
     COMPRESS_SIZE[$key]=$(file_size "$OUTPUT_DIR/${key}.bpaf")
 
     # Extract actual strategies from BPAF header using bpaf-view
-    local strategy_output=$("$REPO_DIR/target/release/bpaf-view" --strategies "$OUTPUT_DIR/${key}.bpaf" || echo "unknown	unknown")
-    read -r first_strat second_strat <<< "$strategy_output"
+    local strategy_output=$("$REPO_DIR/target/release/bpaf-view" --strategies "$OUTPUT_DIR/${key}.bpaf" || echo "unknown\tunknown\tunknown\tunknown")
+    read -r first_strat second_strat first_layer second_layer <<< "$strategy_output"
     STRATEGY_FIRST[$key]="$first_strat"
     STRATEGY_SECOND[$key]="$second_strat"
+    LAYER_FIRST[$key]="$first_layer"
+    LAYER_SECOND[$key]="$second_layer"
     
     # Decompress
-    if [ "$first_strategy" = "automatic" ]; then
-        echo "      [automatic] decompress starting..." >&2
+    if [ $is_auto -eq 1 ]; then
+        echo "      [$first_strategy] decompress starting..." >&2
         /usr/bin/time -v $CIGZIP decompress -i "$OUTPUT_DIR/${key}.bpaf" \
             -o "$OUTPUT_DIR/${key}_decomp.paf" 2>&1 | tee "$OUTPUT_DIR/${key}_decompress.log" >&2
-        echo "      [automatic] decompress finished" >&2
+        echo "      [$first_strategy] decompress finished" >&2
     else
         /usr/bin/time -v $CIGZIP decompress -i "$OUTPUT_DIR/${key}.bpaf" \
             -o "$OUTPUT_DIR/${key}_decomp.paf" 2>&1 | tee "$OUTPUT_DIR/${key}_decompress.log" >/dev/null
@@ -623,24 +642,24 @@ test_configuration() {
     DECOMPRESS_MEM[$key]=$(grep "Maximum resident set size" "$OUTPUT_DIR/${key}_decompress.log" | awk '{print $6}')
     
     # Verify
-    if [ "$first_strategy" = "automatic" ]; then
-        echo "      [automatic] normalize (orig) -> ${OUTPUT_DIR}/${key}_normalize_orig.txt" >&2
+    if [ $is_auto -eq 1 ]; then
+        echo "      [$first_strategy] normalize (orig) -> ${OUTPUT_DIR}/${key}_normalize_orig.txt" >&2
         if cat "$tp_paf" | $NORMALIZE > "$OUTPUT_DIR/${key}_normalize_orig.txt" 2> "$OUTPUT_DIR/${key}_normalize_orig.err"; then
-            echo "      [automatic] normalize (orig) done" >&2
+            echo "      [$first_strategy] normalize (orig) done" >&2
         else
-            echo "      [automatic] normalize (orig) failed" >&2
+            echo "      [$first_strategy] normalize (orig) failed" >&2
         fi
 
-        echo "      [automatic] normalize (decomp) -> ${OUTPUT_DIR}/${key}_normalize_decomp.txt" >&2
+        echo "      [$first_strategy] normalize (decomp) -> ${OUTPUT_DIR}/${key}_normalize_decomp.txt" >&2
         if cat "$OUTPUT_DIR/${key}_decomp.paf" | $NORMALIZE > "$OUTPUT_DIR/${key}_normalize_decomp.txt" 2> "$OUTPUT_DIR/${key}_normalize_decomp.err"; then
-            echo "      [automatic] normalize (decomp) done" >&2
+            echo "      [$first_strategy] normalize (decomp) done" >&2
         else
-            echo "      [automatic] normalize (decomp) failed" >&2
+            echo "      [$first_strategy] normalize (decomp) failed" >&2
         fi
 
         orig_md5=$(md5sum "$OUTPUT_DIR/${key}_normalize_orig.txt" | cut -d' ' -f1)
         decomp_md5=$(md5sum "$OUTPUT_DIR/${key}_normalize_decomp.txt" | cut -d' ' -f1)
-        echo "      [automatic] checksum compare: orig=$orig_md5 decomp=$decomp_md5" >&2
+        echo "      [$first_strategy] checksum compare: orig=$orig_md5 decomp=$decomp_md5" >&2
     else
         orig_md5=$(cat "$tp_paf" | $NORMALIZE | md5sum | cut -d' ' -f1)
         decomp_md5=$(cat "$OUTPUT_DIR/${key}_decomp.paf" | $NORMALIZE | md5sum | cut -d' ' -f1)
@@ -689,7 +708,7 @@ test_configuration() {
             echo "decomp=$OUTPUT_DIR/${key}_decomp.paf"
             echo "compress_log=$OUTPUT_DIR/${key}_compress.log"
             echo "decompress_log=$OUTPUT_DIR/${key}_decompress.log"
-            if [ "$first_strategy" = "automatic" ]; then
+            if [ $is_auto -eq 1 ]; then
                 echo "normalize_orig=$OUTPUT_DIR/${key}_normalize_orig.txt"
                 echo "normalize_decomp=$OUTPUT_DIR/${key}_normalize_decomp.txt"
             fi
@@ -703,7 +722,7 @@ test_configuration() {
     else
         # Cleanup on success
         rm -f "$OUTPUT_DIR/${key}_compress.log" "$OUTPUT_DIR/${key}_decompress.log" "$OUTPUT_DIR/${key}_decomp.paf"
-        if [ "$first_strategy" = "automatic" ]; then
+        if [ $is_auto -eq 1 ]; then
             rm -f "$OUTPUT_DIR/${key}_normalize_orig.txt" "$OUTPUT_DIR/${key}_normalize_orig.err" \
                   "$OUTPUT_DIR/${key}_normalize_decomp.txt" "$OUTPUT_DIR/${key}_normalize_decomp.err"
         fi
@@ -765,8 +784,8 @@ output_tsv_row() {
     # Dataset name from input file
     local dataset_name=$(basename "$INPUT_PAF" .paf.gz | sed 's/.paf$//')
 
-    # Output TSV row (30 columns - includes strategy_first and strategy_second)
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    # Output TSV row (32 columns - includes strategy/layer pairs)
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$dataset_name" \
         "$INPUT_TYPE" \
         "$SIZE" \
@@ -780,6 +799,8 @@ output_tsv_row() {
         "$strategy_label" \
         "${STRATEGY_FIRST[$key]}" \
         "${STRATEGY_SECOND[$key]}" \
+        "${LAYER_FIRST[$key]}" \
+        "${LAYER_SECOND[$key]}" \
         "$compress_time_sec" \
         "$compress_mem_mb" \
         "$bpaf_size_bytes" \
@@ -803,7 +824,7 @@ output_tsv_row() {
 # Initialize TSV file with header
 TSV_FILE="$OUTPUT_DIR/results.tsv"
 cat > "$TSV_FILE" << TSV_HEADER
-dataset_name	dataset_type	original_size_bytes	num_records	encoding_type	encoding_runtime_sec	encoding_memory_mb	tp_file_size_bytes	max_complexity	complexity_metric	compression_strategy	strategy_first	strategy_second	compression_runtime_sec	compression_memory_mb	bpaf_size_bytes	ratio_orig_to_tp	ratio_tp_to_bpaf	ratio_orig_to_bpaf	decompression_runtime_sec	decompression_memory_mb	verification_passed	seek_positions_tested	seek_iterations_per_position	seek_total_tests	seek_mode_a_avg_us	seek_mode_a_stddev_us	seek_mode_b_avg_us	seek_mode_b_stddev_us	seek_success_ratio
+dataset_name	dataset_type	original_size_bytes	num_records	encoding_type	encoding_runtime_sec	encoding_memory_mb	tp_file_size_bytes	max_complexity	complexity_metric	compression_strategy	strategy_first	strategy_second	layer_first	layer_second	compression_runtime_sec	compression_memory_mb	bpaf_size_bytes	ratio_orig_to_tp	ratio_tp_to_bpaf	ratio_orig_to_bpaf	decompression_runtime_sec	decompression_memory_mb	verification_passed	seek_positions_tested	seek_iterations_per_position	seek_total_tests	seek_mode_a_avg_us	seek_mode_a_stddev_us	seek_mode_b_avg_us	seek_mode_b_stddev_us	seek_success_ratio
 TSV_HEADER
 
 # Run all tests
@@ -814,10 +835,9 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
 
     if [ "$TEST_MODE" = "dual" ]; then
         # Test all first×second×layer combinations
-        LAYERS=("" "-bgzip" "-nocomp")
-        total_combos=$((${#BASE_STRATEGIES[@]} * ${#BASE_STRATEGIES[@]} * ${#LAYERS[@]}))
+        total_combos=$((${#BASE_STRATEGIES[@]} * ${#LAYER_SUFFIXES[@]} * ${#BASE_STRATEGIES[@]} * ${#LAYER_SUFFIXES[@]}))
         combo_count=0
-        echo "Testing $total_combos dual strategy combinations (${#BASE_STRATEGIES[@]} first × ${#BASE_STRATEGIES[@]} second × ${#LAYERS[@]} layers) with $THREADS threads..."
+        echo "Testing $total_combos dual strategy combinations ((${#BASE_STRATEGIES[@]} strategies × ${#LAYER_SUFFIXES[@]} layers)^2) with $THREADS threads..."
 
         # Function to run a single test (for parallel execution)
         run_test() {
@@ -839,13 +859,14 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
 
         # Run tests in parallel
         job_count=0
-        for LAYER in "${LAYERS[@]}"; do
-            for FIRST in "${BASE_STRATEGIES[@]}"; do
-                for SECOND in "${BASE_STRATEGIES[@]}"; do
-                    combo_count=$((combo_count + 1))
-                    FIRST_FULL="${FIRST}${LAYER}"
-                    SECOND_FULL="${SECOND}${LAYER}"
-                    TEMP_TSV="$TEMP_DIR/test_${combo_count}.tsv"
+        for LAYER_FIRST in "${LAYER_SUFFIXES[@]}"; do
+            for LAYER_SECOND in "${LAYER_SUFFIXES[@]}"; do
+                for FIRST in "${BASE_STRATEGIES[@]}"; do
+                    for SECOND in "${BASE_STRATEGIES[@]}"; do
+                        combo_count=$((combo_count + 1))
+                    FIRST_FULL="${FIRST}${LAYER_FIRST}"
+                    SECOND_FULL="${SECOND}${LAYER_SECOND}"
+                        TEMP_TSV="$TEMP_DIR/test_${combo_count}.tsv"
 
                     # Run test in background
                     run_test "$TP_TYPE" "$FIRST_FULL" "$SECOND_FULL" "$TEMP_TSV" &
@@ -857,6 +878,7 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
                         wait
                         echo "  Progress: $combo_count/$total_combos"
                     fi
+                done
                 done
             done
         done
@@ -872,24 +894,28 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
         # Clean up
         rm -rf "$TEMP_DIR"
 
-        # Also test automatic mode (which internally tests all 867 combinations and selects best)
+        # Also test automatic modes (which internally test every strategy×layer per stream and select best)
+        for auto_name in "${AUTO_STRATEGIES[@]}"; do
+            echo ""
+            echo "Testing ${auto_name} meta-strategy (selects best per stream from $((${#BASE_STRATEGIES[@]} * ${#LAYER_SUFFIXES[@]})) combinations)..."
+            test_configuration "$TP_TYPE" "$auto_name"
+
+            # Extract the strategies that automatic mode selected from the BPAF header
+            auto_bpaf="$OUTPUT_DIR/${TP_TYPE}_${auto_name}.bpaf"
+            selected_strategies=$("$REPO_DIR/target/release/bpaf-view" --strategies "$auto_bpaf")
+            first_selected=$(echo "$selected_strategies" | cut -f1)
+            second_selected=$(echo "$selected_strategies" | cut -f2)
+            first_layer_selected=$(echo "$selected_strategies" | cut -f3)
+            second_layer_selected=$(echo "$selected_strategies" | cut -f4)
+
+            echo "  → ${auto_name} selected: ${first_selected}[${first_layer_selected}] → ${second_selected}[${second_layer_selected}]"
+
+            # Output TSV row for the automatic run (metrics recorded under current key)
+            output_tsv_row "$TP_TYPE" "$auto_name"
+        done
+
         echo ""
-        echo "Testing automatic meta-strategy (selects best from 867 combinations)..."
-        test_configuration "$TP_TYPE" "automatic"
-
-        # Extract the strategies that automatic mode selected from the BPAF header
-        auto_bpaf="$OUTPUT_DIR/${TP_TYPE}_automatic.bpaf"
-        selected_strategies=$("$REPO_DIR/target/release/bpaf-view" --strategies "$auto_bpaf")
-        first_selected=$(echo "$selected_strategies" | cut -f1)
-        second_selected=$(echo "$selected_strategies" | cut -f2)
-
-        echo "  → Automatic selected: $first_selected → $second_selected"
-
-        # Output TSV row for the automatic run (metrics recorded under "automatic" key)
-        output_tsv_row "$TP_TYPE" "automatic"
-
-        echo ""
-        echo "✓ Completed 868 tests: 867 explicit dual combinations + 1 automatic"
+        echo "✓ Completed $((total_combos + ${#AUTO_STRATEGIES[@]})) tests: ${total_combos} explicit dual combinations + ${#AUTO_STRATEGIES[@]} automatic"
     else
         # Single mode: test each strategy symmetrically (first==second)
         for STRATEGY in "${STRATEGIES[@]}"; do
