@@ -4,7 +4,8 @@ use crate::binary::BINARY_MAGIC;
 use crate::{utils::*, Distance};
 use lib_tracepoints::{ComplexityMetric, TracepointData, TracepointType};
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
 /// Compression layer to use for final compression
 pub const BPAF_VERSION: u8 = 1;
@@ -17,6 +18,15 @@ pub enum CompressionLayer {
     Bgzip,
     /// No compression (store raw encoded data)
     Nocomp,
+}
+
+/// Open a BPAF file, validate its footer, and return the file, parsed header,
+/// and byte offset where the string table starts (immediately after the header).
+/// Use this for any BPAF open path to avoid duplicating header/footer validation.
+pub fn open_with_footer(path: &str) -> io::Result<(File, BinaryPafHeader, u64)> {
+    let mut file = File::open(path)?;
+    let (header, string_table_offset) = crate::binary::read_header_and_footer(&mut file)?;
+    Ok((file, header, string_table_offset))
 }
 
 impl CompressionLayer {
@@ -765,6 +775,181 @@ impl BinaryPafHeader {
             max_complexity,
             distance,
         })
+    }
+}
+
+// Footer to mark a fully written BPAF file. If a crash happens before this is
+// appended (or it is truncated), readers will reject the file.
+pub const BPAF_FOOTER_MAGIC: &[u8; 7] = b"BPAFEND";
+pub const BPAF_FOOTER_VERSION: u8 = 1;
+
+pub struct BinaryPafFooter {
+    pub(crate) num_records: u64,
+    pub(crate) num_strings: u64,
+}
+
+impl BinaryPafFooter {
+    pub fn new(num_records: u64, num_strings: u64) -> Self {
+        Self {
+            num_records,
+            num_strings,
+        }
+    }
+
+    /// Write footer as: [magic][version][num_records][num_strings][footer_len_le]
+    pub fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(BPAF_FOOTER_MAGIC);
+        buf.push(BPAF_FOOTER_VERSION);
+        write_varint(&mut buf, self.num_records)?;
+        write_varint(&mut buf, self.num_strings)?;
+
+        let footer_len: u32 = buf
+            .len()
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Footer too large"))?;
+
+        writer.write_all(&buf)?;
+        writer.write_all(&footer_len.to_le_bytes())?;
+        Ok(())
+    }
+
+    /// Read footer from the end of the file, returning an error if the footer
+    /// is missing or malformed.
+    pub fn read_from_end<R: Read + Seek>(reader: &mut R) -> io::Result<Self> {
+        let file_len = reader.seek(SeekFrom::End(0))?;
+        if file_len < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "File too small to contain BPAF footer length",
+            ));
+        }
+
+        reader.seek(SeekFrom::End(-4))?;
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf)?;
+        let footer_len = u32::from_le_bytes(len_buf) as u64;
+
+        if footer_len + 4 > file_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid BPAF footer length",
+            ));
+        }
+
+        let back = i64::try_from(footer_len + 4).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "BPAF footer length does not fit in i64",
+            )
+        })?;
+        reader.seek(SeekFrom::End(-back))?;
+
+        let mut buf = vec![0u8; footer_len as usize];
+        reader.read_exact(&mut buf)?;
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let mut magic = [0u8; BPAF_FOOTER_MAGIC.len()];
+        cursor.read_exact(&mut magic)?;
+        if magic != *BPAF_FOOTER_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Missing BPAF footer magic",
+            ));
+        }
+
+        let mut version = [0u8; 1];
+        cursor.read_exact(&mut version)?;
+        if version[0] != BPAF_FOOTER_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unsupported BPAF footer version: {}", version[0]),
+            ));
+        }
+
+        let num_records = read_varint(&mut cursor)?;
+        let num_strings = read_varint(&mut cursor)?;
+
+        Ok(Self {
+            num_records,
+            num_strings,
+        })
+    }
+
+    pub fn validate_against(&self, header: &BinaryPafHeader) -> io::Result<()> {
+        if self.num_records != header.num_records {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Footer/header record mismatch: header={}, footer={}",
+                    header.num_records, self.num_records
+                ),
+            ));
+        }
+        if self.num_strings != header.num_strings {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Footer/header string mismatch: header={}, footer={}",
+                    header.num_strings, self.num_strings
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod footer_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn footer_roundtrip() {
+        let footer = BinaryPafFooter::new(10, 5);
+        let mut data = Vec::new();
+        footer.write(&mut data).unwrap();
+        let mut cursor = Cursor::new(data);
+        let read_back = BinaryPafFooter::read_from_end(&mut cursor).unwrap();
+        assert_eq!(read_back.num_records, 10);
+        assert_eq!(read_back.num_strings, 5);
+    }
+
+    #[test]
+    fn open_with_footer_validates() {
+        // Build a minimal fake file: header (magic + fixed bytes), string table (empty), footer.
+        // Header layout: magic(4) + version(1) + first_layer(1) + second_layer(1)
+        // + first_strategy(1) + second_strategy(1) + num_records(varint)
+        // + num_strings(varint) + tp_type(1) + complexity_metric(1)
+        // + max_complexity(varint) + distance (Distance::Edit = 0)
+        let mut file_bytes = Vec::new();
+        file_bytes.extend_from_slice(BINARY_MAGIC);
+        file_bytes.push(BPAF_VERSION);
+        // layers
+        file_bytes.push(CompressionLayer::Zstd.to_u8());
+        file_bytes.push(CompressionLayer::Zstd.to_u8());
+        // strategies
+        file_bytes.push(CompressionStrategy::Raw(3).to_code());
+        file_bytes.push(CompressionStrategy::Raw(3).to_code());
+        // num_records / num_strings
+        write_varint(&mut file_bytes, 1).unwrap();
+        write_varint(&mut file_bytes, 0).unwrap();
+        // tracepoint type + complexity metric
+        file_bytes.push(TracepointType::Standard.to_u8());
+        file_bytes.push(ComplexityMetric::EditDistance.to_u8());
+        // max_complexity
+        write_varint(&mut file_bytes, 0).unwrap();
+        // distance: Distance::Edit serialized by write_distance
+        write_distance(&mut file_bytes, &Distance::Edit).unwrap();
+
+        // string table is empty
+
+        // footer
+        let footer = BinaryPafFooter::new(1, 0);
+        footer.write(&mut file_bytes).unwrap();
+
+        let mut cursor = Cursor::new(file_bytes);
+        let (_header, _pos) = crate::binary::read_header_and_footer(&mut cursor).unwrap();
     }
 }
 

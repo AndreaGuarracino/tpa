@@ -1,6 +1,8 @@
 mod binary;
 mod format;
 mod hybrids;
+mod index;
+mod reader;
 /// Binary PAF format for efficient storage of sequence alignments with tracepoints
 ///
 /// Format: [Header] → [StringTable] → [Records]
@@ -26,19 +28,14 @@ pub use format::{
 };
 pub use lib_tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 
-use crate::format::{parse_tag, BPAF_VERSION};
+use crate::format::{parse_tag, open_with_footer, BinaryPafFooter};
 use crate::utils::{parse_u8, parse_usize};
 
-pub use binary::{
-    build_index,
-    read_mixed_tracepoints_at_offset,
-    // Standalone functions for ultimate performance
-    read_standard_tracepoints_at_offset,
-    read_variable_tracepoints_at_offset,
-    BpafIndex,
-    BpafReader,
-    RecordIterator,
-    BINARY_MAGIC,
+pub use binary::BINARY_MAGIC;
+pub use index::{build_index, BpafIndex};
+pub use reader::{
+    read_mixed_tracepoints_at_offset, read_standard_tracepoints_at_offset,
+    read_variable_tracepoints_at_offset, BpafReader, RecordIterator,
 };
 
 // Re-export utility functions for external tools
@@ -177,13 +174,14 @@ pub fn compress_paf_with_tracepoints(
 ///
 /// # Example
 /// ```no_run
-/// use lib_bpaf::{compress_paf_with_tracepoints_dual, CompressionStrategy, TracepointType, ComplexityMetric, Distance};
+/// use lib_bpaf::{compress_paf_with_tracepoints_dual, CompressionLayer, CompressionStrategy, TracepointType, ComplexityMetric, Distance};
 ///
 /// compress_paf_with_tracepoints_dual(
 ///     "input.paf",
 ///     "output.bpaf",
 ///     CompressionStrategy::Raw(3),
 ///     CompressionStrategy::ZigzagDelta(3),
+///     CompressionLayer::Zstd,
 ///     TracepointType::Standard,
 ///     32,
 ///     ComplexityMetric::EditDistance,
@@ -219,22 +217,8 @@ pub fn compress_paf_with_tracepoints_dual(
 pub fn decompress_bpaf(input_path: &str, output_path: &str) -> io::Result<()> {
     info!("Decompressing {} to text format...", input_path);
 
-    let input = File::open(input_path).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("Failed to open input file '{}': {}", input_path, e),
-        )
-    })?;
-    let mut reader = BufReader::new(input);
-
-    let header = BinaryPafHeader::read(&mut reader)?;
-
-    if header.version != BPAF_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Unsupported format version: {}", header.version),
-        ));
-    }
+    let (input, header, _after_header_pos) = open_with_footer(input_path)?;
+    let reader = BufReader::new(input);
 
     let strategy = header.strategy()?;
     info!(
@@ -403,6 +387,12 @@ fn compress_paf(
         )?;
     }
     writer.flush()?;
+    drop(writer);
+
+    // Append footer to mark the file as complete
+    let footer = BinaryPafFooter::new(record_count, string_table.len() as u64);
+    footer.write(&mut output)?;
+    output.sync_all()?;
 
     info!(
         "Compressed {} records ({} unique sequence names) with {} strategy",

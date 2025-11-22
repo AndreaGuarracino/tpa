@@ -1,12 +1,11 @@
 //! Binary I/O operations for BPAF format
 
-use lib_tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
+use lib_tracepoints::{MixedRepresentation, TracepointData, TracepointType};
 use log::{debug, info};
 use rayon::prelude::*;
 use std::convert::TryFrom;
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 
 use crate::ensure_tracepoints;
 use crate::format::*;
@@ -129,25 +128,6 @@ fn delta_decode(deltas: &[i64]) -> Vec<u64> {
 #[allow(dead_code)]
 fn encode_zigzag(val: i64) -> u64 {
     ((val << 1) ^ (val >> 63)) as u64
-}
-
-/// Helper function to encode varint inline (same as utils::encode_varint)
-#[inline]
-#[allow(dead_code)]
-fn encode_varint_inline(mut value: u64) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    loop {
-        let mut byte = (value & 0x7F) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        bytes.push(byte);
-        if value == 0 {
-            break;
-        }
-    }
-    bytes
 }
 
 pub(crate) struct SmartDualAnalyzer {
@@ -649,7 +629,7 @@ pub(crate) fn decompress_varint<R: Read>(
     Ok(())
 }
 
-fn read_record<R: Read>(
+pub(crate) fn read_record<R: Read>(
     reader: &mut R,
     strategy: CompressionStrategy,
     tp_type: TracepointType,
@@ -695,7 +675,7 @@ fn read_record<R: Read>(
     })
 }
 
-fn read_tracepoints<R: Read>(
+pub(crate) fn read_tracepoints<R: Read>(
     reader: &mut R,
     tp_type: TracepointType,
     strategy: CompressionStrategy,
@@ -729,6 +709,149 @@ fn read_tracepoints<R: Read>(
             Ok(TracepointData::Mixed(items))
         }
     }
+}
+
+// ============================================================================
+// SHARED HELPERS (HEADER/FOOTER, TRACEPOINTS, SKIPS)
+// ============================================================================
+
+/// Read header, validate footer, and reset position to just after the header.
+pub(crate) fn read_header_and_footer<R: Read + Seek>(
+    reader: &mut R,
+) -> io::Result<(BinaryPafHeader, u64)> {
+    let header = BinaryPafHeader::read(reader)?;
+    if header.version != BPAF_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unsupported format version: {}", header.version),
+        ));
+    }
+
+    let after_header = reader.stream_position()?;
+    let footer = BinaryPafFooter::read_from_end(reader)?;
+    footer.validate_against(&header)?;
+    reader.seek(SeekFrom::Start(after_header))?;
+    Ok((header, after_header))
+}
+
+/// Decode tracepoints from a known offset (seeks before reading).
+pub(crate) fn read_tracepoints_at_offset<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+    tp_type: TracepointType,
+    strategy: CompressionStrategy,
+    first_layer: CompressionLayer,
+    second_layer: CompressionLayer,
+) -> io::Result<TracepointData> {
+    reader.seek(SeekFrom::Start(offset))?;
+    read_tracepoints(reader, tp_type, strategy, first_layer, second_layer)
+}
+
+/// Skip over a record without allocating.
+pub(crate) fn skip_record<R: Read + Seek>(
+    reader: &mut R,
+    tp_type: TracepointType,
+) -> io::Result<()> {
+    read_varint(reader)?; // query_name_id
+    read_varint(reader)?; // query_start
+    read_varint(reader)?; // query_end
+    reader.seek(SeekFrom::Current(1))?; // strand
+    read_varint(reader)?; // target_name_id
+    read_varint(reader)?; // target_start
+    read_varint(reader)?; // target_end
+    read_varint(reader)?; // residue_matches
+    read_varint(reader)?; // alignment_block_len
+    reader.seek(SeekFrom::Current(1))?; // mapping_quality
+
+    skip_tracepoints(reader, tp_type)?;
+
+    // Skip tags
+    let num_tags = read_varint(reader)? as usize;
+    for _ in 0..num_tags {
+        reader.seek(SeekFrom::Current(2))?; // key
+        let mut tag_type = [0u8; 1];
+        reader.read_exact(&mut tag_type)?;
+        match tag_type[0] {
+            b'i' => reader.seek(SeekFrom::Current(4))?,
+            b'f' => reader.seek(SeekFrom::Current(4))?,
+            b'Z' => {
+                let len = read_varint(reader)? as usize;
+                reader.seek(SeekFrom::Current(len as i64))?
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Invalid tag type: '{}' (byte: {})",
+                        tag_type[0] as char, tag_type[0]
+                    ),
+                ))
+            }
+        };
+    }
+
+    Ok(())
+}
+
+fn skip_tracepoints<R: Read + Seek>(reader: &mut R, tp_type: TracepointType) -> io::Result<()> {
+    let num_items = read_varint(reader)? as usize;
+    match tp_type {
+        TracepointType::Standard | TracepointType::Fastga => {
+            // Read first_len and skip first_data
+            let first_len = read_varint(reader)?;
+            let first_len = i64::try_from(first_len).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Compressed block too large to skip",
+                )
+            })?;
+            reader.seek(SeekFrom::Current(first_len))?;
+
+            // Read second_len and skip second_data
+            let second_len = read_varint(reader)?;
+            let second_len = i64::try_from(second_len).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Compressed block too large to skip",
+                )
+            })?;
+            reader.seek(SeekFrom::Current(second_len))?;
+        }
+        TracepointType::Variable => {
+            for _ in 0..num_items {
+                read_varint(reader)?;
+                let mut flag = [0u8; 1];
+                reader.read_exact(&mut flag)?;
+                if flag[0] == 1 {
+                    read_varint(reader)?;
+                }
+            }
+        }
+        TracepointType::Mixed => {
+            for _ in 0..num_items {
+                let mut item_type = [0u8; 1];
+                reader.read_exact(&mut item_type)?;
+                match item_type[0] {
+                    0 => {
+                        read_varint(reader)?;
+                        read_varint(reader)?;
+                    }
+                    1 => {
+                        read_varint(reader)?;
+                        let mut op = [0u8; 1];
+                        reader.read_exact(&mut op)?;
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Invalid mixed item type",
+                        ))
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -1752,7 +1875,7 @@ fn safe_signed_add(base: i64, delta: i64) -> io::Result<i64> {
 
 /// Standard/Fastga tracepoint decoding
 #[inline(always)]
-fn decode_standard_tracepoints<R: Read>(
+pub(crate) fn decode_standard_tracepoints<R: Read>(
     reader: &mut R,
     num_items: usize,
     strategy: CompressionStrategy,
@@ -2110,7 +2233,7 @@ fn decode_standard_tracepoints<R: Read>(
 
 /// Variable tracepoint decoding (only raw varints)
 #[inline(always)]
-fn decode_variable_tracepoints<R: Read>(
+pub(crate) fn decode_variable_tracepoints<R: Read>(
     reader: &mut R,
     num_items: usize,
 ) -> io::Result<Vec<(usize, Option<usize>)>> {
@@ -2131,7 +2254,7 @@ fn decode_variable_tracepoints<R: Read>(
 
 /// Mixed tracepoint decoding (only raw varints)
 #[inline(always)]
-fn decode_mixed_tracepoints<R: Read>(
+pub(crate) fn decode_mixed_tracepoints<R: Read>(
     reader: &mut R,
     num_items: usize,
 ) -> io::Result<Vec<MixedRepresentation>> {
@@ -2371,455 +2494,5 @@ mod compression_tests {
         let h = encode_tracepoint_values(&empty, CompressionStrategy::Huffman(3)).unwrap();
         assert!(r.is_empty());
         assert!(h.is_empty());
-    }
-}
-
-// ============================================================================
-// RANDOM ACCESS
-// ============================================================================
-
-pub struct BpafIndex {
-    /// File offset for each record (byte position in .bpaf file)
-    offsets: Vec<u64>,
-}
-
-impl BpafIndex {
-    const INDEX_MAGIC: &'static [u8; 4] = b"BPAI";
-
-    /// Save index to .bpaf.idx file
-    pub fn save(&self, idx_path: &str) -> io::Result<()> {
-        let mut file = File::create(idx_path)?;
-
-        file.write_all(Self::INDEX_MAGIC)?;
-        file.write_all(&[1u8])?; // Version 1
-
-        write_varint(&mut file, self.offsets.len() as u64)?;
-
-        for &offset in &self.offsets {
-            write_varint(&mut file, offset)?;
-        }
-
-        Ok(())
-    }
-
-    /// Load index from .bpaf.idx file
-    pub fn load(idx_path: &str) -> io::Result<Self> {
-        let file = File::open(idx_path)?;
-        let mut reader = BufReader::new(file);
-
-        let mut magic = [0u8; 4];
-        reader.read_exact(&mut magic)?;
-        if &magic != Self::INDEX_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid index magic",
-            ));
-        }
-
-        let mut version = [0u8; 1];
-        reader.read_exact(&mut version)?;
-        if version[0] != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Unsupported index version: {}", version[0]),
-            ));
-        }
-
-        let num_offsets = read_varint(&mut reader)? as usize;
-
-        let mut offsets = Vec::with_capacity(num_offsets);
-        for _ in 0..num_offsets {
-            offsets.push(read_varint(&mut reader)?);
-        }
-
-        Ok(Self { offsets })
-    }
-
-    /// Get number of records in index
-    pub fn len(&self) -> usize {
-        self.offsets.len()
-    }
-
-    /// Check if index is empty
-    pub fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
-    }
-
-    /// Get offset for a specific record ID
-    pub fn get_offset(&self, record_id: u64) -> Option<u64> {
-        self.offsets.get(record_id as usize).copied()
-    }
-}
-
-pub fn build_index(bpaf_path: &str) -> io::Result<BpafIndex> {
-    info!("Building index for {}", bpaf_path);
-
-    let file = File::open(bpaf_path)?;
-    let mut reader = BufReader::with_capacity(131072, file);
-
-    let header = BinaryPafHeader::read(&mut reader)?;
-    if header.version != BPAF_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Unsupported format version: {}", header.version),
-        ));
-    }
-    StringTable::read(&mut reader, header.num_strings)?;
-
-    let mut offsets = Vec::with_capacity(header.num_records as usize);
-    for _ in 0..header.num_records {
-        offsets.push(reader.stream_position()?);
-        skip_record(&mut reader, header.tracepoint_type)?;
-    }
-
-    info!("Index built: {} records", offsets.len());
-    Ok(BpafIndex { offsets })
-}
-
-#[inline]
-fn skip_record<R: Read + Seek>(reader: &mut R, tp_type: TracepointType) -> io::Result<()> {
-    read_varint(reader)?; // query_name_id
-    read_varint(reader)?; // query_start
-    read_varint(reader)?; // query_end
-    reader.seek(SeekFrom::Current(1))?; // strand
-    read_varint(reader)?; // target_name_id
-    read_varint(reader)?; // target_start
-    read_varint(reader)?; // target_end
-    read_varint(reader)?; // residue_matches
-    read_varint(reader)?; // alignment_block_len
-    reader.seek(SeekFrom::Current(1))?; // mapping_quality
-
-    skip_tracepoints(reader, tp_type)?;
-
-    // Skip tags
-    let num_tags = read_varint(reader)? as usize;
-    for _ in 0..num_tags {
-        reader.seek(SeekFrom::Current(2))?; // key
-        let mut tag_type = [0u8; 1];
-        reader.read_exact(&mut tag_type)?;
-        match tag_type[0] {
-            b'i' => reader.seek(SeekFrom::Current(4))?,
-            b'f' => reader.seek(SeekFrom::Current(4))?,
-            b'Z' => {
-                let len = read_varint(reader)? as usize;
-                reader.seek(SeekFrom::Current(len as i64))?
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Invalid tag type: '{}' (byte: {})",
-                        tag_type[0] as char, tag_type[0]
-                    ),
-                ))
-            }
-        };
-    }
-
-    Ok(())
-}
-
-fn skip_tracepoints<R: Read + Seek>(reader: &mut R, tp_type: TracepointType) -> io::Result<()> {
-    let num_items = read_varint(reader)? as usize;
-    match tp_type {
-        TracepointType::Standard | TracepointType::Fastga => {
-            // Read first_len and skip first_data
-            let first_len = read_varint(reader)?;
-            let first_len = i64::try_from(first_len).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Compressed block too large to skip",
-                )
-            })?;
-            reader.seek(SeekFrom::Current(first_len))?;
-
-            // Read second_len and skip second_data
-            let second_len = read_varint(reader)?;
-            let second_len = i64::try_from(second_len).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Compressed block too large to skip",
-                )
-            })?;
-            reader.seek(SeekFrom::Current(second_len))?;
-        }
-        TracepointType::Variable => {
-            for _ in 0..num_items {
-                read_varint(reader)?;
-                let mut flag = [0u8; 1];
-                reader.read_exact(&mut flag)?;
-                if flag[0] == 1 {
-                    read_varint(reader)?;
-                }
-            }
-        }
-        TracepointType::Mixed => {
-            for _ in 0..num_items {
-                let mut item_type = [0u8; 1];
-                reader.read_exact(&mut item_type)?;
-                match item_type[0] {
-                    0 => {
-                        read_varint(reader)?;
-                        read_varint(reader)?;
-                    }
-                    1 => {
-                        read_varint(reader)?;
-                        let mut op = [0u8; 1];
-                        reader.read_exact(&mut op)?;
-                    }
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Invalid mixed item type",
-                        ))
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-pub struct BpafReader {
-    file: File,
-    index: BpafIndex,
-    header: BinaryPafHeader,
-    string_table: StringTable,
-}
-
-impl BpafReader {
-    /// Open a BPAF file with index (builds index if .bpaf.idx doesn't exist)
-    pub fn open(bpaf_path: &str) -> io::Result<Self> {
-        let idx_path = format!("{}.idx", bpaf_path);
-
-        let index = if Path::new(&idx_path).exists() {
-            debug!("Loading existing index: {}", idx_path);
-            BpafIndex::load(&idx_path)?
-        } else {
-            info!("No index found, building...");
-            let idx = build_index(bpaf_path)?;
-            idx.save(&idx_path)?;
-            debug!("Index saved to {}", idx_path);
-            idx
-        };
-
-        let mut file = File::open(bpaf_path)?;
-        let header = BinaryPafHeader::read(&mut file)?;
-        if header.version != BPAF_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Unsupported format version: {}", header.version),
-            ));
-        }
-
-        let string_table = StringTable::new();
-
-        Ok(Self {
-            file,
-            index,
-            header,
-            string_table,
-        })
-    }
-
-    /// Get number of records
-    pub fn len(&self) -> usize {
-        self.index.len()
-    }
-
-    /// Check if reader is empty
-    pub fn is_empty(&self) -> bool {
-        self.index.is_empty()
-    }
-
-    /// Get header information
-    pub fn header(&self) -> &BinaryPafHeader {
-        &self.header
-    }
-
-    /// Get string table (loads on first access if needed)
-    pub fn string_table(&mut self) -> io::Result<&StringTable> {
-        if self.string_table.is_empty() {
-            self.load_string_table()?;
-        }
-        Ok(&self.string_table)
-    }
-
-    /// Load string table (call this if you need sequence names)
-    pub fn load_string_table(&mut self) -> io::Result<()> {
-        if !self.string_table.is_empty() {
-            return Ok(());
-        }
-
-        self.file.seek(SeekFrom::Start(0))?;
-        let header = BinaryPafHeader::read(&mut self.file)?;
-        self.string_table = StringTable::read(&mut self.file, header.num_strings())?;
-        Ok(())
-    }
-
-    /// Get immutable reference to string table (must be loaded first with load_string_table)
-    pub fn string_table_ref(&self) -> &StringTable {
-        &self.string_table
-    }
-
-    /// Get full alignment record by ID - O(1) random access
-    pub fn get_alignment_record(&mut self, record_id: u64) -> io::Result<AlignmentRecord> {
-        let offset = self.index.offsets[record_id as usize];
-        self.get_alignment_record_at_offset(offset)
-    }
-
-    /// Get alignment record by file offset (for impg compatibility)
-    pub fn get_alignment_record_at_offset(&mut self, offset: u64) -> io::Result<AlignmentRecord> {
-        self.file.seek(SeekFrom::Start(offset))?;
-
-        // Read with strategy from header
-        let strategy = self.header.strategy()?;
-        read_record(
-            &mut self.file,
-            strategy,
-            self.header.tracepoint_type,
-            self.header.first_layer,
-            self.header.second_layer,
-        )
-    }
-
-    /// Get tracepoints by record ID
-    pub fn get_tracepoints(
-        &mut self,
-        record_id: u64,
-    ) -> io::Result<(TracepointData, ComplexityMetric, u64)> {
-        let tracepoint_offset = self.get_tracepoint_offset(record_id)?;
-        self.get_tracepoints_at_offset(tracepoint_offset)
-    }
-
-    /// Get tracepoint offset by record ID
-    /// Returns the byte offset where tracepoint data starts within the record
-    pub fn get_tracepoint_offset(&mut self, record_id: u64) -> io::Result<u64> {
-        let record_offset = self.index.offsets[record_id as usize];
-        self.file.seek(SeekFrom::Start(record_offset))?;
-
-        // Skip 7 varints + 2 single bytes to reach tracepoint data
-        read_varint(&mut self.file)?; // query_name_id
-        read_varint(&mut self.file)?; // query_start
-        read_varint(&mut self.file)?; // query_end
-        self.file.seek(SeekFrom::Current(1))?; // strand
-        read_varint(&mut self.file)?; // target_name_id
-        read_varint(&mut self.file)?; // target_start
-        read_varint(&mut self.file)?; // target_end
-        read_varint(&mut self.file)?; // residue_matches
-        read_varint(&mut self.file)?; // alignment_block_len
-        self.file.seek(SeekFrom::Current(1))?; // mapping_quality
-
-        self.file.stream_position()
-    }
-
-    /// Get tracepoints by tracepoint offset
-    /// Seeks directly to tracepoint data within a record
-    pub fn get_tracepoints_at_offset(
-        &mut self,
-        tracepoint_offset: u64,
-    ) -> io::Result<(TracepointData, ComplexityMetric, u64)> {
-        self.file.seek(SeekFrom::Start(tracepoint_offset))?;
-
-        let tp_type = self.header.tracepoint_type;
-        let complexity_metric = self.header.complexity_metric;
-        let max_complexity = self.header.max_complexity;
-
-        // Read tracepoints with strategy from header
-        let strategy = self.header.strategy()?;
-        let tracepoints = read_tracepoints(
-            &mut self.file,
-            tp_type,
-            strategy,
-            self.header.first_layer,
-            self.header.second_layer,
-        )?;
-
-        Ok((tracepoints, complexity_metric, max_complexity))
-    }
-
-    /// Iterator over all records (sequential access)
-    pub fn iter_records(&mut self) -> RecordIterator<'_> {
-        RecordIterator {
-            reader: self,
-            current_id: 0,
-        }
-    }
-}
-
-// ============================================================================
-// STANDALONE FUNCTIONS (NO BPAFREADER OVERHEAD)
-// ============================================================================
-
-/// Fastest access: decode standard tracepoints directly from file at offset.
-/// Requires pre-computed offset and compression strategy.
-#[inline]
-pub fn read_standard_tracepoints_at_offset<R: Read + Seek>(
-    file: &mut R,
-    offset: u64,
-    strategy: CompressionStrategy,
-    first_layer: CompressionLayer,
-    second_layer: CompressionLayer,
-) -> io::Result<Vec<(usize, usize)>> {
-    file.seek(SeekFrom::Start(offset))?;
-    // Buffer small reads (varints + compressed block lengths)
-    let mut buffered = BufReader::with_capacity(64, file);
-    let num_items = read_varint(&mut buffered)? as usize;
-    if num_items == 0 {
-        panic!("Encountered tracepoint block with zero entries");
-    }
-    decode_standard_tracepoints(
-        &mut buffered,
-        num_items,
-        strategy,
-        first_layer,
-        second_layer,
-    )
-}
-
-/// Fastest access: decode variable tracepoints directly from file at offset.
-/// Requires pre-computed offset.
-#[inline]
-pub fn read_variable_tracepoints_at_offset<R: Read + Seek>(
-    file: &mut R,
-    offset: u64,
-) -> io::Result<Vec<(usize, Option<usize>)>> {
-    file.seek(SeekFrom::Start(offset))?;
-    // Buffer small reads (varints + compressed block lengths)
-    let mut buffered = BufReader::with_capacity(64, file);
-    let num_items = read_varint(&mut buffered)? as usize;
-    decode_variable_tracepoints(&mut buffered, num_items)
-}
-
-/// Fastest access: decode mixed tracepoints directly from file at offset.
-/// Requires pre-computed offset.
-#[inline]
-pub fn read_mixed_tracepoints_at_offset<R: Read + Seek>(
-    file: &mut R,
-    offset: u64,
-) -> io::Result<Vec<MixedRepresentation>> {
-    file.seek(SeekFrom::Start(offset))?;
-    // Buffer small reads (varints + compressed block lengths)
-    let mut buffered = BufReader::with_capacity(64, file);
-    let num_items = read_varint(&mut buffered)? as usize;
-    decode_mixed_tracepoints(&mut buffered, num_items)
-}
-
-pub struct RecordIterator<'a> {
-    reader: &'a mut BpafReader,
-    current_id: u64,
-}
-
-impl<'a> Iterator for RecordIterator<'a> {
-    type Item = io::Result<AlignmentRecord>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current_id >= self.reader.len() as u64 {
-            return None;
-        }
-
-        let result = self.reader.get_alignment_record(self.current_id);
-        self.current_id += 1;
-        Some(result)
     }
 }
