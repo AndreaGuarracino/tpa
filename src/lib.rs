@@ -99,6 +99,18 @@ pub fn compress_paf_with_cigar(
     )
 }
 
+fn make_dual_strategy(
+    first_strategy: CompressionStrategy,
+    second_strategy: CompressionStrategy,
+) -> CompressionStrategy {
+    let zstd_level = first_strategy.zstd_level();
+    CompressionStrategy::Dual(
+        Box::new(first_strategy),
+        Box::new(second_strategy),
+        zstd_level,
+    )
+}
+
 pub fn compress_paf_with_cigar_dual(
     input_path: &str,
     output_path: &str,
@@ -110,38 +122,7 @@ pub fn compress_paf_with_cigar_dual(
     complexity_metric: ComplexityMetric,
     distance: Distance,
 ) -> io::Result<()> {
-    // Extract zstd level from first strategy
-    let zstd_level = match &first_strategy {
-        CompressionStrategy::Raw(lvl)
-        | CompressionStrategy::ZigzagDelta(lvl)
-        | CompressionStrategy::TwoDimDelta(lvl)
-        | CompressionStrategy::RunLength(lvl)
-        | CompressionStrategy::BitPacked(lvl)
-        | CompressionStrategy::DeltaOfDelta(lvl)
-        | CompressionStrategy::FrameOfReference(lvl)
-        | CompressionStrategy::HybridRLE(lvl)
-        | CompressionStrategy::OffsetJoint(lvl)
-        | CompressionStrategy::XORDelta(lvl)
-        | CompressionStrategy::Dictionary(lvl)
-        | CompressionStrategy::Simple8(lvl)
-        | CompressionStrategy::StreamVByte(lvl)
-        | CompressionStrategy::FastPFOR(lvl)
-        | CompressionStrategy::Cascaded(lvl)
-        | CompressionStrategy::Simple8bFull(lvl)
-        | CompressionStrategy::SelectiveRLE(lvl)
-        | CompressionStrategy::Rice(lvl)
-        | CompressionStrategy::Huffman(lvl) => *lvl,
-        CompressionStrategy::Dual(_, _, lvl) => *lvl,
-        CompressionStrategy::AutomaticFast(lvl) => *lvl,
-        CompressionStrategy::AutomaticSlow(lvl) => *lvl,
-    };
-
-    // Create Dual strategy
-    let dual_strategy = CompressionStrategy::Dual(
-        Box::new(first_strategy),
-        Box::new(second_strategy),
-        zstd_level,
-    );
+    let dual_strategy = make_dual_strategy(first_strategy, second_strategy);
 
     compress_paf(
         input_path,
@@ -220,38 +201,7 @@ pub fn compress_paf_with_tracepoints_dual(
     complexity_metric: ComplexityMetric,
     distance: Distance,
 ) -> io::Result<()> {
-    // Extract zstd level from first strategy (both should have same level in practice)
-    let zstd_level = match &first_strategy {
-        CompressionStrategy::Raw(lvl)
-        | CompressionStrategy::ZigzagDelta(lvl)
-        | CompressionStrategy::TwoDimDelta(lvl)
-        | CompressionStrategy::RunLength(lvl)
-        | CompressionStrategy::BitPacked(lvl)
-        | CompressionStrategy::DeltaOfDelta(lvl)
-        | CompressionStrategy::FrameOfReference(lvl)
-        | CompressionStrategy::HybridRLE(lvl)
-        | CompressionStrategy::OffsetJoint(lvl)
-        | CompressionStrategy::XORDelta(lvl)
-        | CompressionStrategy::Dictionary(lvl)
-        | CompressionStrategy::Simple8(lvl)
-        | CompressionStrategy::StreamVByte(lvl)
-        | CompressionStrategy::FastPFOR(lvl)
-        | CompressionStrategy::Cascaded(lvl)
-        | CompressionStrategy::Simple8bFull(lvl)
-        | CompressionStrategy::SelectiveRLE(lvl)
-        | CompressionStrategy::Rice(lvl)
-        | CompressionStrategy::Huffman(lvl) => *lvl,
-        CompressionStrategy::Dual(_, _, lvl) => *lvl,
-        CompressionStrategy::AutomaticFast(lvl) => *lvl,
-        CompressionStrategy::AutomaticSlow(lvl) => *lvl,
-    };
-
-    // Create Dual strategy
-    let dual_strategy = CompressionStrategy::Dual(
-        Box::new(first_strategy),
-        Box::new(second_strategy),
-        zstd_level,
-    );
+    let dual_strategy = make_dual_strategy(first_strategy, second_strategy);
 
     compress_paf(
         input_path,
@@ -334,6 +284,35 @@ fn compress_paf(
         _ => None,
     };
 
+    let parse_record =
+        |line: &str, line_num: usize, table: &mut StringTable| -> Option<AlignmentRecord> {
+            let record = if use_cigar {
+                parse_paf_with_cigar(
+                    line,
+                    table,
+                    tp_type,
+                    max_complexity as usize,
+                    &complexity_metric,
+                )
+            } else {
+                parse_paf_with_tracepoints(
+                    line,
+                    table,
+                    tp_type,
+                    max_complexity as usize,
+                    &complexity_metric,
+                )
+            };
+
+            match record {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    warn!("Skipping malformed line {}: {}", line_num + 1, e);
+                    None
+                }
+            }
+        };
+
     let input = open_paf_reader(input_path)?;
     for (line_num, line_result) in input.lines().enumerate() {
         let line = line_result?;
@@ -341,30 +320,8 @@ fn compress_paf(
             continue;
         }
 
-        let record = if use_cigar {
-            parse_paf_with_cigar(
-                &line,
-                &mut string_table,
-                tp_type,
-                max_complexity as usize,
-                &complexity_metric,
-            )
-        } else {
-            parse_paf_with_tracepoints(
-                &line,
-                &mut string_table,
-                tp_type,
-                max_complexity as usize,
-                &complexity_metric,
-            )
-        };
-
-        let record = match record {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("Skipping malformed line {}: {}", line_num + 1, e);
-                continue;
-            }
+        let Some(record) = parse_record(&line, line_num, &mut string_table) else {
+            continue;
         };
 
         if let Some(an) = analyzer.as_mut() {
@@ -433,30 +390,8 @@ fn compress_paf(
             continue;
         }
 
-        let record = if use_cigar {
-            parse_paf_with_cigar(
-                &line,
-                &mut string_table,
-                tp_type,
-                max_complexity as usize,
-                &complexity_metric,
-            )
-        } else {
-            parse_paf_with_tracepoints(
-                &line,
-                &mut string_table,
-                tp_type,
-                max_complexity as usize,
-                &complexity_metric,
-            )
-        };
-
-        let record = match record {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("Skipping malformed line {}: {}", line_num + 1, e);
-                continue;
-            }
+        let Some(record) = parse_record(&line, line_num, &mut string_table) else {
+            continue;
         };
 
         // Write with chosen strategy and layer
@@ -625,59 +560,56 @@ fn parse_paf(
     })
 }
 
-fn parse_tracepoints(tp_str: &str, tp_type: TracepointType) -> io::Result<TracepointData> {
-    let segments: Vec<&str> = tp_str.split(';').collect();
+fn parse_usize_value(value: &str, err_msg: &'static str) -> io::Result<usize> {
+    value
+        .parse::<usize>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, err_msg))
+}
 
+fn invalid_tracepoint_format(part: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("Invalid mixed tracepoint format: '{}'", part),
+    )
+}
+
+fn parse_tracepoint_pair(part: &str, strict: bool) -> io::Result<(usize, usize)> {
+    let mut coords = part.split(',');
+    let first = coords.next().ok_or_else(|| invalid_tracepoint_format(part))?;
+    let second = coords.next().ok_or_else(|| invalid_tracepoint_format(part))?;
+    if strict && coords.next().is_some() {
+        return Err(invalid_tracepoint_format(part));
+    }
+
+    Ok((
+        parse_usize_value(first, "Invalid first value")?,
+        parse_usize_value(second, "Invalid second value")?,
+    ))
+}
+
+fn parse_tracepoints(tp_str: &str, tp_type: TracepointType) -> io::Result<TracepointData> {
     match tp_type {
         TracepointType::Standard | TracepointType::Fastga => {
-            // Parse as Standard/FASTGA tracepoints
             let mut tps = Vec::new();
-            for part in segments {
-                let coords: Vec<&str> = part.split(',').collect();
-                if coords.len() != 2 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("Invalid mixed tracepoint format: '{}'", part),
-                    ));
-                }
-                let first = coords[0].parse::<usize>().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Invalid first value")
-                })?;
-                let second = coords[1].parse::<usize>().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Invalid second value")
-                })?;
-                tps.push((first, second));
+            for part in tp_str.split(';') {
+                let pair = parse_tracepoint_pair(part, true)?;
+                tps.push(pair);
             }
 
-            match tp_type {
-                TracepointType::Standard => Ok(TracepointData::Standard(tps)),
-                TracepointType::Fastga => Ok(TracepointData::Fastga(tps)),
+            Ok(match tp_type {
+                TracepointType::Standard => TracepointData::Standard(tps),
+                TracepointType::Fastga => TracepointData::Fastga(tps),
                 _ => unreachable!(),
-            }
+            })
         }
         TracepointType::Mixed => {
-            // Parse as Mixed tracepoints
             let mut items = Vec::new();
 
-            for part in segments {
+            for part in tp_str.split(';') {
                 if part.contains(',') {
-                    // Standard tracepoint
-                    let coords: Vec<&str> = part.split(',').collect();
-                    if coords.len() != 2 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("Invalid mixed tracepoint format: '{}'", part),
-                        ));
-                    }
-                    let first = coords[0].parse::<usize>().map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "Invalid first value")
-                    })?;
-                    let second = coords[1].parse::<usize>().map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "Invalid second value")
-                    })?;
+                    let (first, second) = parse_tracepoint_pair(part, true)?;
                     items.push(MixedRepresentation::Tracepoint(first, second));
                 } else {
-                    // CIGAR operation
                     let op = part.chars().last().ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -696,9 +628,7 @@ fn parse_tracepoints(tp_str: &str, tp_type: TracepointType) -> io::Result<Tracep
                             "Mixed tracepoint entry missing length",
                         ));
                     }
-                    let len = len_str.parse::<usize>().map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "Invalid CIGAR length")
-                    })?;
+                    let len = parse_usize_value(len_str, "Invalid CIGAR length")?;
                     items.push(MixedRepresentation::CigarOp(len, op));
                 }
             }
@@ -706,22 +636,13 @@ fn parse_tracepoints(tp_str: &str, tp_type: TracepointType) -> io::Result<Tracep
             Ok(TracepointData::Mixed(items))
         }
         TracepointType::Variable => {
-            // Parse as Variable tracepoints
             let mut tps = Vec::new();
-            for part in segments {
+            for part in tp_str.split(';') {
                 if part.contains(',') {
-                    let coords: Vec<&str> = part.split(',').collect();
-                    let first = coords[0].parse::<usize>().map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "Invalid first value")
-                    })?;
-                    let second = coords[1].parse::<usize>().map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "Invalid second value")
-                    })?;
+                    let (first, second) = parse_tracepoint_pair(part, true)?;
                     tps.push((first, Some(second)));
                 } else {
-                    let first = part.parse::<usize>().map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "Invalid first value")
-                    })?;
+                    let first = parse_usize_value(part, "Invalid first value")?;
                     tps.push((first, None));
                 }
             }

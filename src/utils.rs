@@ -5,6 +5,18 @@ use flate2::read::MultiGzDecoder;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 
+#[inline]
+fn write_i32_le<W: Write>(writer: &mut W, value: i32) -> io::Result<()> {
+    writer.write_all(&value.to_le_bytes())
+}
+
+#[inline]
+fn read_i32_le<R: Read>(reader: &mut R) -> io::Result<i32> {
+    let mut buf = [0u8; 4];
+    reader.read_exact(&mut buf)?;
+    Ok(i32::from_le_bytes(buf))
+}
+
 // ============================================================================
 // VARINT ENCODING (LEB128)
 // ============================================================================
@@ -101,9 +113,9 @@ pub(crate) fn write_distance<W: Write>(writer: &mut W, distance: &Distance) -> i
             gap_opening,
             gap_extension,
         } => {
-            writer.write_all(&mismatch.to_le_bytes())?;
-            writer.write_all(&gap_opening.to_le_bytes())?;
-            writer.write_all(&gap_extension.to_le_bytes())?;
+            write_i32_le(writer, *mismatch)?;
+            write_i32_le(writer, *gap_opening)?;
+            write_i32_le(writer, *gap_extension)?;
         }
         Distance::GapAffine2p {
             mismatch,
@@ -112,11 +124,11 @@ pub(crate) fn write_distance<W: Write>(writer: &mut W, distance: &Distance) -> i
             gap_opening2,
             gap_extension2,
         } => {
-            writer.write_all(&mismatch.to_le_bytes())?;
-            writer.write_all(&gap_opening1.to_le_bytes())?;
-            writer.write_all(&gap_extension1.to_le_bytes())?;
-            writer.write_all(&gap_opening2.to_le_bytes())?;
-            writer.write_all(&gap_extension2.to_le_bytes())?;
+            write_i32_le(writer, *mismatch)?;
+            write_i32_le(writer, *gap_opening1)?;
+            write_i32_le(writer, *gap_extension1)?;
+            write_i32_le(writer, *gap_opening2)?;
+            write_i32_le(writer, *gap_extension2)?;
         }
     }
     Ok(())
@@ -136,13 +148,9 @@ pub(crate) fn read_distance<R: Read>(reader: &mut R) -> io::Result<Distance> {
             gap_opening,
             gap_extension,
         } => {
-            let mut buf = [0u8; 4];
-            reader.read_exact(&mut buf)?;
-            *mismatch = i32::from_le_bytes(buf);
-            reader.read_exact(&mut buf)?;
-            *gap_opening = i32::from_le_bytes(buf);
-            reader.read_exact(&mut buf)?;
-            *gap_extension = i32::from_le_bytes(buf);
+            *mismatch = read_i32_le(reader)?;
+            *gap_opening = read_i32_le(reader)?;
+            *gap_extension = read_i32_le(reader)?;
         }
         Distance::GapAffine2p {
             mismatch,
@@ -151,17 +159,11 @@ pub(crate) fn read_distance<R: Read>(reader: &mut R) -> io::Result<Distance> {
             gap_opening2,
             gap_extension2,
         } => {
-            let mut buf = [0u8; 4];
-            reader.read_exact(&mut buf)?;
-            *mismatch = i32::from_le_bytes(buf);
-            reader.read_exact(&mut buf)?;
-            *gap_opening1 = i32::from_le_bytes(buf);
-            reader.read_exact(&mut buf)?;
-            *gap_extension1 = i32::from_le_bytes(buf);
-            reader.read_exact(&mut buf)?;
-            *gap_opening2 = i32::from_le_bytes(buf);
-            reader.read_exact(&mut buf)?;
-            *gap_extension2 = i32::from_le_bytes(buf);
+            *mismatch = read_i32_le(reader)?;
+            *gap_opening1 = read_i32_le(reader)?;
+            *gap_extension1 = read_i32_le(reader)?;
+            *gap_opening2 = read_i32_le(reader)?;
+            *gap_extension2 = read_i32_le(reader)?;
         }
     }
     Ok(distance)

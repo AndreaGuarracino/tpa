@@ -262,58 +262,33 @@ impl CompressionStrategy {
             CompressionLayer::Zstd
         };
 
-        let compression_level = if parts.len() > 1 {
-            parts[1].trim().parse::<i32>().map_err(|_| {
-                format!(
-                    "Invalid compression level '{}'. Must be a number between 0 and 22.",
-                    parts[1]
-                )
-            })?
-        } else if strategy_name.ends_with("-nocomp") || s.contains("-nocomp") {
-            0 // nocomp means level 0
-        } else {
-            3 // Default compression level
-        };
-
-        // Validate compression level range (allow 0 for nocomp)
-        if compression_level < 0 || compression_level > 22 {
-            return Err(format!(
-                "Compression level {} is out of range. Must be between 0 and 22.",
-                compression_level
-            ));
-        }
-
-        let strategy = match strategy_name.as_str() {
-            "automatic" | "automatic-fast" => {
-                Ok(CompressionStrategy::AutomaticFast(compression_level))
-            }
-            "automatic-slow" => Ok(CompressionStrategy::AutomaticSlow(compression_level)),
-            "raw" => Ok(CompressionStrategy::Raw(compression_level)),
-            "zigzag-delta" => Ok(CompressionStrategy::ZigzagDelta(compression_level)),
-            "2d-delta" => Ok(CompressionStrategy::TwoDimDelta(compression_level)),
-            "rle" => Ok(CompressionStrategy::RunLength(compression_level)),
-            "bit-packed" => Ok(CompressionStrategy::BitPacked(compression_level)),
-            "delta-of-delta" => Ok(CompressionStrategy::DeltaOfDelta(compression_level)),
-            "frame-of-reference" | "for" => Ok(CompressionStrategy::FrameOfReference(compression_level)),
-            "hybrid-rle" => Ok(CompressionStrategy::HybridRLE(compression_level)),
-            "offset-joint" => Ok(CompressionStrategy::OffsetJoint(compression_level)),
-            "xor-delta" => Ok(CompressionStrategy::XORDelta(compression_level)),
-            "dictionary" | "dict" => Ok(CompressionStrategy::Dictionary(compression_level)),
-            "simple8" => Ok(CompressionStrategy::Simple8(compression_level)),
-            "stream-vbyte" | "streamvbyte" => Ok(CompressionStrategy::StreamVByte(compression_level)),
-            "fastpfor" | "fast-pfor" => Ok(CompressionStrategy::FastPFOR(compression_level)),
-            "cascaded" => Ok(CompressionStrategy::Cascaded(compression_level)),
-            "simple8b-full" | "simple8bfull" => Ok(CompressionStrategy::Simple8bFull(compression_level)),
-            "selective-rle" | "selectiverle" => Ok(CompressionStrategy::SelectiveRLE(compression_level)),
-            "rice" => Ok(CompressionStrategy::Rice(compression_level)),
-            "huffman" => Ok(CompressionStrategy::Huffman(compression_level)),
-            _ => Err(format!(
-                "Unsupported compression strategy '{}'. Use --help to see all available strategies.",
-                strategy_name
-            )),
-        }?;
+        let default_level = if layer == CompressionLayer::Nocomp { 0 } else { 3 };
+        let compression_level = Self::parse_level(&parts, default_level)?;
+        let strategy = Self::parse_single_strategy(&strategy_name, compression_level)?;
 
         Ok((strategy, layer))
+    }
+
+    /// Parse compression level from split input and validate range
+    fn parse_level(parts: &[&str], default: i32) -> Result<i32, String> {
+        let level = match parts.get(1) {
+            Some(raw) => raw.trim().parse::<i32>().map_err(|_| {
+                format!(
+                    "Invalid compression level '{}'. Must be a number between 0 and 22.",
+                    raw
+                )
+            })?,
+            None => default,
+        };
+
+        if (0..=22).contains(&level) {
+            Ok(level)
+        } else {
+            Err(format!(
+                "Compression level {} is out of range. Must be between 0 and 22.",
+                level
+            ))
+        }
     }
 
     /// Parse dual strategy from string (format: "strategy1:strategy2" or "strategy1:strategy2,level")
@@ -349,25 +324,7 @@ impl CompressionStrategy {
         let first_name = strat_parts[0].trim().to_lowercase();
         let second_name = strat_parts[1].trim().to_lowercase();
 
-        // Parse compression level
-        let compression_level = if parts.len() > 1 {
-            parts[1].trim().parse::<i32>().map_err(|_| {
-                format!(
-                    "Invalid compression level '{}'. Must be a number between 0 and 22.",
-                    parts[1]
-                )
-            })?
-        } else {
-            3 // Default
-        };
-
-        // Validate compression level
-        if compression_level < 0 || compression_level > 22 {
-            return Err(format!(
-                "Compression level {} is out of range. Must be between 0 and 22.",
-                compression_level
-            ));
-        }
+        let compression_level = Self::parse_level(&parts, 3)?;
 
         // Parse first strategy
         let first_strategy = Self::parse_single_strategy(&first_name, compression_level)?;
