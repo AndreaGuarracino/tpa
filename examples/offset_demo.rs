@@ -3,10 +3,10 @@ use lib_bpaf::{BpafReader, TracepointData};
 use std::time::Instant;
 
 /// Helper to display ComplexityMetric (doesn't implement Debug)
-fn complexity_metric_str(metric: lib_tracepoints::ComplexityMetric) -> &'static str {
+fn complexity_metric_str(metric: tracepoints::ComplexityMetric) -> &'static str {
     match metric {
-        lib_tracepoints::ComplexityMetric::EditDistance => "EditDistance",
-        lib_tracepoints::ComplexityMetric::DiagonalDistance => "DiagonalDistance",
+        tracepoints::ComplexityMetric::EditDistance => "EditDistance",
+        tracepoints::ComplexityMetric::DiagonalDistance => "DiagonalDistance",
     }
 }
 

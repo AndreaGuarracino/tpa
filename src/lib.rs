@@ -19,7 +19,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 
 // Re-export public types
-use lib_tracepoints::{
+use tracepoints::{
     cigar_to_mixed_tracepoints, cigar_to_tracepoints, cigar_to_variable_tracepoints,
 };
 pub use lib_wfa2::affine_wavefront::Distance;
@@ -28,7 +28,7 @@ pub use format::{
     AlignmentRecord, BinaryPafHeader, CompressionConfig, CompressionLayer, CompressionStrategy,
     StringTable, Tag, TagValue, BPAF_MAGIC,
 };
-pub use lib_tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
+pub use tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 
 use crate::format::{parse_tag, open_with_footer, BinaryPafFooter};
 use crate::utils::{parse_u8, parse_usize};

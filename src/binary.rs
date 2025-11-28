@@ -1,9 +1,8 @@
 //! Binary I/O operations for BPAF format
 
-use lib_tracepoints::{MixedRepresentation, TracepointData, TracepointType};
+use tracepoints::{MixedRepresentation, TracepointData, TracepointType};
 use log::{debug, info};
 use rayon::prelude::*;
-use std::convert::TryFrom;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 

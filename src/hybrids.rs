@@ -272,14 +272,13 @@ pub fn decode_cascaded(data: &[u8]) -> io::Result<Vec<u64>> {
                 return Ok(result);
             }
 
-            let first = read_varint(&mut reader)?;
-            result.push(first);
+            let mut prev = read_varint(&mut reader)?;
+            result.push(prev);
 
             while !reader.is_empty() {
                 let zigzag = read_varint(&mut reader)?;
-                let delta = decode_zigzag(zigzag);
-                let prev = *result.last().unwrap();
-                result.push((prev as i64).wrapping_add(delta) as u64);
+                prev = (prev as i64).wrapping_add(decode_zigzag(zigzag)) as u64;
+                result.push(prev);
             }
         }
         _ => {

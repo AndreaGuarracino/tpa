@@ -5,7 +5,7 @@ use crate::format::{
 };
 use crate::index::{build_index, BpafIndex};
 use crate::utils::read_varint;
-use lib_tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
+use tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 use log::{debug, info};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};

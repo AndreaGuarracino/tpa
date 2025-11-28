@@ -1,7 +1,7 @@
 //! Data structures for Binary PAF format
 
 use crate::{utils::*, Distance};
-use lib_tracepoints::{ComplexityMetric, TracepointData, TracepointType};
+use tracepoints::{ComplexityMetric, TracepointData, TracepointType};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
