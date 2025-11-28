@@ -72,7 +72,10 @@ impl BpafSizeAnalysis {
         println!(
             "  Strategy codes:             {:>12} bytes - value: {:?}",
             strategy_size,
-            header.strategies().unwrap()
+            header.strategies().unwrap_or_else(|e| {
+                eprintln!("Warning: failed to decode strategies: {}", e);
+                (lib_bpaf::CompressionStrategy::Raw(3), lib_bpaf::CompressionStrategy::Raw(3))
+            })
         );
         println!(
             "  Num records (varint):       {:>12} bytes - value: {}",
@@ -185,8 +188,8 @@ fn analyze_bpaf_size(path: &str) -> io::Result<(BpafSizeAnalysis, BinaryPafHeade
     let mut sequence_length_varints = 0u64;
 
     for i in 0..string_table.len() {
-        let name = string_table.get(i as u64).unwrap();
-        let seq_len = string_table.get_length(i as u64).unwrap();
+        let Some(name) = string_table.get(i as u64) else { continue };
+        let Some(seq_len) = string_table.get_length(i as u64) else { continue };
 
         string_name_length_varints += varint_size(name.len() as u64);
         string_name_bytes += name.len() as u64;

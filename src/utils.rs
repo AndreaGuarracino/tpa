@@ -100,6 +100,22 @@ pub fn varint_size(value: u64) -> u64 {
 }
 
 // ============================================================================
+// ZIGZAG ENCODING
+// ============================================================================
+
+/// Zigzag encode a signed value to unsigned
+#[inline]
+pub fn encode_zigzag(val: i64) -> u64 {
+    ((val << 1) ^ (val >> 63)) as u64
+}
+
+/// Zigzag decode an unsigned value to signed
+#[inline]
+pub fn decode_zigzag(zigzag: u64) -> i64 {
+    ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64)
+}
+
+// ============================================================================
 // DISTANCE SERIALIZATION
 // ============================================================================
 

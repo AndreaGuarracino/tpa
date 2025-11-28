@@ -277,8 +277,7 @@ pub fn decode_cascaded(data: &[u8]) -> io::Result<Vec<u64>> {
 
             while !reader.is_empty() {
                 let zigzag = read_varint(&mut reader)?;
-                // Correct zigzag decode: (n >> 1) ^ -(n & 1)
-                let delta = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+                let delta = decode_zigzag(zigzag);
                 let prev = *result.last().unwrap();
                 result.push((prev as i64).wrapping_add(delta) as u64);
             }
@@ -356,8 +355,7 @@ pub fn decode_selective_rle(data: &[u8]) -> io::Result<Vec<u64>> {
     Ok(result)
 }
 
-/// Simple8bFull: Enhanced Simple8 with more packing modes
-/// Includes additional selectors for better compression
+/// Simple8b with 16 selector modes packing multiple integers into 64-bit words
 pub fn encode_simple8b_full(vals: &[u64]) -> io::Result<Vec<u64>> {
     let mut result = Vec::new();
     let mut i = 0;

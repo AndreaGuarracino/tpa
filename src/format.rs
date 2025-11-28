@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
-/// Compression layer to use for final compression
 pub const BPAF_VERSION: u8 = 1;
 pub const BPAF_MAGIC: &[u8; 4] = b"BPAF";
 
@@ -66,16 +65,117 @@ impl CompressionLayer {
     }
 }
 
+/// Configuration for PAF compression
+#[derive(Clone, Debug)]
+pub struct CompressionConfig {
+    /// Strategy for first values in tracepoint pairs
+    pub first_strategy: CompressionStrategy,
+    /// Strategy for second values (None = use first_strategy)
+    pub second_strategy: Option<CompressionStrategy>,
+    /// Compression layer (Zstd, Bgzip, or Nocomp)
+    pub layer: CompressionLayer,
+    /// Tracepoint representation type
+    pub tp_type: TracepointType,
+    /// Maximum complexity/spacing parameter
+    pub max_complexity: u64,
+    /// Metric used for complexity calculation
+    pub complexity_metric: ComplexityMetric,
+    /// Distance parameters for alignment
+    pub distance: Distance,
+    /// True if input has CIGAR strings, false if tracepoints
+    pub use_cigar: bool,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            first_strategy: CompressionStrategy::Automatic(3, 1000),
+            second_strategy: None,
+            layer: CompressionLayer::Zstd,
+            tp_type: TracepointType::Standard,
+            max_complexity: 32,
+            complexity_metric: ComplexityMetric::EditDistance,
+            distance: Distance::Edit,
+            use_cigar: false,
+        }
+    }
+}
+
+impl CompressionConfig {
+    /// Create a new config with sensible defaults
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the compression strategy (used for both first and second values)
+    pub fn strategy(mut self, s: CompressionStrategy) -> Self {
+        self.first_strategy = s;
+        self.second_strategy = None;
+        self
+    }
+
+    /// Set separate strategies for first and second values
+    pub fn dual_strategy(mut self, first: CompressionStrategy, second: CompressionStrategy) -> Self {
+        self.first_strategy = first;
+        self.second_strategy = Some(second);
+        self
+    }
+
+    /// Set the compression layer
+    pub fn layer(mut self, l: CompressionLayer) -> Self {
+        self.layer = l;
+        self
+    }
+
+    /// Set the tracepoint type
+    pub fn tp_type(mut self, t: TracepointType) -> Self {
+        self.tp_type = t;
+        self
+    }
+
+    /// Set maximum complexity/spacing
+    pub fn max_complexity(mut self, c: u64) -> Self {
+        self.max_complexity = c;
+        self
+    }
+
+    /// Set complexity metric
+    pub fn complexity_metric(mut self, m: ComplexityMetric) -> Self {
+        self.complexity_metric = m;
+        self
+    }
+
+    /// Set distance parameters
+    pub fn distance(mut self, d: Distance) -> Self {
+        self.distance = d;
+        self
+    }
+
+    /// Mark input as having CIGAR strings (converts to tracepoints)
+    pub fn from_cigar(mut self) -> Self {
+        self.use_cigar = true;
+        self
+    }
+
+    /// Mark input as having tracepoints (default)
+    pub fn from_tracepoints(mut self) -> Self {
+        self.use_cigar = false;
+        self
+    }
+
+    /// Get the effective second strategy (first if not explicitly set)
+    pub fn effective_second_strategy(&self) -> CompressionStrategy {
+        self.second_strategy.clone().unwrap_or_else(|| self.first_strategy.clone())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum CompressionStrategy {
-    /// Automatic-fast strategy selection (samples first N records)
-    /// - Tests every concrete strategy × layer on a 1,000-record sample
-    /// - Configurable compression level (max 22, default: 3)
-    AutomaticFast(i32),
-    /// Automatic-slow strategy selection (uses entire file)
-    /// - Tests every concrete strategy × layer on all records
-    /// - Configurable compression level (max 22, default: 3)
-    AutomaticSlow(i32),
+    /// Automatic strategy selection
+    /// - Tests every concrete strategy × layer on sampled records
+    /// - Parameters: (zstd_level, sample_size) where 0 = entire file
+    /// - Default: level=3, sample_size=1000
+    Automatic(i32, usize),
     /// Raw encoding (no preprocessing) + Zstd
     /// - Optimal for low complexity data
     /// - Configurable compression level (max 22, default: 3)
@@ -183,39 +283,6 @@ pub enum CompressionStrategy {
 }
 
 impl CompressionStrategy {
-    /// Helper to check if a string is a valid strategy name
-    #[allow(dead_code)]
-    fn is_strategy_name(s: &str) -> bool {
-        matches!(
-            s,
-            "automatic"
-                | "raw"
-                | "zigzag-delta"
-                | "2d-delta"
-                | "rle"
-                | "bit-packed"
-                | "delta-of-delta"
-                | "frame-of-reference"
-                | "for"
-                | "hybrid-rle"
-                | "offset-joint"
-                | "xor-delta"
-                | "dictionary"
-                | "dict"
-                | "simple8"
-                | "stream-vbyte"
-                | "streamvbyte"
-                | "fastpfor"
-                | "fast-pfor"
-                | "cascaded"
-                | "simple8b-full"
-                | "simple8bfull"
-                | "selective-rle"
-                | "selectiverle"
-                | "rice"
-                | "huffman"
-        )
-    }
 
     /// Return every concrete strategy variant (excludes meta-strategies such as Automatic)
     pub fn concrete_strategies(level: i32) -> Vec<Self> {
@@ -245,6 +312,7 @@ impl CompressionStrategy {
     /// Parse strategy from string with compression layer
     /// Formats:
     ///   - Single: "strategy", "strategy,level", "strategy-bgzip", "strategy-nocomp"
+    ///   - Automatic: "automatic", "automatic,level", "automatic,level,sample_size"
     pub fn from_str_with_layer(s: &str) -> Result<(Self, CompressionLayer), String> {
         let parts: Vec<&str> = s.split(',').collect();
         let mut strategy_name = parts[0].to_lowercase();
@@ -262,7 +330,22 @@ impl CompressionStrategy {
 
         let default_level = if layer == CompressionLayer::Nocomp { 0 } else { 3 };
         let compression_level = Self::parse_level(&parts, default_level)?;
-        let strategy = Self::parse_single_strategy(&strategy_name, compression_level)?;
+
+        // Special handling for automatic strategy with optional sample_size
+        let strategy = if strategy_name == "automatic" {
+            let sample_size = match parts.get(2) {
+                Some(raw) => raw.trim().parse::<usize>().map_err(|_| {
+                    format!(
+                        "Invalid sample size '{}'. Must be a non-negative integer (0 = entire file).",
+                        raw
+                    )
+                })?,
+                None => 1000, // Default sample size
+            };
+            CompressionStrategy::Automatic(compression_level, sample_size)
+        } else {
+            Self::parse_single_strategy(&strategy_name, compression_level)?
+        };
 
         Ok((strategy, layer))
     }
@@ -292,8 +375,7 @@ impl CompressionStrategy {
     /// Parse a single strategy name into a CompressionStrategy enum
     fn parse_single_strategy(name: &str, level: i32) -> Result<CompressionStrategy, String> {
         match name {
-            "automatic" | "automatic-fast" => Ok(CompressionStrategy::AutomaticFast(level)),
-            "automatic-slow" => Ok(CompressionStrategy::AutomaticSlow(level)),
+            "automatic" => Ok(CompressionStrategy::Automatic(level, 1000)),
             "raw" => Ok(CompressionStrategy::Raw(level)),
             "zigzag-delta" => Ok(CompressionStrategy::ZigzagDelta(level)),
             "2d-delta" => Ok(CompressionStrategy::TwoDimDelta(level)),
@@ -320,11 +402,9 @@ impl CompressionStrategy {
         }
     }
 
-    /// Parse strategy from string (format: "strategy" or "strategy,level") - defaults to Zstd
-    /// Also sets the thread-local compression layer based on suffix (-bgzip/-nocomp)
+    /// Parse strategy from string (format: "strategy" or "strategy,level")
     pub fn from_str(s: &str) -> Result<Self, String> {
         let (strategy, _layer) = Self::from_str_with_layer(s)?;
-        // Note: Layer is now passed explicitly through API calls, not via thread-local state
         Ok(strategy)
     }
 
@@ -332,8 +412,6 @@ impl CompressionStrategy {
     pub fn variants() -> &'static [&'static str] {
         &[
             "automatic",
-            "automatic-fast",
-            "automatic-slow",
             "raw",
             "zigzag-delta",
             "2d-delta",
@@ -347,36 +425,41 @@ impl CompressionStrategy {
             "dictionary",
             "simple8",
             "stream-vbyte",
+            "fastpfor",
+            "cascaded",
+            "simple8b-full",
+            "selective-rle",
             "rice",
             "huffman",
         ]
     }
 
     /// Convert to strategy code for file header
-    fn to_code(&self) -> u8 {
+    fn to_code(&self) -> io::Result<u8> {
         match self {
-            CompressionStrategy::AutomaticFast(_) | CompressionStrategy::AutomaticSlow(_) => {
-                panic!("Automatic strategies must be resolved before writing")
-            }
-            CompressionStrategy::Raw(_) => 0,
-            CompressionStrategy::ZigzagDelta(_) => 1,
-            CompressionStrategy::TwoDimDelta(_) => 2,
-            CompressionStrategy::RunLength(_) => 3,
-            CompressionStrategy::BitPacked(_) => 4,
-            CompressionStrategy::DeltaOfDelta(_) => 5,
-            CompressionStrategy::FrameOfReference(_) => 6,
-            CompressionStrategy::HybridRLE(_) => 7,
-            CompressionStrategy::OffsetJoint(_) => 8,
-            CompressionStrategy::XORDelta(_) => 9,
-            CompressionStrategy::Dictionary(_) => 10,
-            CompressionStrategy::Simple8(_) => 11,
-            CompressionStrategy::StreamVByte(_) => 12,
-            CompressionStrategy::FastPFOR(_) => 13,
-            CompressionStrategy::Cascaded(_) => 14,
-            CompressionStrategy::Simple8bFull(_) => 15,
-            CompressionStrategy::SelectiveRLE(_) => 16,
-            CompressionStrategy::Rice(_) => 17,
-            CompressionStrategy::Huffman(_) => 18,
+            CompressionStrategy::Automatic(_, _) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Automatic strategy must be resolved before writing",
+            )),
+            CompressionStrategy::Raw(_) => Ok(0),
+            CompressionStrategy::ZigzagDelta(_) => Ok(1),
+            CompressionStrategy::TwoDimDelta(_) => Ok(2),
+            CompressionStrategy::RunLength(_) => Ok(3),
+            CompressionStrategy::BitPacked(_) => Ok(4),
+            CompressionStrategy::DeltaOfDelta(_) => Ok(5),
+            CompressionStrategy::FrameOfReference(_) => Ok(6),
+            CompressionStrategy::HybridRLE(_) => Ok(7),
+            CompressionStrategy::OffsetJoint(_) => Ok(8),
+            CompressionStrategy::XORDelta(_) => Ok(9),
+            CompressionStrategy::Dictionary(_) => Ok(10),
+            CompressionStrategy::Simple8(_) => Ok(11),
+            CompressionStrategy::StreamVByte(_) => Ok(12),
+            CompressionStrategy::FastPFOR(_) => Ok(13),
+            CompressionStrategy::Cascaded(_) => Ok(14),
+            CompressionStrategy::Simple8bFull(_) => Ok(15),
+            CompressionStrategy::SelectiveRLE(_) => Ok(16),
+            CompressionStrategy::Rice(_) => Ok(17),
+            CompressionStrategy::Huffman(_) => Ok(18),
         }
     }
 
@@ -412,8 +495,7 @@ impl CompressionStrategy {
     /// Get zstd compression level for this strategy
     pub fn zstd_level(&self) -> i32 {
         match self {
-            CompressionStrategy::AutomaticFast(level) => *level,
-            CompressionStrategy::AutomaticSlow(level) => *level,
+            CompressionStrategy::Automatic(level, _) => *level,
             CompressionStrategy::Raw(level) => *level,
             CompressionStrategy::ZigzagDelta(level) => *level,
             CompressionStrategy::TwoDimDelta(level) => *level,
@@ -440,11 +522,12 @@ impl CompressionStrategy {
 impl std::fmt::Display for CompressionStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CompressionStrategy::AutomaticFast(level) => {
-                write!(f, "AutomaticFast (level {})", level)
-            }
-            CompressionStrategy::AutomaticSlow(level) => {
-                write!(f, "AutomaticSlow (level {})", level)
+            CompressionStrategy::Automatic(level, sample_size) => {
+                if *sample_size == 0 {
+                    write!(f, "Automatic (level {}, all records)", level)
+                } else {
+                    write!(f, "Automatic (level {}, {} records)", level, sample_size)
+                }
             }
             CompressionStrategy::Raw(level) => {
                 write!(f, "Raw (level {})", level)
@@ -548,11 +631,11 @@ impl BinaryPafHeader {
         complexity_metric: ComplexityMetric,
         max_complexity: u64,
         distance: Distance,
-    ) -> Self {
-        let first_strategy_code = first_strategy.to_code();
-        let second_strategy_code = second_strategy.to_code();
+    ) -> io::Result<Self> {
+        let first_strategy_code = first_strategy.to_code()?;
+        let second_strategy_code = second_strategy.to_code()?;
 
-        Self {
+        Ok(Self {
             version: BPAF_VERSION,
             first_strategy_code,
             second_strategy_code,
@@ -564,7 +647,7 @@ impl BinaryPafHeader {
             complexity_metric,
             max_complexity,
             distance,
-        }
+        })
     }
 
     /// Get format version
@@ -856,11 +939,11 @@ mod footer_tests {
         file_bytes.push(BPAF_VERSION);
         // strategies + layers packed
         file_bytes.push(encode_strategy_with_layer(
-            CompressionStrategy::Raw(3).to_code(),
+            CompressionStrategy::Raw(3).to_code().unwrap(),
             CompressionLayer::Zstd,
         ));
         file_bytes.push(encode_strategy_with_layer(
-            CompressionStrategy::Raw(3).to_code(),
+            CompressionStrategy::Raw(3).to_code().unwrap(),
             CompressionLayer::Zstd,
         ));
         // num_records / num_strings
@@ -1050,14 +1133,26 @@ impl Tag {
 
 pub fn parse_tag(field: &str) -> Option<Tag> {
     let parts: Vec<&str> = field.splitn(3, ':').collect();
-    if parts.len() != 3 {
+    if parts.len() != 3 || parts[0].len() < 2 || parts[1].is_empty() {
         return None;
     }
     let key = [parts[0].as_bytes()[0], parts[0].as_bytes()[1]];
     let tag_type = parts[1].as_bytes()[0];
     let value = match tag_type {
-        b'i' => parts[2].parse::<i32>().ok().map(TagValue::Int)?,
-        b'f' => parts[2].parse::<f32>().ok().map(TagValue::Float)?,
+        b'i' => match parts[2].parse::<i32>() {
+            Ok(v) => TagValue::Int(v),
+            Err(e) => {
+                log::warn!("Failed to parse integer tag '{}': {}", field, e);
+                return None;
+            }
+        },
+        b'f' => match parts[2].parse::<f32>() {
+            Ok(v) => TagValue::Float(v),
+            Err(e) => {
+                log::warn!("Failed to parse float tag '{}': {}", field, e);
+                return None;
+            }
+        },
         b'Z' => TagValue::String(parts[2].to_string()),
         _ => return None,
     };

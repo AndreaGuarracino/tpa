@@ -6,8 +6,7 @@ Binary format for genomic sequence alignments with tracepoints.
 
 - **O(1) random access**: External index for instant record lookup
 - **Fast varint compression**:
-  - **Automatic-Fast (default)**: Samples the first 1,000 records and tests every concrete strategy × compression layer per stream (19×3 per stream, plus dependent combos), then locks in the best first/second pair; ties favor faster seek strategies/layers
-  - **Automatic-Slow**: Same exhaustive search over all records with the same tie-break (favor faster seeking)
+  - **Automatic (default)**: Samples records and tests every concrete strategy × compression layer per stream (19×3 per stream), then locks in the best first/second pair; configurable sample size (default 1000, 0 = entire file)
   - **ZigzagDelta**: Delta + zigzag transform + varint + zstd
   - **Raw**: Plain varints + zstd
   - **Rice / Huffman**: Block-local entropy coding over zigzag deltas, byte-aligned for random seeks
@@ -132,49 +131,54 @@ for record in reader.iter_records() {
 ### Compression
 
 ```rust
-use lib_bpaf::{compress_paf_with_tracepoints, CompressionStrategy};
+use lib_bpaf::{compress_paf_to_bpaf, CompressionConfig, CompressionStrategy, CompressionLayer};
 
-// Automatic-Fast (default): Analyzes data and tries every strategy/layer per stream
-// - Samples first 1000 records to determine optimal encoding
-// - Handles all tracepoint types automatically
-// - Enables O(1) random tracepoint access
-compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::AutomaticFast(3))?;
+// Automatic (default): samples 1000 records to find best strategy
+compress_paf_to_bpaf("alignments.paf", "alignments.bpaf", CompressionConfig::new())?;
 
-// Automatic-Slow: same search but uses ALL records for scoring
-compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::AutomaticSlow(3))?;
+// Automatic with custom sample size (500 records)
+compress_paf_to_bpaf(
+    "alignments.paf",
+    "alignments.bpaf",
+    CompressionConfig::new().strategy(CompressionStrategy::Automatic(3, 500)),
+)?;
 
-// ZigzagDelta: Delta + zigzag transform (both values) + varint + zstd
-// - Always uses delta encoding for tracepoints
-// - Works well when values are monotonic or slowly changing
-// - Enables O(1) random tracepoint access
-compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::ZigzagDelta(3))?;
+// Automatic with entire file analysis (sample_size = 0)
+compress_paf_to_bpaf(
+    "alignments.paf",
+    "alignments.bpaf",
+    CompressionConfig::new().strategy(CompressionStrategy::Automatic(3, 0)),
+)?;
 
-// Raw: No delta, direct varints + zstd compression
-// - Ideal when deltas are noisy or large
-// - Also enables O(1) random tracepoint access
-compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::Raw(3))?;
+// ZigzagDelta: Delta + zigzag transform + varint + zstd
+compress_paf_to_bpaf(
+    "alignments.paf",
+    "alignments.bpaf",
+    CompressionConfig::new().strategy(CompressionStrategy::ZigzagDelta(3)),
+)?;
 
-// BlockwiseAdaptive: Adaptive selection per tracepoint record
-// - Samples 1% of data and tests 4 sub-strategies
-// - Selects optimal encoding (FOR, DeltaOfDelta, XORDelta, Dictionary)
-// - Enables O(1) random tracepoint access
-compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::BlockwiseAdaptive(32))?;
+// Dual strategy: different strategies for first/second values
+compress_paf_to_bpaf(
+    "alignments.paf",
+    "alignments.bpaf",
+    CompressionConfig::new()
+        .dual_strategy(CompressionStrategy::Raw(3), CompressionStrategy::TwoDimDelta(3)),
+)?;
 
-// Rice entropy coding: Zigzag + delta + Rice (Golomb) bitstream per block
-compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::Rice(3))?;
-
-// Huffman entropy coding: Zigzag + delta + canonical Huffman per block
-compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::Huffman(3))?;
+// From CIGAR input (converts to tracepoints)
+compress_paf_to_bpaf(
+    "alignments.paf",
+    "alignments.bpaf",
+    CompressionConfig::new().from_cigar(),
+)?;
 ```
 
 **Strategy guide:**
-- **Automatic-Fast (default)**: Best for most use cases, analyzes the first/second streams independently (all strategies × layers) on a 1,000-record sample and stores the winning combination
-- **Automatic-Slow**: Use when you want the absolute best compression and can afford analyzing the entire file
+- **Automatic (default)**: Best for most use cases. Parameters: `(level, sample_size)` where sample_size=1000 is default, 0 = analyze entire file
 - **ZigzagDelta**: Use when tracepoint values are mostly increasing
+- **TwoDimDelta**: Best for CIGAR-derived alignments (exploits query/target correlation)
 - **Raw**: Use when tracepoint values jump frequently
-- **BlockwiseAdaptive**: Adaptive selection per record using advanced codecs
-- **Rice**: Skewed, small zigzag deltas where Golomb coding beats varints (still byte-aligned)
-- **Huffman**: Highly skewed distributions with a few hot values/zeros
+- **Rice/Huffman**: Entropy coding for skewed distributions
 
 ### Index management
 

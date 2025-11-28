@@ -100,7 +100,6 @@ fn delta_encode(values: &[u64]) -> Vec<i64> {
 
 /// Delta decode back to positions
 #[inline]
-#[allow(dead_code)]
 fn delta_decode(deltas: &[i64]) -> Vec<u64> {
     let mut values = Vec::with_capacity(deltas.len());
     if deltas.is_empty() {
@@ -111,17 +110,6 @@ fn delta_decode(deltas: &[i64]) -> Vec<u64> {
         values.push((values[i - 1] as i64 + deltas[i]) as u64);
     }
     values
-}
-
-// ============================================================================
-// ZIGZAG ENCODING
-// ============================================================================
-
-/// Zigzag encode a signed value to unsigned
-#[inline]
-#[allow(dead_code)]
-fn encode_zigzag(val: i64) -> u64 {
-    ((val << 1) ^ (val >> 63)) as u64
 }
 
 pub(crate) struct SmartDualAnalyzer {
@@ -159,16 +147,16 @@ impl SmartDualAnalyzer {
         }
     }
 
-    pub fn ingest(&mut self, record: &AlignmentRecord) {
+    pub fn ingest(&mut self, record: &AlignmentRecord) -> io::Result<()> {
         if let Some(limit) = self.sample_limit {
             if self.processed_records >= limit {
-                return;
+                return Ok(());
             }
         }
 
         match &record.tracepoints {
             TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
-                ensure_tracepoints(&record.tracepoints);
+                ensure_tracepoints(&record.tracepoints)?;
                 self.processed_records += 1;
                 self.processed_tracepoints += tps.len();
 
@@ -199,19 +187,28 @@ impl SmartDualAnalyzer {
                 );
             }
             _ => {
-                panic!("Automatic strategy analysis requires standard or FASTGA tracepoints");
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Automatic strategy analysis requires standard or FASTGA tracepoints",
+                ));
             }
         }
+        Ok(())
     }
 
-    pub fn finalize_pair(self) -> (
+    pub fn finalize_pair(
+        self,
+    ) -> io::Result<(
         CompressionStrategy,
         CompressionLayer,
         CompressionStrategy,
         CompressionLayer,
-    ) {
+    )> {
         if self.processed_records == 0 {
-            panic!("Automatic strategy analysis requires at least one tracepoint");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Automatic strategy analysis requires at least one tracepoint",
+            ));
         }
 
         let mut first_candidates: Vec<(CompressionStrategy, CompressionLayer, usize)> = Vec::new();
@@ -256,11 +253,16 @@ impl SmartDualAnalyzer {
         }
 
         if first_candidates.is_empty() || second_candidates.is_empty() {
-            panic!("Automatic strategy analysis failed: no valid candidates");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Automatic strategy analysis failed: no valid candidates",
+            ));
         }
 
-        let (best_first_strategy, best_first_layer, best_first_size) = best_first.unwrap();
-        let (best_second_strategy, best_second_layer, best_second_size) = best_second.unwrap();
+        let (best_first_strategy, best_first_layer, best_first_size) =
+            best_first.expect("first_candidates not empty implies best_first is Some");
+        let (best_second_strategy, best_second_layer, best_second_size) =
+            best_second.expect("second_candidates not empty implies best_second is Some");
 
         let mut final_first = best_first_strategy.clone();
         let mut final_first_layer = best_first_layer;
@@ -385,12 +387,12 @@ impl SmartDualAnalyzer {
             best_total_size
         );
 
-        (
+        Ok((
             final_first,
             final_first_layer,
             final_second,
             final_second_layer,
-        )
+        ))
     }
 }
 
@@ -423,7 +425,7 @@ fn seek_rank(strategy: &CompressionStrategy) -> u8 {
         CompressionStrategy::FastPFOR(_) => 16,
         CompressionStrategy::Cascaded(_) => 17,
         CompressionStrategy::SelectiveRLE(_) => 18,
-        CompressionStrategy::AutomaticFast(_) | CompressionStrategy::AutomaticSlow(_) => 255,
+        CompressionStrategy::Automatic(_, _) => 255,
     }
 }
 
@@ -576,12 +578,10 @@ fn process_stream_states<F>(
 
 fn encode_first_stream(values: &[u64], strategy: &CompressionStrategy) -> io::Result<Vec<u8>> {
     match strategy {
-        CompressionStrategy::AutomaticFast(_) | CompressionStrategy::AutomaticSlow(_) => {
-            Err(io::Error::new(
+        CompressionStrategy::Automatic(_, _) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Automatic strategies must be resolved before encoding",
-        ))
-        }
+            "Automatic strategy must be resolved before encoding",
+        )),
         _ => encode_tracepoint_values(values, strategy.clone()),
     }
 }
@@ -592,12 +592,10 @@ fn encode_second_stream(
     strategy: &CompressionStrategy,
 ) -> io::Result<Vec<u8>> {
     match strategy {
-        CompressionStrategy::AutomaticFast(_) | CompressionStrategy::AutomaticSlow(_) => {
-            Err(io::Error::new(
+        CompressionStrategy::Automatic(_, _) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Automatic strategies must be resolved before encoding",
-        ))
-        }
+            "Automatic strategy must be resolved before encoding",
+        )),
         CompressionStrategy::TwoDimDelta(_) => {
             encode_2d_delta_second_values(first_vals, second_vals)
         }
@@ -605,7 +603,7 @@ fn encode_second_stream(
             let mut buf = Vec::with_capacity(second_vals.len() * 2);
             for (f, s) in first_vals.iter().zip(second_vals.iter()) {
                 let diff = *s as i64 - *f as i64;
-                let zigzag = ((diff << 1) ^ (diff >> 63)) as u64;
+                let zigzag = encode_zigzag(diff);
                 write_varint(&mut buf, zigzag)?;
             }
             Ok(buf)
@@ -802,7 +800,10 @@ pub(crate) fn read_tracepoints<R: Read>(
 ) -> io::Result<TracepointData> {
     let num_items = read_varint(reader)? as usize;
     if num_items == 0 {
-        panic!("Encountered tracepoint block with zero entries");
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Encountered tracepoint block with zero entries",
+        ));
     }
     match tp_type {
         TracepointType::Standard | TracepointType::Fastga => {
@@ -1351,20 +1352,13 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
                 write_varint(&mut buf, val)?;
             }
         }
-        CompressionStrategy::ZigzagDelta(_) => {
-            // Zigzag + delta
+        CompressionStrategy::ZigzagDelta(_)
+        | CompressionStrategy::TwoDimDelta(_)
+        | CompressionStrategy::OffsetJoint(_) => {
+            // Zigzag + delta encode (for first values; second values handled specially)
             let deltas = delta_encode(vals);
             for &val in &deltas {
-                let zigzag = ((val << 1) ^ (val >> 63)) as u64;
-                write_varint(&mut buf, zigzag)?;
-            }
-        }
-        CompressionStrategy::TwoDimDelta(_) => {
-            // For first values: same as ZigzagDelta
-            // For second values: will be handled specially in write_tracepoints
-            let deltas = delta_encode(vals);
-            for &val in &deltas {
-                let zigzag = ((val << 1) ^ (val >> 63)) as u64;
+                let zigzag = encode_zigzag(val);
                 write_varint(&mut buf, zigzag)?;
             }
         }
@@ -1435,7 +1429,7 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
             let deltas = delta_encode(vals);
             let delta_deltas = delta_encode(&deltas.iter().map(|&x| x as u64).collect::<Vec<_>>());
             for &val in &delta_deltas {
-                let zigzag = ((val << 1) ^ (val >> 63)) as u64;
+                let zigzag = encode_zigzag(val);
                 write_varint(&mut buf, zigzag)?;
             }
         }
@@ -1475,15 +1469,6 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
             // For now, use regular varint
             for &val in vals {
                 write_varint(&mut buf, val)?;
-            }
-        }
-        CompressionStrategy::OffsetJoint(_) => {
-            // For first values: regular zigzag delta
-            // For second values: will be handled specially (as offset from first)
-            let deltas = delta_encode(vals);
-            for &val in &deltas {
-                let zigzag = ((val << 1) ^ (val >> 63)) as u64;
-                write_varint(&mut buf, zigzag)?;
             }
         }
         CompressionStrategy::XORDelta(_) => {
@@ -1530,11 +1515,7 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
             }
         }
         CompressionStrategy::Simple8(_) => {
-            // Simple8-style: pack multiple small integers into 64-bit words
-            if vals.is_empty() {
-                return Ok(buf);
-            }
-            // Simplified version: use varint for now (full Simple8 needs selector logic)
+            // Varint encoding (see Simple8bFull for word-packed variant)
             for &val in vals {
                 write_varint(&mut buf, val)?;
             }
@@ -1609,8 +1590,11 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
             let zigzagged: Vec<u64> = deltas.iter().map(|&v| encode_zigzag(v)).collect();
             buf = huffman_encode(&zigzagged)?;
         }
-        CompressionStrategy::AutomaticFast(_) | CompressionStrategy::AutomaticSlow(_) => {
-            panic!("Automatic strategies must be resolved before encoding")
+        CompressionStrategy::Automatic(_, _) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Automatic strategy must be resolved before encoding",
+            ));
         }
     }
     Ok(buf)
@@ -1630,7 +1614,7 @@ fn encode_2d_delta_second_values(first_vals: &[u64], second_vals: &[u64]) -> io:
 
     // Apply zigzag encoding to differences
     for diff in diffs {
-        let zigzag = ((diff << 1) ^ (diff >> 63)) as u64;
+        let zigzag = encode_zigzag(diff);
         write_varint(&mut buf, zigzag)?;
     }
 
@@ -1639,7 +1623,6 @@ fn encode_2d_delta_second_values(first_vals: &[u64], second_vals: &[u64]) -> io:
 
 /// Decode tracepoint values based on compression strategy
 #[inline]
-#[allow(dead_code)]
 fn decode_tracepoint_values(
     buf: &[u8],
     num_items: usize,
@@ -1655,19 +1638,24 @@ fn decode_tracepoint_values(
             }
             Ok(vals)
         }
-        CompressionStrategy::ZigzagDelta(_) | CompressionStrategy::TwoDimDelta(_) => {
-            // Zigzag + delta decode
+        CompressionStrategy::ZigzagDelta(_)
+        | CompressionStrategy::TwoDimDelta(_)
+        | CompressionStrategy::OffsetJoint(_) => {
+            // Zigzag + delta decode (first values for all three strategies)
             let mut vals = Vec::with_capacity(num_items);
+            if num_items == 0 {
+                return Ok(vals);
+            }
 
             // First value
             let zigzag = read_varint(&mut reader)?;
-            let first = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+            let first = decode_zigzag(zigzag);
             vals.push(first as u64);
 
             // Remaining values: zigzag decode + delta accumulate in one pass
             for _ in 1..num_items {
                 let zigzag = read_varint(&mut reader)?;
-                let delta = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+                let delta = decode_zigzag(zigzag);
                 let prev = *vals.last().unwrap() as i64;
                 vals.push((prev + delta) as u64);
             }
@@ -1739,8 +1727,7 @@ fn decode_tracepoint_values(
             let mut delta_deltas = Vec::with_capacity(num_items);
             for _ in 0..num_items {
                 let zigzag = read_varint(&mut reader)?;
-                let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
-                delta_deltas.push(val);
+                delta_deltas.push(decode_zigzag(zigzag));
             }
             // Apply delta decode twice
             let deltas = delta_decode(&delta_deltas);
@@ -1792,23 +1779,6 @@ fn decode_tracepoint_values(
             let mut vals = Vec::with_capacity(num_items);
             for _ in 0..num_items {
                 vals.push(read_varint(&mut reader)?);
-            }
-            Ok(vals)
-        }
-        CompressionStrategy::OffsetJoint(_) => {
-            // Same as ZigzagDelta for first values
-            let mut vals = Vec::with_capacity(num_items);
-            if num_items == 0 {
-                return Ok(vals);
-            }
-            let zigzag = read_varint(&mut reader)?;
-            let first = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
-            vals.push(first as u64);
-            for _ in 1..num_items {
-                let zigzag = read_varint(&mut reader)?;
-                let delta = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
-                let prev = *vals.last().unwrap() as i64;
-                vals.push((prev + delta) as u64);
             }
             Ok(vals)
         }
@@ -1945,15 +1915,17 @@ fn decode_tracepoint_values(
             }
             Ok(vals)
         }
-        CompressionStrategy::AutomaticFast(_) | CompressionStrategy::AutomaticSlow(_) => {
-            panic!("Automatic strategies must be resolved before decoding")
+        CompressionStrategy::Automatic(_, _) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Automatic strategy must be resolved before decoding",
+            ));
         }
     }
 }
 
 /// Decode second values for 2D-Delta strategy (from diff values and first values)
 #[inline]
-#[allow(dead_code)]
 fn decode_2d_delta_second_values(buf: &[u8], first_vals: &[u64]) -> io::Result<Vec<u64>> {
     let mut reader = buf;
     let mut second_vals = Vec::with_capacity(first_vals.len());
@@ -1961,7 +1933,7 @@ fn decode_2d_delta_second_values(buf: &[u8], first_vals: &[u64]) -> io::Result<V
     // Decode zigzag-encoded differences and add to first values
     for &first in first_vals {
         let zigzag = read_varint(&mut reader)?;
-        let diff = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+        let diff = decode_zigzag(zigzag);
         let second = safe_signed_add(first as i64, diff)?;
         second_vals.push(second as u64);
     }
@@ -2034,7 +2006,7 @@ pub(crate) fn decode_standard_tracepoints<R: Read>(
             let mut vals = Vec::with_capacity(num_items);
             for a in &first_vals_u64 {
                 let zigzag = read_varint(&mut reader)?;
-                let diff = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+                let diff = decode_zigzag(zigzag);
                 let b = safe_signed_add(*a as i64, diff)?;
                 vals.push(b as u64);
             }
@@ -2077,10 +2049,10 @@ pub(crate) fn decode_standard_tracepoints<R: Read>(
             }
             vals
         }
-        CompressionStrategy::AutomaticFast(_) | CompressionStrategy::AutomaticSlow(_) => {
+        CompressionStrategy::Automatic(_, _) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Automatic strategies must be resolved before decoding",
+                "Automatic strategy must be resolved before decoding",
             ))
         }
         other => decode_tracepoint_values(&second_buf, num_items, other)?,
@@ -2199,7 +2171,7 @@ impl AlignmentRecord {
         first_layer: CompressionLayer,
         second_layer: CompressionLayer,
     ) -> io::Result<()> {
-        ensure_tracepoints(&self.tracepoints);
+        ensure_tracepoints(&self.tracepoints)?;
         match &self.tracepoints {
             TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
                 write_varint(writer, tps.len() as u64)?;
@@ -2217,7 +2189,7 @@ impl AlignmentRecord {
                         let mut buf = Vec::with_capacity(second_vals.len() * 2);
                         for (f, s) in first_vals.iter().zip(second_vals.iter()) {
                             let diff = *s as i64 - *f as i64;
-                            let zigzag = ((diff << 1) ^ (diff >> 63)) as u64;
+                            let zigzag = encode_zigzag(diff);
                             write_varint(&mut buf, zigzag)?;
                         }
                         buf

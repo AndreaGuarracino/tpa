@@ -65,12 +65,10 @@ fn main() -> io::Result<()> {
         }
     }
 
-    if bpaf_path.is_none() {
+    let Some(bpaf_path) = bpaf_path else {
         print_usage();
         process::exit(1);
-    }
-
-    let bpaf_path = bpaf_path.unwrap();
+    };
 
     // Open BPAF file
     let reader = BpafReader::open(bpaf_path)?;

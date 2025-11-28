@@ -1,6 +1,5 @@
 use lib_bpaf::{
-    compress_paf_with_tracepoints, ComplexityMetric, CompressionLayer, CompressionStrategy,
-    TracepointType,
+    compress_paf_to_bpaf, CompressionConfig, CompressionStrategy,
 };
 use lib_wfa2::affine_wavefront::Distance;
 
@@ -12,19 +11,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    compress_paf_with_tracepoints(
+    compress_paf_to_bpaf(
         &args[1],
         &args[2],
-        CompressionStrategy::AutomaticSlow(3),
-        CompressionLayer::Zstd,
-        TracepointType::Standard,
-        32,
-        ComplexityMetric::EditDistance,
-        Distance::GapAffine {
-            mismatch: 8,
-            gap_opening: 5,
-            gap_extension: 2,
-        },
+        CompressionConfig::new()
+            .strategy(CompressionStrategy::Automatic(3, 0)) // 0 = analyze entire file
+            .distance(Distance::GapAffine {
+                mismatch: 8,
+                gap_opening: 5,
+                gap_extension: 2,
+            }),
     )?;
 
     Ok(())

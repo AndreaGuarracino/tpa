@@ -559,11 +559,9 @@ for layer in "${LAYER_SUFFIXES[@]}"; do
     done
 done
 
-# Add meta-strategies (automatic-fast/slow)
-AUTO_STRATEGIES=("automatic-fast" "automatic-slow")
-for auto in "${AUTO_STRATEGIES[@]}"; do
-    STRATEGIES+=("$auto")
-done
+# Add automatic strategies: default (1000 samples) and full file (0 = all records)
+STRATEGIES+=("automatic")       # default: level=3, sample_size=1000
+STRATEGIES+=("automatic,3,0")   # full file: level=3, sample_size=0
 
 # Test function
 test_configuration() {

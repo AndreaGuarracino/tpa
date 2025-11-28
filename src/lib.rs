@@ -1,14 +1,16 @@
+//! Binary PAF format for efficient storage of sequence alignments with tracepoints
+//!
+//! Format: [Header] → [StringTable] → [Records] → [Footer]
+//! - Header: Magic "BPAF" + version + metadata
+//! - StringTable: Deduplicated sequence names with lengths
+//! - Records: Core PAF fields + compressed tracepoints
+//! - Footer: Crash-safety marker with record/string counts
+
 mod binary;
 mod format;
 mod hybrids;
 mod index;
 mod reader;
-/// Binary PAF format for efficient storage of sequence alignments with tracepoints
-///
-/// Format: [Header] → [StringTable] → [Records]
-/// - Header: Magic "BPAF" + version + metadata
-/// - StringTable: Deduplicated sequence names with lengths
-/// - Records: Core PAF fields + compressed tracepoints
 mod utils;
 
 use log::{info, warn};
@@ -23,8 +25,8 @@ use lib_tracepoints::{
 pub use lib_wfa2::affine_wavefront::Distance;
 
 pub use format::{
-    AlignmentRecord, BinaryPafHeader, CompressionLayer, CompressionStrategy, StringTable, Tag,
-    TagValue, BPAF_MAGIC,
+    AlignmentRecord, BinaryPafHeader, CompressionConfig, CompressionLayer, CompressionStrategy,
+    StringTable, Tag, TagValue, BPAF_MAGIC,
 };
 pub use lib_tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 
@@ -45,15 +47,19 @@ use crate::binary::{decompress_varint, SmartDualAnalyzer};
 
 use crate::utils::open_paf_reader;
 
-pub(crate) fn ensure_tracepoints(data: &TracepointData) {
+pub(crate) fn ensure_tracepoints(data: &TracepointData) -> io::Result<()> {
     let has = match data {
         TracepointData::Standard(tps) | TracepointData::Fastga(tps) => !tps.is_empty(),
         TracepointData::Variable(tps) => !tps.is_empty(),
         TracepointData::Mixed(items) => !items.is_empty(),
     };
     if !has {
-        panic!("Encountered record without tracepoints");
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Encountered record without tracepoints",
+        ));
     }
+    Ok(())
 }
 
 // ============================================================================
@@ -73,132 +79,54 @@ pub fn is_binary_paf(path: &str) -> io::Result<bool> {
     }
 }
 
-pub fn compress_paf_with_cigar(
-    input_path: &str,
-    output_path: &str,
-    strategy: CompressionStrategy,
-    layer: format::CompressionLayer,
-    tp_type: TracepointType,
-    max_complexity: u64,
-    complexity_metric: ComplexityMetric,
-    distance: Distance,
-) -> io::Result<()> {
-    compress_paf(
-        input_path,
-        output_path,
-        strategy.clone(),
-        strategy,
-        layer,
-        tp_type,
-        max_complexity,
-        complexity_metric,
-        distance,
-        true, // use_cigar
-    )
-}
-
-pub fn compress_paf_with_cigar_dual(
-    input_path: &str,
-    output_path: &str,
-    first_strategy: CompressionStrategy,
-    second_strategy: CompressionStrategy,
-    layer: format::CompressionLayer,
-    tp_type: TracepointType,
-    max_complexity: u64,
-    complexity_metric: ComplexityMetric,
-    distance: Distance,
-) -> io::Result<()> {
-    compress_paf(
-        input_path,
-        output_path,
-        first_strategy,
-        second_strategy,
-        layer,
-        tp_type,
-        max_complexity,
-        complexity_metric,
-        distance,
-        true, // use_cigar
-    )
-}
-
-pub fn compress_paf_with_tracepoints(
-    input_path: &str,
-    output_path: &str,
-    strategy: CompressionStrategy,
-    layer: format::CompressionLayer,
-    tp_type: TracepointType,
-    max_complexity: u64,
-    complexity_metric: ComplexityMetric,
-    distance: Distance,
-) -> io::Result<()> {
-    compress_paf(
-        input_path,
-        output_path,
-        strategy.clone(),
-        strategy,
-        layer,
-        tp_type,
-        max_complexity,
-        complexity_metric,
-        distance,
-        false, // use_cigar
-    )
-}
-
-/// Compress a PAF file with tracepoints using separate strategies for first and second values
-///
-/// This allows explicit control over which compression strategy is used for each value
-/// in tracepoint pairs, enabling testing of all 17×17=289 strategy combinations.
-///
-/// # Arguments
-/// * `input_path` - Path to input PAF file with tracepoints
-/// * `output_path` - Path to output BPAF file
-/// * `first_strategy` - Strategy for compressing first values in tracepoint pairs
-/// * `second_strategy` - Strategy for compressing second values in tracepoint pairs
-/// * `tp_type` - Type of tracepoint representation
-/// * `max_complexity` - Maximum complexity/spacing parameter
-/// * `complexity_metric` - Metric used for complexity calculation
-/// * `distance` - Distance parameters for alignment
+/// Compress a PAF file to BPAF format
 ///
 /// # Example
 /// ```no_run
-/// use lib_bpaf::{compress_paf_with_tracepoints_dual, CompressionLayer, CompressionStrategy, TracepointType, ComplexityMetric, Distance};
+/// use lib_bpaf::{compress_paf_to_bpaf, CompressionConfig, CompressionStrategy, CompressionLayer};
 ///
-/// compress_paf_with_tracepoints_dual(
+/// // Simple usage with defaults (Automatic, Zstd, Standard tracepoints)
+/// compress_paf_to_bpaf("input.paf", "output.bpaf", CompressionConfig::new())?;
+///
+/// // With specific strategy
+/// compress_paf_to_bpaf(
 ///     "input.paf",
 ///     "output.bpaf",
-///     CompressionStrategy::Raw(3),
-///     CompressionStrategy::ZigzagDelta(3),
-///     CompressionLayer::Zstd,
-///     TracepointType::Standard,
-///     32,
-///     ComplexityMetric::EditDistance,
-///     Distance::Edit,
-/// ).unwrap();
+///     CompressionConfig::new()
+///         .strategy(CompressionStrategy::ZigzagDelta(3))
+///         .layer(CompressionLayer::Zstd),
+/// )?;
+///
+/// // Dual strategy with CIGAR input
+/// compress_paf_to_bpaf(
+///     "input.paf",
+///     "output.bpaf",
+///     CompressionConfig::new()
+///         .dual_strategy(
+///             CompressionStrategy::Raw(3),
+///             CompressionStrategy::ZigzagDelta(3),
+///         )
+///         .from_cigar(),
+/// )?;
+/// # Ok::<(), std::io::Error>(())
 /// ```
-pub fn compress_paf_with_tracepoints_dual(
+pub fn compress_paf_to_bpaf(
     input_path: &str,
     output_path: &str,
-    first_strategy: CompressionStrategy,
-    second_strategy: CompressionStrategy,
-    layer: format::CompressionLayer,
-    tp_type: TracepointType,
-    max_complexity: u64,
-    complexity_metric: ComplexityMetric,
-    distance: Distance,
+    config: CompressionConfig,
 ) -> io::Result<()> {
-    compress_paf(
+    let second = config.effective_second_strategy();
+    compress_paf_internal(
         input_path,
         output_path,
-        first_strategy,
-        second_strategy,
-        layer,
-        tp_type,
-        max_complexity,
-        complexity_metric,
-        distance,
-        false, // use_cigar
+        config.first_strategy,
+        second,
+        config.layer,
+        config.tp_type,
+        config.max_complexity,
+        config.complexity_metric,
+        config.distance,
+        config.use_cigar,
     )
 }
 
@@ -227,7 +155,7 @@ pub fn decompress_bpaf(input_path: &str, output_path: &str) -> io::Result<()> {
 // Helpers
 // ============================================================================
 
-fn compress_paf(
+fn compress_paf_internal(
     input_path: &str,
     output_path: &str,
     first_strategy: CompressionStrategy,
@@ -246,45 +174,34 @@ fn compress_paf(
         second_strategy
     );
 
-    const FAST_SAMPLE_SIZE: usize = 1000; // Sample size for automatic-fast analysis
-
     // Pass 1: Build string table + collect sample for analysis
     let mut string_table = StringTable::new();
     let mut record_count = 0u64;
 
     let mut analyzer = match (&first_strategy, &second_strategy) {
-        (CompressionStrategy::AutomaticFast(level), _)
-        | (_, CompressionStrategy::AutomaticFast(level)) => {
-            Some(SmartDualAnalyzer::new(*level, Some(FAST_SAMPLE_SIZE), false))
-        }
-        (CompressionStrategy::AutomaticSlow(level), _)
-        | (_, CompressionStrategy::AutomaticSlow(level)) => {
-            Some(SmartDualAnalyzer::new(*level, None, true))
+        (CompressionStrategy::Automatic(level, sample_size), _)
+        | (_, CompressionStrategy::Automatic(level, sample_size)) => {
+            let limit = if *sample_size == 0 {
+                None // 0 = entire file
+            } else {
+                Some(*sample_size)
+            };
+            let parallel = *sample_size == 0; // Use parallel only for full-file analysis
+            Some(SmartDualAnalyzer::new(*level, limit, parallel))
         }
         _ => None,
     };
 
     let parse_record =
         |line: &str, line_num: usize, table: &mut StringTable| -> Option<AlignmentRecord> {
-            let record = if use_cigar {
-                parse_paf_with_cigar(
-                    line,
-                    table,
-                    tp_type,
-                    max_complexity as usize,
-                    &complexity_metric,
-                )
-            } else {
-                parse_paf_with_tracepoints(
-                    line,
-                    table,
-                    tp_type,
-                    max_complexity as usize,
-                    &complexity_metric,
-                )
-            };
-
-            match record {
+            match parse_paf(
+                line,
+                table,
+                use_cigar,
+                tp_type,
+                max_complexity as usize,
+                complexity_metric,
+            ) {
                 Ok(r) => Some(r),
                 Err(e) => {
                     warn!("Skipping malformed line {}: {}", line_num + 1, e);
@@ -305,7 +222,7 @@ fn compress_paf(
         };
 
         if let Some(an) = analyzer.as_mut() {
-            an.ingest(&record);
+            an.ingest(&record)?;
         }
         record_count += 1;
     }
@@ -321,7 +238,7 @@ fn compress_paf(
     // Choose strategy based on user's preference
     let (chosen_first, chosen_second, first_layer, second_layer) = match analyzer {
         Some(analyzer) => {
-            let (first_strat, first_layer, second_strat, second_layer) = analyzer.finalize_pair();
+            let (first_strat, first_layer, second_strat, second_layer) = analyzer.finalize_pair()?;
             (first_strat, second_strat, first_layer, second_layer)
         }
         None => (
@@ -332,7 +249,7 @@ fn compress_paf(
         ),
     };
 
-    // Pass 2: Stream write - Header → StringTable → Records
+    // Pass 2: Write Header → StringTable → Records → Footer
     let mut output = File::create(output_path).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -352,7 +269,7 @@ fn compress_paf(
         complexity_metric,
         max_complexity,
         distance,
-    );
+    )?;
     header.write(&mut output)?;
 
     // Write string table
@@ -398,40 +315,6 @@ fn compress_paf(
     Ok(())
 }
 
-fn parse_paf_with_cigar(
-    line: &str,
-    string_table: &mut StringTable,
-    tp_type: TracepointType,
-    max_complexity: usize,
-    complexity_metric: &ComplexityMetric,
-) -> io::Result<AlignmentRecord> {
-    parse_paf(
-        line,
-        string_table,
-        true,
-        tp_type,
-        max_complexity,
-        *complexity_metric,
-    )
-}
-
-fn parse_paf_with_tracepoints(
-    line: &str,
-    string_table: &mut StringTable,
-    tp_type: TracepointType,
-    max_complexity: usize,
-    complexity_metric: &ComplexityMetric,
-) -> io::Result<AlignmentRecord> {
-    parse_paf(
-        line,
-        string_table,
-        false,
-        tp_type,
-        max_complexity,
-        *complexity_metric,
-    )
-}
-
 fn parse_paf(
     line: &str,
     string_table: &mut StringTable,
@@ -475,11 +358,16 @@ fn parse_paf(
     let mut tags = Vec::new();
 
     for field in fields.iter().skip(12) {
-        if use_cigar && field.starts_with("cg:Z:") {
-            cigar = Some(field.strip_prefix("cg:Z:").unwrap());
-        } else if !use_cigar && field.starts_with("tp:Z:") {
-            tp_str = Some(field.strip_prefix("tp:Z:").unwrap());
-        } else if let Some(tag) = parse_tag(field) {
+        if use_cigar {
+            if let Some(cg) = field.strip_prefix("cg:Z:") {
+                cigar = Some(cg);
+                continue;
+            }
+        } else if let Some(tp) = field.strip_prefix("tp:Z:") {
+            tp_str = Some(tp);
+            continue;
+        }
+        if let Some(tag) = parse_tag(field) {
             tags.push(tag);
         }
     }
@@ -527,7 +415,7 @@ fn parse_paf(
         parse_tracepoints(tp_data, tp_type)?
     };
 
-    ensure_tracepoints(&tracepoints);
+    ensure_tracepoints(&tracepoints)?;
 
     Ok(AlignmentRecord {
         query_name_id,
