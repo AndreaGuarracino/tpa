@@ -4,6 +4,7 @@ use crate::{utils::*, Distance};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::str::FromStr;
 use tracepoints::{ComplexityMetric, TracepointData, TracepointType};
 
 pub const TPA_VERSION: u8 = 1;
@@ -451,11 +452,6 @@ impl CompressionStrategy {
         }
     }
 
-    /// Parse strategy from string (format: "strategy" or "strategy,level")
-    pub fn from_str(s: &str) -> Result<Self, String> {
-        let (strategy, _layer) = Self::from_str_with_layer(s)?;
-        Ok(strategy)
-    }
 
     /// Get all available strategies
     pub fn variants() -> &'static [&'static str] {
@@ -565,6 +561,16 @@ impl CompressionStrategy {
             CompressionStrategy::Rice(level) => *level,
             CompressionStrategy::Huffman(level) => *level,
         }
+    }
+}
+
+impl FromStr for CompressionStrategy {
+    type Err = String;
+
+    /// Parse strategy from string (format: "strategy" or "strategy,level")
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (strategy, _layer) = Self::from_str_with_layer(s)?;
+        Ok(strategy)
     }
 }
 

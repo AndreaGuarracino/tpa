@@ -178,8 +178,8 @@ pub fn encode_cascaded(vals: &[u64]) -> io::Result<Vec<u8>> {
         let dict_size = freq_vec.len().min(256);
 
         write_varint(&mut buf, dict_size as u64)?;
-        for i in 0..dict_size {
-            write_varint(&mut buf, freq_vec[i].0)?;
+        for (val, _) in freq_vec.iter().take(dict_size) {
+            write_varint(&mut buf, *val)?;
         }
 
         // Create reverse mapping
