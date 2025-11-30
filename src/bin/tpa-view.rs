@@ -31,7 +31,6 @@ fn strategy_to_name(strat: &str) -> String {
         "DeltaOfDelta" => "delta-of-delta",
         "FrameOfReference" => "frame-of-reference",
         "HybridRLE" => "hybrid-rle",
-        "OffsetJoint" => "offset-joint",
         "XORDelta" => "xor-delta",
         "Dictionary" => "dictionary",
         "StreamVByte" => "stream-vbyte",
@@ -41,6 +40,7 @@ fn strategy_to_name(strat: &str) -> String {
         "SelectiveRLE" => "selective-rle",
         "Rice" => "rice",
         "Huffman" => "huffman",
+        "LZ77" => "lz77",
         _ => "unknown",
     }
     .to_string()

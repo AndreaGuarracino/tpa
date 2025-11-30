@@ -366,7 +366,6 @@ BASE_STRATEGIES=(
     "delta-of-delta"
     "frame-of-reference"
     "hybrid-rle"
-    "offset-joint"
     "xor-delta"
     "dictionary"
     "stream-vbyte"
@@ -376,6 +375,7 @@ BASE_STRATEGIES=(
     "selective-rle"
     "rice"
     "huffman"
+    "lz77"
 )
 
 LAYER_SUFFIXES=(

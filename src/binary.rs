@@ -476,21 +476,21 @@ fn seek_rank(strategy: &CompressionStrategy) -> u8 {
         CompressionStrategy::Raw(_) => 0,
         CompressionStrategy::ZigzagDelta(_) => 1,
         CompressionStrategy::TwoDimDelta(_) => 2,
-        CompressionStrategy::OffsetJoint(_) => 3,
-        CompressionStrategy::RunLength(_) => 4,
-        CompressionStrategy::BitPacked(_) => 5,
-        CompressionStrategy::FrameOfReference(_) => 6,
-        CompressionStrategy::HybridRLE(_) => 7,
-        CompressionStrategy::XORDelta(_) => 8,
-        CompressionStrategy::DeltaOfDelta(_) => 9,
-        CompressionStrategy::Simple8bFull(_) => 10,
-        CompressionStrategy::StreamVByte(_) => 11,
-        CompressionStrategy::Dictionary(_) => 12,
-        CompressionStrategy::Rice(_) => 13,
-        CompressionStrategy::Huffman(_) => 14,
-        CompressionStrategy::FastPFOR(_) => 15,
-        CompressionStrategy::Cascaded(_) => 16,
-        CompressionStrategy::SelectiveRLE(_) => 17,
+        CompressionStrategy::RunLength(_) => 3,
+        CompressionStrategy::BitPacked(_) => 4,
+        CompressionStrategy::FrameOfReference(_) => 5,
+        CompressionStrategy::HybridRLE(_) => 6,
+        CompressionStrategy::XORDelta(_) => 7,
+        CompressionStrategy::DeltaOfDelta(_) => 8,
+        CompressionStrategy::Simple8bFull(_) => 9,
+        CompressionStrategy::StreamVByte(_) => 10,
+        CompressionStrategy::Dictionary(_) => 11,
+        CompressionStrategy::Rice(_) => 12,
+        CompressionStrategy::Huffman(_) => 13,
+        CompressionStrategy::FastPFOR(_) => 14,
+        CompressionStrategy::Cascaded(_) => 15,
+        CompressionStrategy::SelectiveRLE(_) => 16,
+        CompressionStrategy::LZ77(_) => 17,
         CompressionStrategy::Automatic(_, _) => 255,
     }
 }
@@ -665,15 +665,6 @@ fn encode_second_stream(
         CompressionStrategy::TwoDimDelta(_) => {
             encode_2d_delta_second_values(first_vals, second_vals)
         }
-        CompressionStrategy::OffsetJoint(_) => {
-            let mut buf = Vec::with_capacity(second_vals.len() * 2);
-            for (f, s) in first_vals.iter().zip(second_vals.iter()) {
-                let diff = *s as i64 - *f as i64;
-                let zigzag = encode_zigzag(diff);
-                write_varint(&mut buf, zigzag)?;
-            }
-            Ok(buf)
-        }
         CompressionStrategy::HybridRLE(_) => {
             let mut buf = Vec::with_capacity(second_vals.len() * 2);
             if !second_vals.is_empty() {
@@ -699,9 +690,7 @@ fn encode_second_stream(
 }
 
 fn second_depends_on_first(strategy: &CompressionStrategy) -> bool {
-    matches!(
-        strategy,
-        CompressionStrategy::TwoDimDelta(_) | CompressionStrategy::OffsetJoint(_)
+    matches!(strategy, CompressionStrategy::TwoDimDelta(_)
     )
 }
 
@@ -1401,6 +1390,140 @@ fn huffman_decode(buf: &[u8], num_items: usize) -> io::Result<Vec<u64>> {
     Ok(output)
 }
 
+// ============================================================================
+// LZ77 ENCODING/DECODING
+// ============================================================================
+
+/// LZ77 token markers
+const LZ77_LITERAL: u8 = 0;
+const LZ77_MATCH: u8 = 1;
+
+/// Minimum match length for LZ77 (must be >= 3 for compression benefit)
+const LZ77_MIN_MATCH: usize = 3;
+
+/// Default window size for LZ77 (256 values)
+const LZ77_WINDOW_SIZE: usize = 256;
+
+/// Find the longest match in the sliding window
+#[inline]
+fn lz77_find_longest_match(
+    values: &[u64],
+    pos: usize,
+    window_size: usize,
+) -> (usize, usize) {
+    let start = pos.saturating_sub(window_size);
+    let mut best_offset = 0;
+    let mut best_length = 0;
+
+    // Search through the window for matches
+    for offset in 1..=(pos - start) {
+        let match_start = pos - offset;
+        let mut len = 0;
+
+        // Match can extend beyond original match position (overlapping match)
+        while pos + len < values.len() {
+            let src_idx = match_start + (len % offset);
+            if values[src_idx] != values[pos + len] {
+                break;
+            }
+            len += 1;
+        }
+
+        if len >= LZ77_MIN_MATCH && len > best_length {
+            best_offset = offset;
+            best_length = len;
+        }
+    }
+
+    (best_offset, best_length)
+}
+
+/// Encode values using LZ77-style sequence matching
+fn lz77_encode(vals: &[u64]) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(vals.len() * 2);
+
+    if vals.is_empty() {
+        return Ok(buf);
+    }
+
+    let mut i = 0;
+    while i < vals.len() {
+        let (best_offset, best_length) = lz77_find_longest_match(vals, i, LZ77_WINDOW_SIZE);
+
+        if best_length >= LZ77_MIN_MATCH {
+            // Emit match token: marker + offset + length
+            buf.push(LZ77_MATCH);
+            write_varint(&mut buf, best_offset as u64)?;
+            write_varint(&mut buf, best_length as u64)?;
+            i += best_length;
+        } else {
+            // Emit literal token: marker + value
+            buf.push(LZ77_LITERAL);
+            write_varint(&mut buf, vals[i])?;
+            i += 1;
+        }
+    }
+
+    Ok(buf)
+}
+
+/// Decode LZ77-encoded values
+fn lz77_decode(buf: &[u8], num_items: usize) -> io::Result<Vec<u64>> {
+    if num_items == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut reader = buf;
+    let mut values = Vec::with_capacity(num_items);
+
+    while values.len() < num_items {
+        if reader.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "LZ77 decode: unexpected end of data",
+            ));
+        }
+
+        let marker = reader[0];
+        reader = &reader[1..];
+
+        if marker == LZ77_LITERAL {
+            // Literal: read single value
+            let value = read_varint(&mut reader)?;
+            values.push(value);
+        } else if marker == LZ77_MATCH {
+            // Match: read offset and length, then copy from history
+            let offset = read_varint(&mut reader)? as usize;
+            let length = read_varint(&mut reader)? as usize;
+
+            if offset == 0 || offset > values.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "LZ77 decode: invalid offset {} (history size {})",
+                        offset,
+                        values.len()
+                    ),
+                ));
+            }
+
+            let start = values.len() - offset;
+            // Copy values, handling overlapping matches
+            for j in 0..length {
+                let src_idx = start + (j % offset);
+                values.push(values[src_idx]);
+            }
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("LZ77 decode: invalid marker byte {}", marker),
+            ));
+        }
+    }
+
+    Ok(values)
+}
+
 /// Encode tracepoint values based on compression strategy
 #[inline]
 fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::Result<Vec<u8>> {
@@ -1412,9 +1535,7 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
                 write_varint(&mut buf, val)?;
             }
         }
-        CompressionStrategy::ZigzagDelta(_)
-        | CompressionStrategy::TwoDimDelta(_)
-        | CompressionStrategy::OffsetJoint(_) => {
+        CompressionStrategy::ZigzagDelta(_) | CompressionStrategy::TwoDimDelta(_) => {
             // Zigzag + delta encode (for first values; second values handled specially)
             let deltas = delta_encode(vals);
             for &val in &deltas {
@@ -1645,6 +1766,10 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
             let zigzagged: Vec<u64> = deltas.iter().map(|&v| encode_zigzag(v)).collect();
             buf = huffman_encode(&zigzagged)?;
         }
+        CompressionStrategy::LZ77(_) => {
+            // LZ77-style sequence matching: find repeated sequences
+            buf = lz77_encode(vals)?;
+        }
         CompressionStrategy::Automatic(_, _) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1659,20 +1784,10 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
 #[inline]
 fn encode_2d_delta_second_values(first_vals: &[u64], second_vals: &[u64]) -> io::Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(second_vals.len() * 2);
-
-    // Compute differences: second - first
-    let diffs: Vec<i64> = first_vals
-        .iter()
-        .zip(second_vals.iter())
-        .map(|(f, s)| *s as i64 - *f as i64)
-        .collect();
-
-    // Apply zigzag encoding to differences
-    for diff in diffs {
-        let zigzag = encode_zigzag(diff);
-        write_varint(&mut buf, zigzag)?;
+    for (f, s) in first_vals.iter().zip(second_vals.iter()) {
+        let diff = *s as i64 - *f as i64;
+        write_varint(&mut buf, encode_zigzag(diff))?;
     }
-
     Ok(buf)
 }
 
@@ -1693,10 +1808,8 @@ fn decode_tracepoint_values(
             }
             Ok(vals)
         }
-        CompressionStrategy::ZigzagDelta(_)
-        | CompressionStrategy::TwoDimDelta(_)
-        | CompressionStrategy::OffsetJoint(_) => {
-            // Zigzag + delta decode (first values for all three strategies)
+        CompressionStrategy::ZigzagDelta(_) | CompressionStrategy::TwoDimDelta(_) => {
+            // Zigzag + delta decode
             let mut vals = Vec::with_capacity(num_items);
             if num_items == 0 {
                 return Ok(vals);
@@ -1962,6 +2075,10 @@ fn decode_tracepoint_values(
             }
             Ok(vals)
         }
+        CompressionStrategy::LZ77(_) => {
+            // LZ77-style sequence matching decode
+            lz77_decode(buf, num_items)
+        }
         CompressionStrategy::Automatic(_, _) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Automatic strategy must be resolved before decoding",
@@ -2043,23 +2160,6 @@ pub(crate) fn decode_standard_tracepoints<R: Read>(
     let second_vals_u64: Vec<u64> = match second_strategy {
         CompressionStrategy::TwoDimDelta(_) => {
             decode_2d_delta_second_values(&second_buf, &first_vals_u64)?
-        }
-        CompressionStrategy::OffsetJoint(_) => {
-            let mut reader = &second_buf[..];
-            let mut vals = Vec::with_capacity(num_items);
-            for a in &first_vals_u64 {
-                let zigzag = read_varint(&mut reader)?;
-                let diff = decode_zigzag(zigzag);
-                let b = safe_signed_add(*a as i64, diff)?;
-                vals.push(b as u64);
-            }
-            if !reader.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("offset-joint residual bytes after decode: {}", reader.len()),
-                ));
-            }
-            vals
         }
         CompressionStrategy::HybridRLE(_) => {
             let mut reader = &second_buf[..];
@@ -2307,16 +2407,6 @@ impl AlignmentRecord {
                     CompressionStrategy::TwoDimDelta(_) => {
                         encode_2d_delta_second_values(&first_vals, &second_vals)?
                     }
-                    CompressionStrategy::OffsetJoint(_) => {
-                        // Encode second as signed offset from first (zigzag)
-                        let mut buf = Vec::with_capacity(second_vals.len() * 2);
-                        for (f, s) in first_vals.iter().zip(second_vals.iter()) {
-                            let diff = *s as i64 - *f as i64;
-                            let zigzag = encode_zigzag(diff);
-                            write_varint(&mut buf, zigzag)?;
-                        }
-                        buf
-                    }
                     CompressionStrategy::HybridRLE(_) => {
                         // Encode target with RLE (value, run_len)
                         let mut buf = Vec::with_capacity(second_vals.len() * 2);
@@ -2508,5 +2598,42 @@ mod compression_tests {
         let h = encode_tracepoint_values(&empty, CompressionStrategy::Huffman(3)).unwrap();
         assert!(r.is_empty());
         assert!(h.is_empty());
+    }
+
+    #[test]
+    fn lz77_roundtrip_with_repeats() {
+        // Values with repeated patterns - should compress well with LZ77
+        let vals = vec![10u64, 20, 10, 20, 10, 20, 15, 25];
+        let buf = encode_tracepoint_values(&vals, CompressionStrategy::LZ77(3)).unwrap();
+        let decoded =
+            decode_tracepoint_values(&buf, vals.len(), CompressionStrategy::LZ77(3)).unwrap();
+        assert_eq!(vals, decoded);
+    }
+
+    #[test]
+    fn lz77_roundtrip_no_repeats() {
+        // Values without patterns - should still work, just less compression
+        let vals = vec![1u64, 2, 3, 4, 5, 6, 7, 8];
+        let buf = encode_tracepoint_values(&vals, CompressionStrategy::LZ77(3)).unwrap();
+        let decoded =
+            decode_tracepoint_values(&buf, vals.len(), CompressionStrategy::LZ77(3)).unwrap();
+        assert_eq!(vals, decoded);
+    }
+
+    #[test]
+    fn lz77_roundtrip_long_repeat() {
+        // Long repeated sequence - tests overlapping match handling
+        let vals = vec![42u64; 100];
+        let buf = encode_tracepoint_values(&vals, CompressionStrategy::LZ77(3)).unwrap();
+        let decoded =
+            decode_tracepoint_values(&buf, vals.len(), CompressionStrategy::LZ77(3)).unwrap();
+        assert_eq!(vals, decoded);
+    }
+
+    #[test]
+    fn lz77_empty() {
+        let empty: Vec<u64> = Vec::new();
+        let buf = encode_tracepoint_values(&empty, CompressionStrategy::LZ77(3)).unwrap();
+        assert!(buf.is_empty());
     }
 }

@@ -116,12 +116,29 @@ pub fn compress_paf_to_tpa(
     config: CompressionConfig,
 ) -> io::Result<()> {
     let second = config.effective_second_strategy();
+
+    // If using dual strategies, require explicit dual layers
+    let (first_layer, second_layer) = if config.second_strategy.is_some() {
+        // Dual strategy mode - require explicit second_layer
+        let second_layer = config.second_layer.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Dual strategy mode requires explicit second layer (use dual_layer() instead of layer())",
+            )
+        })?;
+        (config.first_layer, second_layer)
+    } else {
+        // Single strategy mode - use first_layer for both
+        (config.first_layer, config.first_layer)
+    };
+
     compress_paf_internal(
         input_path,
         output_path,
         config.first_strategy,
         second,
-        config.layer,
+        first_layer,
+        second_layer,
         config.tp_type,
         config.max_complexity,
         config.complexity_metric,
@@ -160,7 +177,8 @@ fn compress_paf_internal(
     output_path: &str,
     first_strategy: CompressionStrategy,
     second_strategy: CompressionStrategy,
-    user_specified_layer: format::CompressionLayer,
+    user_first_layer: format::CompressionLayer,
+    user_second_layer: format::CompressionLayer,
     tp_type: TracepointType,
     max_complexity: u32,
     complexity_metric: ComplexityMetric,
@@ -245,8 +263,8 @@ fn compress_paf_internal(
         None => (
             first_strategy,
             second_strategy,
-            user_specified_layer,
-            user_specified_layer,
+            user_first_layer,
+            user_second_layer,
         ),
     };
 

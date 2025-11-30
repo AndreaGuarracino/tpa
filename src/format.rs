@@ -113,8 +113,10 @@ pub struct CompressionConfig {
     pub first_strategy: CompressionStrategy,
     /// Strategy for second values (None = use first_strategy)
     pub second_strategy: Option<CompressionStrategy>,
-    /// Compression layer (Zstd, Bgzip, or Nocomp)
-    pub layer: CompressionLayer,
+    /// Compression layer for first stream
+    pub first_layer: CompressionLayer,
+    /// Compression layer for second stream (None = use first_layer)
+    pub second_layer: Option<CompressionLayer>,
     /// Tracepoint representation type
     pub tp_type: TracepointType,
     /// Maximum complexity/spacing parameter
@@ -132,7 +134,8 @@ impl Default for CompressionConfig {
         Self {
             first_strategy: CompressionStrategy::Automatic(3, 10000),
             second_strategy: None,
-            layer: CompressionLayer::Zstd,
+            first_layer: CompressionLayer::Zstd,
+            second_layer: None,
             tp_type: TracepointType::Standard,
             max_complexity: 32,
             complexity_metric: ComplexityMetric::EditDistance,
@@ -166,9 +169,17 @@ impl CompressionConfig {
         self
     }
 
-    /// Set the compression layer
+    /// Set the compression layer (used for both first and second streams)
     pub fn layer(mut self, l: CompressionLayer) -> Self {
-        self.layer = l;
+        self.first_layer = l;
+        self.second_layer = None;
+        self
+    }
+
+    /// Set separate compression layers for first and second streams
+    pub fn dual_layer(mut self, first: CompressionLayer, second: CompressionLayer) -> Self {
+        self.first_layer = first;
+        self.second_layer = Some(second);
         self
     }
 
@@ -262,11 +273,6 @@ pub enum CompressionStrategy {
     /// - Optimal for direct tracepoints with 30%+ zero deltas
     /// - Configurable compression level (max 22, default: 3)
     HybridRLE(i32),
-    /// Offset-based Joint Encoding
-    /// - Encode target as offset from query (simpler than 2D-Delta)
-    /// - Optimal for high correlation data (ρ > 0.95)
-    /// - Configurable compression level (max 22, default: 3)
-    OffsetJoint(i32),
     /// XOR-based differential encoding (Gorilla)
     /// - XOR each value with predecessor, encode meaningful bits
     /// - Optimal for highly correlated coordinates (12x compression)
@@ -322,6 +328,13 @@ pub enum CompressionStrategy {
     /// - Byte-aligned output keeps O(1) random access
     /// - Configurable compression level (max 22, default: 3)
     Huffman(i32),
+    /// LZ77-style sequence matching
+    /// - Finds repeated sequences in sliding window
+    /// - Encodes as literals + (offset, length) matches
+    /// - Captures multi-value patterns that Dictionary misses
+    /// - Optimal for data with repeated subsequences
+    /// - Configurable compression level (max 22, default: 3)
+    LZ77(i32),
 }
 
 impl CompressionStrategy {
@@ -336,7 +349,6 @@ impl CompressionStrategy {
             CompressionStrategy::DeltaOfDelta(level),
             CompressionStrategy::FrameOfReference(level),
             CompressionStrategy::HybridRLE(level),
-            CompressionStrategy::OffsetJoint(level),
             CompressionStrategy::XORDelta(level),
             CompressionStrategy::Dictionary(level),
             CompressionStrategy::StreamVByte(level),
@@ -346,6 +358,7 @@ impl CompressionStrategy {
             CompressionStrategy::SelectiveRLE(level),
             CompressionStrategy::Rice(level),
             CompressionStrategy::Huffman(level),
+            CompressionStrategy::LZ77(level),
         ]
     }
 
@@ -428,7 +441,6 @@ impl CompressionStrategy {
             "delta-of-delta" => Ok(CompressionStrategy::DeltaOfDelta(level)),
             "frame-of-reference" | "for" => Ok(CompressionStrategy::FrameOfReference(level)),
             "hybrid-rle" => Ok(CompressionStrategy::HybridRLE(level)),
-            "offset-joint" => Ok(CompressionStrategy::OffsetJoint(level)),
             "xor-delta" => Ok(CompressionStrategy::XORDelta(level)),
             "dictionary" | "dict" => Ok(CompressionStrategy::Dictionary(level)),
             "stream-vbyte" | "streamvbyte" => Ok(CompressionStrategy::StreamVByte(level)),
@@ -438,6 +450,7 @@ impl CompressionStrategy {
             "selective-rle" | "selectiverle" => Ok(CompressionStrategy::SelectiveRLE(level)),
             "rice" => Ok(CompressionStrategy::Rice(level)),
             "huffman" => Ok(CompressionStrategy::Huffman(level)),
+            "lz77" => Ok(CompressionStrategy::LZ77(level)),
             _ => Err(format!(
                 "Unsupported compression strategy '{}'. Use --help to see all available strategies.",
                 name
@@ -457,7 +470,6 @@ impl CompressionStrategy {
             "delta-of-delta",
             "frame-of-reference",
             "hybrid-rle",
-            "offset-joint",
             "xor-delta",
             "dictionary",
             "stream-vbyte",
@@ -467,11 +479,12 @@ impl CompressionStrategy {
             "selective-rle",
             "rice",
             "huffman",
+            "lz77",
         ]
     }
 
     /// Convert to strategy code for file header
-    /// Note: Strategy codes 0-10 unchanged, codes 11-17 are renumbered (Simple8 removed)
+    /// Strategy codes: 0-17 (18 strategies)
     fn to_code(&self) -> io::Result<u8> {
         match self {
             CompressionStrategy::Automatic(_, _) => Err(io::Error::new(
@@ -486,21 +499,21 @@ impl CompressionStrategy {
             CompressionStrategy::DeltaOfDelta(_) => Ok(5),
             CompressionStrategy::FrameOfReference(_) => Ok(6),
             CompressionStrategy::HybridRLE(_) => Ok(7),
-            CompressionStrategy::OffsetJoint(_) => Ok(8),
-            CompressionStrategy::XORDelta(_) => Ok(9),
-            CompressionStrategy::Dictionary(_) => Ok(10),
-            CompressionStrategy::StreamVByte(_) => Ok(11),
-            CompressionStrategy::FastPFOR(_) => Ok(12),
-            CompressionStrategy::Cascaded(_) => Ok(13),
-            CompressionStrategy::Simple8bFull(_) => Ok(14),
-            CompressionStrategy::SelectiveRLE(_) => Ok(15),
-            CompressionStrategy::Rice(_) => Ok(16),
-            CompressionStrategy::Huffman(_) => Ok(17),
+            CompressionStrategy::XORDelta(_) => Ok(8),
+            CompressionStrategy::Dictionary(_) => Ok(9),
+            CompressionStrategy::StreamVByte(_) => Ok(10),
+            CompressionStrategy::FastPFOR(_) => Ok(11),
+            CompressionStrategy::Cascaded(_) => Ok(12),
+            CompressionStrategy::Simple8bFull(_) => Ok(13),
+            CompressionStrategy::SelectiveRLE(_) => Ok(14),
+            CompressionStrategy::Rice(_) => Ok(15),
+            CompressionStrategy::Huffman(_) => Ok(16),
+            CompressionStrategy::LZ77(_) => Ok(17),
         }
     }
 
     /// Parse from strategy code
-    /// Note: Strategy codes 0-10 unchanged, codes 11-17 are renumbered (Simple8 removed)
+    /// Strategy codes: 0-17 (18 strategies)
     fn from_code(code: u8) -> io::Result<Self> {
         match code {
             0 => Ok(CompressionStrategy::Raw(3)),
@@ -511,16 +524,16 @@ impl CompressionStrategy {
             5 => Ok(CompressionStrategy::DeltaOfDelta(3)),
             6 => Ok(CompressionStrategy::FrameOfReference(3)),
             7 => Ok(CompressionStrategy::HybridRLE(3)),
-            8 => Ok(CompressionStrategy::OffsetJoint(3)),
-            9 => Ok(CompressionStrategy::XORDelta(3)),
-            10 => Ok(CompressionStrategy::Dictionary(3)),
-            11 => Ok(CompressionStrategy::StreamVByte(3)),
-            12 => Ok(CompressionStrategy::FastPFOR(3)),
-            13 => Ok(CompressionStrategy::Cascaded(3)),
-            14 => Ok(CompressionStrategy::Simple8bFull(3)),
-            15 => Ok(CompressionStrategy::SelectiveRLE(3)),
-            16 => Ok(CompressionStrategy::Rice(3)),
-            17 => Ok(CompressionStrategy::Huffman(3)),
+            8 => Ok(CompressionStrategy::XORDelta(3)),
+            9 => Ok(CompressionStrategy::Dictionary(3)),
+            10 => Ok(CompressionStrategy::StreamVByte(3)),
+            11 => Ok(CompressionStrategy::FastPFOR(3)),
+            12 => Ok(CompressionStrategy::Cascaded(3)),
+            13 => Ok(CompressionStrategy::Simple8bFull(3)),
+            14 => Ok(CompressionStrategy::SelectiveRLE(3)),
+            15 => Ok(CompressionStrategy::Rice(3)),
+            16 => Ok(CompressionStrategy::Huffman(3)),
+            17 => Ok(CompressionStrategy::LZ77(3)),
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("Unsupported compression strategy code: {}", code),
@@ -542,7 +555,6 @@ impl CompressionStrategy {
             CompressionStrategy::DeltaOfDelta(level) => *level,
             CompressionStrategy::FrameOfReference(level) => *level,
             CompressionStrategy::HybridRLE(level) => *level,
-            CompressionStrategy::OffsetJoint(level) => *level,
             CompressionStrategy::XORDelta(level) => *level,
             CompressionStrategy::Dictionary(level) => *level,
             CompressionStrategy::StreamVByte(level) => *level,
@@ -552,6 +564,7 @@ impl CompressionStrategy {
             CompressionStrategy::SelectiveRLE(level) => *level,
             CompressionStrategy::Rice(level) => *level,
             CompressionStrategy::Huffman(level) => *level,
+            CompressionStrategy::LZ77(level) => *level,
         }
     }
 }
@@ -600,9 +613,6 @@ impl std::fmt::Display for CompressionStrategy {
             CompressionStrategy::HybridRLE(level) => {
                 write!(f, "HybridRLE (level {})", level)
             }
-            CompressionStrategy::OffsetJoint(level) => {
-                write!(f, "OffsetJoint (level {})", level)
-            }
             CompressionStrategy::XORDelta(level) => {
                 write!(f, "XORDelta (level {})", level)
             }
@@ -629,6 +639,9 @@ impl std::fmt::Display for CompressionStrategy {
             }
             CompressionStrategy::Huffman(level) => {
                 write!(f, "Huffman (level {})", level)
+            }
+            CompressionStrategy::LZ77(level) => {
+                write!(f, "LZ77 (level {})", level)
             }
         }
     }

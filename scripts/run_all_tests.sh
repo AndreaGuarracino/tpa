@@ -367,7 +367,7 @@ cat >> "$FINAL_REPORT" << FOOTER
 - **Distance Metric:** gap-affine (penalties: 5,8,2)
 - **Tracepoint Types Tested:** ${TP_TYPES[*]}
 - **Automatic Mode:** $AUTO_DESC
-- **Compression Strategies:** raw, zigzag-delta, 2d-delta, rle, bit-packed, delta-of-delta, frame-of-reference, hybrid-rle, offset-joint, xor-delta, dictionary, stream-vbyte, fastpfor, cascaded, simple8b-full, selective-rle, rice, huffman
+- **Compression Strategies:** raw, zigzag-delta, 2d-delta, rle, bit-packed, delta-of-delta, frame-of-reference, hybrid-rle, xor-delta, dictionary, stream-vbyte, fastpfor, cascaded, simple8b-full, selective-rle, rice, huffman, lz77
 - **Seek Modes:** Mode A (TpaReader), Mode B (standalone functions)
 
 ## What Was Tested
