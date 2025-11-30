@@ -1,5 +1,35 @@
 #!/bin/bash
 set -e
+#
+# Comprehensive test suite for TPA compression
+#
+# REQUIREMENTS:
+#   - cigzip binary (https://github.com/AndreaGuarracino/cigzip)
+#   - Set CIGZIP or CIGZIP_DIR environment variable:
+#       CIGZIP=/path/to/cigzip/target/release/cigzip  (direct binary path)
+#       CIGZIP_DIR=/path/to/cigzip                    (repo root, builds if needed)
+#
+# USAGE:
+#   ./comprehensive_test.sh <input.paf[.gz]> [output_dir] [max_complexity] [metric] [num_records] [test_mode] [threads] [tp_types]
+#
+# EXAMPLES:
+#   # Basic test with defaults (20000 records, single mode)
+#   CIGZIP=/path/to/cigzip/target/release/cigzip ./comprehensive_test.sh data.paf.gz
+#
+#   # Test 1000 records with automatic strategy selection
+#   CIGZIP=/path/to/cigzip/target/release/cigzip ./comprehensive_test.sh data.paf.gz /tmp/results 32 edit-distance 1000 auto:0
+#
+#   # Full dual-strategy matrix (all combinations) with 4 threads
+#   CIGZIP_DIR=/path/to/cigzip ./comprehensive_test.sh data.paf.gz /tmp/dual 32 edit-distance 500 dual 4
+#
+#   # Test multiple tracepoint types
+#   CIGZIP=/path/to/cigzip/target/release/cigzip ./comprehensive_test.sh data.paf.gz /tmp/out 32 edit-distance 1000 single 1 standard,variable,mixed
+#
+# TEST MODES:
+#   single    - Test each strategy symmetrically (first==second) [default]
+#   dual      - Test all first×second strategy combinations
+#   auto:N    - Only test automatic mode with N-record sampling (0=full file)
+#
 
 # Ensure Rust/Cargo tools are available
 if [ -f "$HOME/.cargo/env" ]; then
@@ -14,8 +44,18 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
-CIGZIP_DIR="${CIGZIP_DIR:-}"
-CIGZIP="$CIGZIP_DIR/target/release/cigzip"
+
+# Support both CIGZIP (direct binary path) and CIGZIP_DIR (repo root)
+if [ -n "${CIGZIP:-}" ] && [ -f "$CIGZIP" ]; then
+    # CIGZIP points directly to the binary
+    CIGZIP_DIR=""
+elif [ -n "${CIGZIP_DIR:-}" ]; then
+    # CIGZIP_DIR points to repo root
+    CIGZIP="$CIGZIP_DIR/target/release/cigzip"
+else
+    CIGZIP=""
+    CIGZIP_DIR=""
+fi
 NORMALIZE="python3 $SCRIPT_DIR/normalize_paf.py"
 
 # Safe numeric ratio helper
@@ -197,22 +237,25 @@ echo "Extracted: $EXTRACTED records ($SIZE bytes)"
 echo ""
 
 # Build tools if needed
-if [ ! -f "$CIGZIP" ]; then
+if [ -z "$CIGZIP" ] || [ ! -f "$CIGZIP" ]; then
     if [ -z "$CIGZIP_DIR" ]; then
-        echo "ERROR: CIGZIP_DIR environment variable not set."
-        echo "Please set it to the path of your cigzip repository:"
-        echo "  export CIGZIP_DIR=/path/to/cigzip"
-        echo "  # or"
-        echo "  CIGZIP_DIR=/path/to/cigzip $0 $*"
+        echo "ERROR: cigzip not found."
+        echo "Set one of these environment variables:"
+        echo "  CIGZIP=/path/to/cigzip/target/release/cigzip   # direct binary path"
+        echo "  CIGZIP_DIR=/path/to/cigzip                     # repo root (will build if needed)"
+        echo ""
+        echo "Example:"
+        echo "  CIGZIP=/path/to/cigzip/target/release/cigzip $0 $*"
         exit 1
     fi
     if [ ! -d "$CIGZIP_DIR" ]; then
-        echo "ERROR: CIGZIP_DIR=$CIGZIP_DIR does not exist."
+        echo "ERROR: CIGZIP_DIR=$CIGZIP_DIR does not exist or is not a directory."
         exit 1
     fi
     echo "=== Building cigzip ==="
     cd "$CIGZIP_DIR"
     cargo build --release 2>&1 | tail -3
+    CIGZIP="$CIGZIP_DIR/target/release/cigzip"
 fi
 
 if [ ! -f "$REPO_DIR/target/release/libtpa.rlib" ]; then
@@ -221,368 +264,33 @@ if [ ! -f "$REPO_DIR/target/release/libtpa.rlib" ]; then
     cargo build --release 2>&1 | tail -3
 fi
 
-# Build seek test programs
-echo "=== Building seek test programs ==="
-cd "$REPO_DIR"
+# Build seek benchmark examples if needed
+SEEK_BENCH_READER="$REPO_DIR/target/release/examples/seek_bench_reader"
+SEEK_BENCH_DIRECT="$REPO_DIR/target/release/examples/seek_bench_direct"
 
-# Mode A: TpaReader with index
-cat > /tmp/seek_mode_a.rs << 'RUST_A'
-use std::env;
-use std::time::Instant;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use tpa::TpaReader;
-use tpa::TracepointData;
+if [ ! -f "$SEEK_BENCH_READER" ] || [ ! -f "$SEEK_BENCH_DIRECT" ]; then
+    echo "=== Building seek benchmark examples ==="
+    cd "$REPO_DIR"
+    cargo build --release --examples 2>&1 | tail -3
+fi
 
-// Reference type that can hold any tracepoint format
-enum Reference {
-    Standard(Vec<Vec<(usize, usize)>>),
-    Variable(Vec<Vec<(usize, Option<usize>)>>),
-}
-
-fn parse_reference(path: &str, limit: usize, tp_type: &str) -> Reference {
-    let file = File::open(path).expect("reference PAF open failed");
-    let reader = BufReader::new(file);
-
-    match tp_type {
-        "variable" => {
-            let mut refs = Vec::new();
-            for line in reader.lines().take(limit) {
-                let line = line.expect("line read");
-                if let Some(tp_idx) = line.find("tp:Z:") {
-                    let tp_str = &line[tp_idx + 5..];
-                    let tps: Vec<(usize, Option<usize>)> = tp_str
-                        .split(';')
-                        .filter(|s| !s.is_empty())
-                        .map(|pair| {
-                            let mut it = pair.split(',');
-                            let a: usize = it.next().unwrap().parse().unwrap();
-                            let b: Option<usize> = it.next().map(|s| s.parse().unwrap());
-                            (a, b)
-                        })
-                        .collect();
-                    refs.push(tps);
-                }
-            }
-            Reference::Variable(refs)
-        }
-        _ => {
-            // standard, mixed - parse as pairs
-            let mut refs = Vec::new();
-            for line in reader.lines().take(limit) {
-                let line = line.expect("line read");
-                if let Some(tp_idx) = line.find("tp:Z:") {
-                    let tp_str = &line[tp_idx + 5..];
-                    let tps: Vec<(usize, usize)> = tp_str
-                        .split(';')
-                        .filter(|s| !s.is_empty())
-                        .map(|pair| {
-                            let mut it = pair.split(',');
-                            let a: usize = it.next().unwrap().parse().unwrap();
-                            let b: usize = it.next().unwrap().parse().unwrap();
-                            (a, b)
-                        })
-                        .collect();
-                    refs.push(tps);
-                }
-            }
-            Reference::Standard(refs)
-        }
-    }
-}
-
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    let tpa_path = &args[1];
-    let num_records: u64 = args[2].parse().unwrap();
-    let num_positions: usize = args[3].parse().unwrap();
-    let iterations_per_pos: usize = args[4].parse().unwrap();
-    let tp_type = &args[5];
-    let reference_paf = &args[6];
-
-    let mut reader = TpaReader::open(tpa_path).unwrap();
-    let reference = parse_reference(reference_paf, num_records as usize, tp_type);
-
-    // Generate random positions
-    use std::collections::HashSet;
-    let mut rng = 12345u64;
-    let mut positions = HashSet::new();
-    while positions.len() < num_positions {
-        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
-        positions.insert((rng % num_records) as u64);
-    }
-    let positions: Vec<u64> = positions.into_iter().collect();
-
-    let mut sum_us = 0u128;
-    let mut sum_sq_us = 0u128;
-    let mut success = 0usize;
-    let total_tests = num_positions * iterations_per_pos;
-
-    for &pos in &positions {
-        // Warmup
-        for _ in 0..3 { let _ = reader.get_tracepoints(pos); }
-
-        // Benchmark this position
-        for _ in 0..iterations_per_pos {
-            let start = Instant::now();
-            match reader.get_tracepoints(pos) {
-                Ok((tp, _, _)) => {
-                    let time_us = start.elapsed().as_micros();
-                    sum_us += time_us;
-                    sum_sq_us += time_us * time_us;
-                    success += 1;
-
-                    // Validate based on type
-                    match (&tp, &reference) {
-                        (TracepointData::Standard(tps), Reference::Standard(refs)) |
-                        (TracepointData::Fastga(tps), Reference::Standard(refs)) => {
-                            if let Some(expected) = refs.get(pos as usize) {
-                                if expected.as_slice() != tps.as_slice() {
-                                    eprintln!("Tracepoint mismatch at record {}", pos);
-                                    std::process::exit(1);
-                                }
-                            }
-                        }
-                        (TracepointData::Variable(tps), Reference::Variable(refs)) => {
-                            if let Some(expected) = refs.get(pos as usize) {
-                                if expected.as_slice() != tps.as_slice() {
-                                    eprintln!("Variable tracepoint mismatch at record {}", pos);
-                                    std::process::exit(1);
-                                }
-                            }
-                        }
-                        (TracepointData::Mixed(_), _) => {
-                            // Mixed validation is complex, just check decode succeeded
-                        }
-                        _ => {
-                            eprintln!("Tracepoint type mismatch");
-                            std::process::exit(1);
-                        }
-                    }
-                }
-                Err(_) => {}
-            }
-        }
-    }
-
-    let avg_us = sum_us as f64 / total_tests as f64;
-    let variance = (sum_sq_us as f64 / total_tests as f64) - (avg_us * avg_us);
-    let stddev_us = variance.sqrt();
-    let success_ratio = success as f64 / total_tests as f64;
-
-    println!("{:.2} {:.2} {:.4}", avg_us, stddev_us, success_ratio);
-}
-RUST_A
-
-# Mode B: Standalone functions
-cat > /tmp/seek_mode_b.rs << 'RUST_B'
-use std::env;
-use std::time::Instant;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use tpa::{
-    read_mixed_tracepoints_at_offset, read_standard_tracepoints_at_offset_with_strategies,
-    read_variable_tracepoints_at_offset, TpaReader,
-};
-
-// Reference type that can hold any tracepoint format
-enum Reference {
-    Standard(Vec<Vec<(usize, usize)>>),
-    Variable(Vec<Vec<(usize, Option<usize>)>>),
-}
-
-fn parse_reference(path: &str, limit: usize, tp_type: &str) -> Reference {
-    let file = File::open(path).expect("reference PAF open failed");
-    let reader = BufReader::new(file);
-
-    match tp_type {
-        "variable" => {
-            let mut refs = Vec::new();
-            for line in reader.lines().take(limit) {
-                let line = line.expect("line read");
-                if let Some(tp_idx) = line.find("tp:Z:") {
-                    let tp_str = &line[tp_idx + 5..];
-                    let tps: Vec<(usize, Option<usize>)> = tp_str
-                        .split(';')
-                        .filter(|s| !s.is_empty())
-                        .map(|pair| {
-                            let mut it = pair.split(',');
-                            let a: usize = it.next().unwrap().parse().unwrap();
-                            let b: Option<usize> = it.next().map(|s| s.parse().unwrap());
-                            (a, b)
-                        })
-                        .collect();
-                    refs.push(tps);
-                }
-            }
-            Reference::Variable(refs)
-        }
-        _ => {
-            // standard, mixed - parse as pairs
-            let mut refs = Vec::new();
-            for line in reader.lines().take(limit) {
-                let line = line.expect("line read");
-                if let Some(tp_idx) = line.find("tp:Z:") {
-                    let tp_str = &line[tp_idx + 5..];
-                    let tps: Vec<(usize, usize)> = tp_str
-                        .split(';')
-                        .filter(|s| !s.is_empty())
-                        .map(|pair| {
-                            let mut it = pair.split(',');
-                            let a: usize = it.next().unwrap().parse().unwrap();
-                            let b: usize = it.next().unwrap().parse().unwrap();
-                            (a, b)
-                        })
-                        .collect();
-                    refs.push(tps);
-                }
-            }
-            Reference::Standard(refs)
-        }
-    }
-}
-
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    let tpa_path = &args[1];
-    let num_records: u64 = args[2].parse().unwrap();
-    let num_positions: usize = args[3].parse().unwrap();
-    let iterations_per_pos: usize = args[4].parse().unwrap();
-    let tp_type = &args[5];
-    let reference_paf = &args[6];
-
-    let mut reader = TpaReader::open(tpa_path).unwrap();
-    let (first_strategy, second_strategy) = reader.header().strategies().unwrap();
-    let first_layer = reader.header().first_layer();
-    let second_layer = reader.header().second_layer();
-    let reference = parse_reference(reference_paf, num_records as usize, tp_type);
-
-    // Generate random positions and get their offsets
-    use std::collections::HashSet;
-    let mut rng = 12345u64;
-    let mut positions = HashSet::new();
-    while positions.len() < num_positions {
-        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
-        positions.insert((rng % num_records) as u64);
-    }
-
-    let offsets: Vec<u64> = positions
-        .iter()
-        .map(|&pos| reader.get_tracepoint_offset(pos).unwrap())
-        .collect();
-    drop(reader);
-
-    let mut file = File::open(tpa_path).unwrap();
-    let mut sum_us = 0u128;
-    let mut sum_sq_us = 0u128;
-    let mut success = 0usize;
-    let total_tests = num_positions * iterations_per_pos;
-
-    for (&offset, &record_id) in offsets.iter().zip(positions.iter()) {
-        // Warmup
-        for _ in 0..3 {
-            match tp_type.as_str() {
-                "standard" => { let _ = read_standard_tracepoints_at_offset_with_strategies(
-                    &mut file, offset, first_strategy.clone(), second_strategy.clone(),
-                    first_layer, second_layer); }
-                "variable" => { let _ = read_variable_tracepoints_at_offset(
-                    &mut file, offset, first_strategy.clone(), second_strategy.clone(),
-                    first_layer, second_layer); }
-                "mixed" => { let _ = read_mixed_tracepoints_at_offset(
-                    &mut file, offset, first_strategy.clone(), second_strategy.clone(),
-                    first_layer, second_layer); }
-                _ => panic!("Invalid tp_type"),
-            }
-        }
-
-        // Benchmark this position
-        for _ in 0..iterations_per_pos {
-            let start = Instant::now();
-            let ok = match tp_type.as_str() {
-                "standard" => {
-                    match read_standard_tracepoints_at_offset_with_strategies(
-                        &mut file, offset, first_strategy.clone(), second_strategy.clone(),
-                        first_layer, second_layer) {
-                        Ok(tps) => {
-                            if let Reference::Standard(refs) = &reference {
-                                if let Some(expected) = refs.get(record_id as usize) {
-                                    if expected.as_slice() != tps.as_slice() {
-                                        eprintln!("Tracepoint mismatch at record {}", record_id);
-                                        std::process::exit(1);
-                                    }
-                                }
-                            }
-                            true
-                        }
-                        Err(_) => false,
-                    }
-                }
-                "variable" => {
-                    match read_variable_tracepoints_at_offset(
-                        &mut file, offset, first_strategy.clone(), second_strategy.clone(),
-                        first_layer, second_layer) {
-                        Ok(tps) => {
-                            if let Reference::Variable(refs) = &reference {
-                                if let Some(expected) = refs.get(record_id as usize) {
-                                    if expected.as_slice() != tps.as_slice() {
-                                        eprintln!("Variable tracepoint mismatch at record {}", record_id);
-                                        std::process::exit(1);
-                                    }
-                                }
-                            }
-                            true
-                        }
-                        Err(_) => false,
-                    }
-                }
-                "mixed" => {
-                    read_mixed_tracepoints_at_offset(
-                        &mut file, offset, first_strategy.clone(), second_strategy.clone(),
-                        first_layer, second_layer).is_ok()
-                }
-                _ => panic!("Invalid tp_type"),
-            };
-
-            if ok {
-                let time_us = start.elapsed().as_micros();
-                sum_us += time_us;
-                sum_sq_us += time_us * time_us;
-                success += 1;
-            }
-        }
-    }
-
-    let avg_us = sum_us as f64 / total_tests as f64;
-    let variance = (sum_sq_us as f64 / total_tests as f64) - (avg_us * avg_us);
-    let stddev_us = variance.sqrt();
-    let success_ratio = success as f64 / total_tests as f64;
-
-    println!("{:.2} {:.2} {:.4}", avg_us, stddev_us, success_ratio);
-}
-RUST_B
-
-if ! rustc --edition 2021 -O /tmp/seek_mode_a.rs \
-    -L target/release/deps --extern tpa=target/release/libtpa.rlib \
-    -o /tmp/seek_mode_a 2>&1; then
-    echo "✗ Error: Failed to compile seek_mode_a"
+if [ ! -f "$SEEK_BENCH_READER" ]; then
+    echo "✗ Error: Failed to build seek_bench_reader"
+    exit 1
+fi
+if [ ! -f "$SEEK_BENCH_DIRECT" ]; then
+    echo "✗ Error: Failed to build seek_bench_direct"
     exit 1
 fi
 
-if ! rustc --edition 2021 -O /tmp/seek_mode_b.rs \
-    -L target/release/deps --extern tpa=target/release/libtpa.rlib \
-    -o /tmp/seek_mode_b 2>&1; then
-    echo "✗ Error: Failed to compile seek_mode_b"
-    exit 1
-fi
-
-echo "✓ Seek tools ready"
+echo "✓ Seek benchmark tools ready"
 echo ""
 
 # Results storage - declare arrays before use
 declare -A ENCODE_TIME ENCODE_MEM
 declare -A COMPRESS_TIME COMPRESS_MEM COMPRESS_SIZE
 declare -A DECOMPRESS_TIME DECOMPRESS_MEM
-declare -A SEEK_A SEEK_B SEEK_A_STDDEV SEEK_B_STDDEV SEEK_SUCCESS_RATIO
+declare -A SEEK_A SEEK_B SEEK_A_STDDEV SEEK_B_STDDEV SEEK_DECODE_RATIO SEEK_VALID_RATIO
 declare -A VERIFIED
 declare -A TP_SIZE
 declare -A BGZIP_TIME BGZIP_MEM BGZIP_SIZE
@@ -807,24 +515,27 @@ test_configuration() {
     fi
     
     # Seek Mode A: 10 positions × 10 iterations (for quick testing)
-    local seek_a_result=$(/tmp/seek_mode_a "$OUTPUT_DIR/${key}.tpa" "$EXTRACTED" 10 10 "$tp_type" "$tp_paf" || echo "0 0 0")
-    read -r seek_a_avg seek_a_std seek_a_ratio <<< "$seek_a_result"
+    # Output: avg_us stddev_us decode_ratio valid_ratio
+    local seek_a_result=$("$SEEK_BENCH_READER" "$OUTPUT_DIR/${key}.tpa" "$EXTRACTED" 10 10 "$tp_type" "$tp_paf" || echo "0 0 0 0")
+    read -r seek_a_avg seek_a_std seek_a_decode seek_a_valid <<< "$seek_a_result"
     SEEK_A[$key]="$seek_a_avg"
     SEEK_A_STDDEV[$key]="$seek_a_std"
 
     # Seek Mode B: 10 positions × 10 iterations (for quick testing)
-    local seek_b_result=$(/tmp/seek_mode_b "$OUTPUT_DIR/${key}.tpa" "$EXTRACTED" 10 10 "$tp_type" "$tp_paf" || echo "0 0 0")
-    read -r seek_b_avg seek_b_std seek_b_ratio <<< "$seek_b_result"
+    # Output: avg_us stddev_us decode_ratio valid_ratio
+    local seek_b_result=$("$SEEK_BENCH_DIRECT" "$OUTPUT_DIR/${key}.tpa" "$EXTRACTED" 10 10 "$tp_type" "$tp_paf" || echo "0 0 0 0")
+    read -r seek_b_avg seek_b_std seek_b_decode seek_b_valid <<< "$seek_b_result"
     SEEK_B[$key]="$seek_b_avg"
     SEEK_B_STDDEV[$key]="$seek_b_std"
-    SEEK_SUCCESS_RATIO[$key]="${seek_b_ratio:-0}"  # Using Mode B ratio (both should be identical)
+    SEEK_DECODE_RATIO[$key]="${seek_b_decode:-0}"  # Using Mode B ratio (both should be identical)
+    SEEK_VALID_RATIO[$key]="${seek_b_valid:-0}"
 
     # Determine pass/fail for logging
     local failure_reasons=()
     if [ "${VERIFIED[$key]}" != "✓" ]; then
         failure_reasons+=("verification:${orig_md5}->${decomp_md5}")
     fi
-    local seek_ratio_value="${SEEK_SUCCESS_RATIO[$key]}"
+    local seek_ratio_value="${SEEK_DECODE_RATIO[$key]}"
     if ! printf '%s' "$seek_ratio_value" | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then
         failure_reasons+=("seek:non-numeric:${seek_ratio_value}")
     else
@@ -913,14 +624,15 @@ output_tsv_row() {
         verified_text="yes"
     fi
 
-    # Seek success ratio fallback
-    local seek_success=${SEEK_SUCCESS_RATIO[$key]:-0}
+    # Seek ratios fallback
+    local seek_decode=${SEEK_DECODE_RATIO[$key]:-0}
+    local seek_valid=${SEEK_VALID_RATIO[$key]:-0}
 
     # Dataset name from input file
     local dataset_name=$(basename "$INPUT_PAF" .paf.gz | sed 's/.paf$//')
 
-    # Output TSV row (32 columns - includes strategy/layer pairs)
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    # Output TSV row (33 columns - includes strategy/layer pairs)
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$dataset_name" \
         "$INPUT_TYPE" \
         "$SIZE" \
@@ -952,14 +664,15 @@ output_tsv_row() {
         "${SEEK_A_STDDEV[$key]}" \
         "${SEEK_B[$key]}" \
         "${SEEK_B_STDDEV[$key]}" \
-        "$seek_success" \
+        "$seek_decode" \
+        "$seek_valid" \
         >> "$tsv_file"
 }
 
 # Initialize TSV file with header
 TSV_FILE="$OUTPUT_DIR/results.tsv"
 cat > "$TSV_FILE" << TSV_HEADER
-dataset_name	dataset_type	original_size_bytes	num_records	encoding_type	encoding_runtime_sec	encoding_memory_mb	tp_file_size_bytes	max_complexity	complexity_metric	compression_strategy	strategy_first	strategy_second	layer_first	layer_second	compression_runtime_sec	compression_memory_mb	tpa_size_bytes	ratio_orig_to_tp	ratio_tp_to_tpa	ratio_orig_to_tpa	decompression_runtime_sec	decompression_memory_mb	verification_passed	seek_positions_tested	seek_iterations_per_position	seek_total_tests	seek_mode_a_avg_us	seek_mode_a_stddev_us	seek_mode_b_avg_us	seek_mode_b_stddev_us	seek_success_ratio
+dataset_name	dataset_type	original_size_bytes	num_records	encoding_type	encoding_runtime_sec	encoding_memory_mb	tp_file_size_bytes	max_complexity	complexity_metric	compression_strategy	strategy_first	strategy_second	layer_first	layer_second	compression_runtime_sec	compression_memory_mb	tpa_size_bytes	ratio_orig_to_tp	ratio_tp_to_tpa	ratio_orig_to_tpa	decompression_runtime_sec	decompression_memory_mb	verification_passed	seek_positions_tested	seek_iterations_per_position	seek_total_tests	seek_mode_a_avg_us	seek_mode_a_stddev_us	seek_mode_b_avg_us	seek_mode_b_stddev_us	seek_decode_ratio	seek_valid_ratio
 TSV_HEADER
 
 # Run all tests

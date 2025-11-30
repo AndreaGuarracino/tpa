@@ -1,5 +1,54 @@
 #!/bin/bash
 set -e
+#
+# Batch test runner for TPA compression across multiple PAF files
+# Aggregates results into a master TSV and final report
+#
+# REQUIREMENTS:
+#   - cigzip binary (https://github.com/AndreaGuarracino/cigzip)
+#   - Set CIGZIP or CIGZIP_DIR environment variable:
+#       CIGZIP=/path/to/cigzip/target/release/cigzip  (direct binary path)
+#       CIGZIP_DIR=/path/to/cigzip                    (repo root, builds if needed)
+#
+# USAGE:
+#   ./run_all_tests.sh <num_records> <output_base> <num_threads> \
+#       --files FILE [FILE ...] --types TYPE [TYPE ...] [--auto ROWS]
+#
+# ARGUMENTS:
+#   num_records  - Number of records to test per file (0 = all records)
+#   output_base  - Output directory for all test results
+#   num_threads  - Number of parallel threads
+#   --files      - Space-separated list of input PAF files
+#   --types      - Space-separated list of tracepoint types (standard, variable, mixed)
+#
+# OPTIONAL:
+#   --auto ROWS  - Only test automatic mode with ROWS sample size (0 = full file)
+#
+# EXAMPLES:
+#   # Test 2 files with standard tracepoints, 100 records each, 4 threads
+#   CIGZIP=/path/to/cigzip/target/release/cigzip ./run_all_tests.sh 100 /tmp/results 4 \
+#       --files data1.paf.gz data2.paf.gz --types standard
+#
+#   # Test all tracepoint types on one file
+#   CIGZIP=/path/to/cigzip/target/release/cigzip ./run_all_tests.sh 500 ./output 8 \
+#       --files input.paf --types standard variable mixed
+#
+#   # Test automatic mode only (10000-record sampling)
+#   CIGZIP_DIR=/path/to/cigzip ./run_all_tests.sh 1000 /tmp/auto 4 \
+#       --files data.paf --types standard --auto 10000
+#
+#   # Test automatic mode with full file analysis
+#   CIGZIP_DIR=/path/to/cigzip ./run_all_tests.sh 0 /tmp/full 4 \
+#       --files data.paf --types standard --auto 0
+#
+# OUTPUT:
+#   output_base/
+#   ├── all_results.tsv      # Master TSV with all test results
+#   ├── FINAL_REPORT.md      # Aggregated markdown report
+#   └── <dataset_name>/      # Per-file results
+#       ├── results.tsv
+#       └── test_report.md
+#
 
 # Ensure Rust/Cargo tools are available
 if [ -f "$HOME/.cargo/env" ]; then
@@ -7,23 +56,6 @@ if [ -f "$HOME/.cargo/env" ]; then
 else
     export PATH="/home/node/.cargo/bin:$PATH"
 fi
-
-# Wrapper script to run comprehensive tests on multiple PAF files
-# Aggregates results into a final report
-#
-# Usage: ./run_all_tests.sh <num_records> <output_base> <num_threads> \
-#            --files FILE [FILE ...] --types TYPE [TYPE ...] [--auto ROWS]
-#
-# Arguments (all required):
-#   num_records  - Number of records to test per file (0 = all records)
-#   output_base  - Output directory for all test results
-#   num_threads  - Number of parallel threads
-#   --files      - Space-separated list of input PAF files
-#   --types      - Space-separated list of tracepoint types (standard, variable, mixed)
-#
-# Optional flags:
-#   --auto ROWS  - Only test automatic mode with ROWS sample size
-#                  (default: 10000, use 0 for full file analysis)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPREHENSIVE_TEST="$SCRIPT_DIR/comprehensive_test.sh"
@@ -153,7 +185,7 @@ mkdir -p "$OUTPUT_BASE"
 # Initialize master TSV file
 MASTER_TSV="$OUTPUT_BASE/all_results.tsv"
 cat > "$MASTER_TSV" << TSV_HEADER
-dataset_name	dataset_type	original_size_bytes	num_records	encoding_type	encoding_runtime_sec	encoding_memory_mb	tp_file_size_bytes	max_complexity	complexity_metric	compression_strategy	strategy_first	strategy_second	compression_layer_first	compression_layer_second	compression_runtime_sec	compression_memory_mb	tpa_size_bytes	ratio_orig_to_tp	ratio_tp_to_tpa	ratio_orig_to_tpa	decompression_runtime_sec	decompression_memory_mb	verification_passed	seek_positions_tested	seek_iterations_per_position	seek_total_tests	seek_mode_a_avg_us	seek_mode_a_stddev_us	seek_mode_b_avg_us	seek_mode_b_stddev_us	seek_success_ratio
+dataset_name	dataset_type	original_size_bytes	num_records	encoding_type	encoding_runtime_sec	encoding_memory_mb	tp_file_size_bytes	max_complexity	complexity_metric	compression_strategy	strategy_first	strategy_second	compression_layer_first	compression_layer_second	compression_runtime_sec	compression_memory_mb	tpa_size_bytes	ratio_orig_to_tp	ratio_tp_to_tpa	ratio_orig_to_tpa	decompression_runtime_sec	decompression_memory_mb	verification_passed	seek_positions_tested	seek_iterations_per_position	seek_total_tests	seek_mode_a_avg_us	seek_mode_a_stddev_us	seek_mode_b_avg_us	seek_mode_b_stddev_us	seek_decode_ratio	seek_valid_ratio
 TSV_HEADER
 
 echo "###################################################################"

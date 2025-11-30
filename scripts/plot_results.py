@@ -197,21 +197,21 @@ def plot_dataset_metrics(df, dataset_name, output_dir):
                  ha='right', va='top',
                  bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8), fontsize=9)
 
-    # Plot 6: Tracepoint validation ratio (seek success)
+    # Plot 6: Tracepoint validation ratio (seek valid_ratio)
     ax6 = axes[5]
-    seek_ratio = data['seek_success_ratio']
+    seek_ratio = data['seek_valid_ratio']
     seek_colors = ['#2ca02c' if v >= 0.999 else '#d62728' for v in seek_ratio]  # green pass, red fail
     ax6.bar(range(len(strategies)), seek_ratio, color=seek_colors, alpha=0.8, edgecolor='black', linewidth=0.5)
     ax6.set_xlabel('Compression Strategy', fontweight='bold')
-    ax6.set_ylabel('Seek Success Ratio', fontweight='bold')
-    ax6.set_title('Tracepoint Validation Ratio (Seek Success)', fontweight='bold')
+    ax6.set_ylabel('Tracepoint Match Ratio', fontweight='bold')
+    ax6.set_title('Tracepoint Validation (Decoded vs Reference)', fontweight='bold')
     ax6.set_xticks(range(len(strategies)))
     ax6.set_xticklabels(strategies, rotation=90, ha='right', fontsize=8)
     ax6.set_ylim(0, 1.05)
     ax6.grid(axis='y', alpha=0.3)
     compact_axis(ax6, len(strategies))
-    best_idx = data['seek_success_ratio'].idxmax()
-    best_val = data.loc[best_idx, 'seek_success_ratio']
+    best_idx = data['seek_valid_ratio'].idxmax()
+    best_val = data.loc[best_idx, 'seek_valid_ratio']
     best_first = data.loc[best_idx, 'strategy_first_norm']
     best_second = data.loc[best_idx, 'strategy_second_norm']
     ax6.text(0.98, 0.98, f'Best: {best_first}→{best_second}\n{best_val:.3f}',
@@ -323,7 +323,7 @@ def main():
         'decompression_memory_mb', 'verification_passed',
         'seek_positions_tested', 'seek_iterations_per_position',
         'seek_total_tests', 'seek_mode_a_avg_us', 'seek_mode_a_stddev_us',
-        'seek_mode_b_avg_us', 'seek_mode_b_stddev_us', 'seek_success_ratio'
+        'seek_mode_b_avg_us', 'seek_mode_b_stddev_us', 'seek_decode_ratio', 'seek_valid_ratio'
     ]
 
     df = pd.read_csv(tsv_file, sep='\t', index_col=False, engine='python')
@@ -344,7 +344,7 @@ def main():
         'ratio_orig_to_tpa', 'decompression_runtime_sec', 'decompression_memory_mb',
         'seek_positions_tested', 'seek_iterations_per_position', 'seek_total_tests',
         'seek_mode_a_avg_us', 'seek_mode_a_stddev_us', 'seek_mode_b_avg_us',
-        'seek_mode_b_stddev_us', 'seek_success_ratio'
+        'seek_mode_b_stddev_us', 'seek_decode_ratio', 'seek_valid_ratio'
     ]
     for col in numeric_cols:
         if col in df.columns:
