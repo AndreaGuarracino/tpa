@@ -267,8 +267,9 @@ fi
 # Build seek benchmark examples if needed
 SEEK_BENCH_READER="$REPO_DIR/target/release/examples/seek_bench_reader"
 SEEK_BENCH_DIRECT="$REPO_DIR/target/release/examples/seek_bench_direct"
+SEEK_BENCH_BGZIP_PAF="$REPO_DIR/target/release/examples/seek_bench_bgzip_paf"
 
-if [ ! -f "$SEEK_BENCH_READER" ] || [ ! -f "$SEEK_BENCH_DIRECT" ]; then
+if [ ! -f "$SEEK_BENCH_READER" ] || [ ! -f "$SEEK_BENCH_DIRECT" ] || [ ! -f "$SEEK_BENCH_BGZIP_PAF" ]; then
     echo "=== Building seek benchmark examples ==="
     cd "$REPO_DIR"
     cargo build --release --examples 2>&1 | tail -3
@@ -280,6 +281,10 @@ if [ ! -f "$SEEK_BENCH_READER" ]; then
 fi
 if [ ! -f "$SEEK_BENCH_DIRECT" ]; then
     echo "✗ Error: Failed to build seek_bench_direct"
+    exit 1
+fi
+if [ ! -f "$SEEK_BENCH_BGZIP_PAF" ]; then
+    echo "✗ Error: Failed to build seek_bench_bgzip_paf"
     exit 1
 fi
 
@@ -294,6 +299,7 @@ declare -A SEEK_A SEEK_B SEEK_A_STDDEV SEEK_B_STDDEV SEEK_DECODE_RATIO SEEK_VALI
 declare -A VERIFIED
 declare -A TP_SIZE
 declare -A BGZIP_TIME BGZIP_MEM BGZIP_SIZE
+declare -A BGZIP_SEEK_AVG BGZIP_SEEK_STDDEV BGZIP_SEEK_DECODE BGZIP_SEEK_VALID
 declare -A STRATEGY_FIRST STRATEGY_SECOND
 declare -A LAYER_FIRST LAYER_SECOND
 
@@ -341,15 +347,25 @@ if command -v bgzip &> /dev/null; then
             # Extract compression metrics
             BGZIP_TIME[$TP_TYPE]=$(grep "Elapsed (wall clock)" "$OUTPUT_DIR/${TP_TYPE}_bgzip.log" | awk '{print $8}')
             BGZIP_MEM[$TP_TYPE]=$(grep "Maximum resident set size" "$OUTPUT_DIR/${TP_TYPE}_bgzip.log" | awk '{print $6}')
-        BGZIP_SIZE[$TP_TYPE]=$(file_size "${TP_PAF}.gz")
-        TP_SIZE[$TP_TYPE]=$(file_size "$TP_PAF")
+            BGZIP_SIZE[$TP_TYPE]=$(file_size "${TP_PAF}.gz")
+            TP_SIZE[$TP_TYPE]=$(file_size "$TP_PAF")
 
             ratio_bgzip=$(safe_ratio "${TP_SIZE[$TP_TYPE]}" "${BGZIP_SIZE[$TP_TYPE]}" 2)
             echo "    Uncompressed: $(numfmt --to=iec ${TP_SIZE[$TP_TYPE]})"
             echo "    BGZIP:        $(numfmt --to=iec ${BGZIP_SIZE[$TP_TYPE]}) (${ratio_bgzip}x compression)"
+
+            # Run BGZIP seek benchmark
+            echo "    Running BGZIP seek benchmark..."
+            bgzip_seek_result=$("$SEEK_BENCH_BGZIP_PAF" "${TP_PAF}.gz" "$EXTRACTED" 10 10 "$TP_TYPE" "$TP_PAF" || echo "0 0 0 0")
+            read -r bgzip_avg bgzip_std bgzip_decode bgzip_valid <<< "$bgzip_seek_result"
+            BGZIP_SEEK_AVG[$TP_TYPE]="$bgzip_avg"
+            BGZIP_SEEK_STDDEV[$TP_TYPE]="$bgzip_std"
+            BGZIP_SEEK_DECODE[$TP_TYPE]="$bgzip_decode"
+            BGZIP_SEEK_VALID[$TP_TYPE]="$bgzip_valid"
+            echo "    Seek avg: ${bgzip_avg}μs, stddev: ${bgzip_std}μs, valid: ${bgzip_valid}"
         fi
     done
-    echo "✓ BGZIP compression complete"
+    echo "✓ BGZIP compression and seek benchmark complete"
 else
     echo "=== BGZIP compression skipped (bgzip not found in PATH) ==="
 fi
@@ -669,6 +685,93 @@ output_tsv_row() {
         >> "$tsv_file"
 }
 
+# TSV output function for BGZIP baseline
+output_bgzip_baseline_row() {
+    local tp_type="$1"
+    local tsv_file="$OUTPUT_DIR/results.tsv"
+
+    # Calculate ratios
+    local tp_size_bytes=${TP_SIZE[$tp_type]:-0}
+    local bgzip_size_bytes=${BGZIP_SIZE[$tp_type]:-0}
+
+    local ratio_orig_to_tp
+    ratio_orig_to_tp=$(safe_ratio "$SIZE" "$tp_size_bytes" 3)
+
+    local ratio_tp_to_bgzip
+    ratio_tp_to_bgzip=$(safe_ratio "$tp_size_bytes" "$bgzip_size_bytes" 3)
+
+    local ratio_orig_to_bgzip
+    ratio_orig_to_bgzip=$(safe_ratio "$SIZE" "$bgzip_size_bytes" 3)
+
+    # Convert times to seconds
+    local encode_time_sec=$(time_to_seconds "$(normalize_time_field "${ENCODE_TIME[$tp_type]}")")
+    local bgzip_time_sec=$(time_to_seconds "$(normalize_time_field "${BGZIP_TIME[$tp_type]}")")
+
+    # Convert memory to MB
+    local encode_mem_mb=$(kb_to_mb "$(normalize_time_field "${ENCODE_MEM[$tp_type]}")")
+    local bgzip_mem_mb=$(kb_to_mb "$(normalize_time_field "${BGZIP_MEM[$tp_type]}")")
+
+    # Verification status - based on seek benchmark validity
+    local seek_valid=${BGZIP_SEEK_VALID[$tp_type]:-0}
+    local verified_text="no"
+    # Check if valid ratio >= 1.0 (all seeks validated correctly)
+    if awk "BEGIN{exit !($seek_valid >= 1.0)}" 2>/dev/null; then
+        verified_text="yes"
+    fi
+
+    # Dataset name from input file
+    local dataset_name=$(basename "$INPUT_PAF" .paf.gz | sed 's/.paf$//')
+
+    # Output TSV row (33 columns - same structure as TPA rows)
+    # For BGZIP baseline:
+    #   - compression_strategy: "bgzip-only"
+    #   - strategy_first/second: "bgzip"
+    #   - layer_first/second: "bgzip"
+    #   - tpa_size_bytes column contains BGZIP compressed size
+    #   - seek_mode_a: 0 (no high-level reader abstraction for BGZIP)
+    #   - seek_mode_b: BGZIP seek time (direct BGZF virtual position seeking)
+    #
+    # NOTE: BGZIP seek is placed in Mode B because it uses pre-computed virtual positions
+    # and direct bgzf::io::Reader access, which is analogous to TPA Mode B (standalone functions
+    # with pre-computed offsets). There's no Mode A equivalent because no "BgzipPafReader"
+    # high-level abstraction exists - the bgzf::io::Reader IS the low-level reader.
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$dataset_name" \
+        "$INPUT_TYPE" \
+        "$SIZE" \
+        "$EXTRACTED" \
+        "$tp_type" \
+        "$encode_time_sec" \
+        "$encode_mem_mb" \
+        "$tp_size_bytes" \
+        "$MAX_COMPLEXITY" \
+        "$COMPLEXITY_METRIC" \
+        "bgzip-only" \
+        "bgzip" \
+        "bgzip" \
+        "bgzip" \
+        "bgzip" \
+        "$bgzip_time_sec" \
+        "$bgzip_mem_mb" \
+        "$bgzip_size_bytes" \
+        "$ratio_orig_to_tp" \
+        "$ratio_tp_to_bgzip" \
+        "$ratio_orig_to_bgzip" \
+        "0" \
+        "0" \
+        "$verified_text" \
+        "100" \
+        "100" \
+        "10000" \
+        "NA" \
+        "NA" \
+        "${BGZIP_SEEK_AVG[$tp_type]:-0}" \
+        "${BGZIP_SEEK_STDDEV[$tp_type]:-0}" \
+        "${BGZIP_SEEK_DECODE[$tp_type]:-0}" \
+        "$seek_valid" \
+        >> "$tsv_file"
+}
+
 # Initialize TSV file with header
 TSV_FILE="$OUTPUT_DIR/results.tsv"
 cat > "$TSV_FILE" << TSV_HEADER
@@ -680,6 +783,12 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
     echo "═══════════════════════════════════════════════════"
     echo "Testing Tracepoint Type: ${TP_TYPE^^}"
     echo "═══════════════════════════════════════════════════"
+
+    # Output BGZIP baseline row first (if bgzip was available)
+    if [ -n "${BGZIP_SIZE[$TP_TYPE]:-}" ] && [ "${BGZIP_SIZE[$TP_TYPE]}" -gt 0 ]; then
+        echo "  Adding BGZIP baseline to results..."
+        output_bgzip_baseline_row "$TP_TYPE"
+    fi
 
     if [ "$TEST_MODE" = "dual" ]; then
         # Test all first×second×layer combinations
