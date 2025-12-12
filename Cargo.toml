@@ -16,9 +16,9 @@ bgzip = "0.3"
 tracepoints = { git = "https://github.com/AndreaGuarracino/tracepoints" }
 lib_wfa2 = { git = "https://github.com/AndreaGuarracino/lib_wfa2" }
 rayon = "1.11"
+noodles = { version = "0.100.0", features = ["bgzf"] }
 
 [dev-dependencies]
-noodles = { version = "0.100.0", features = ["bgzf"] }
 rand = "0.8"
 
 [[bin]]

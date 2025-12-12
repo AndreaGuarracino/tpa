@@ -99,6 +99,23 @@ fn delta_decode(deltas: &[i64]) -> Vec<u64> {
     values
 }
 
+/// Reconstruct original values from zigzag-encoded deltas.
+/// Used by Rice and Huffman decoders which produce zigzagged delta sequences.
+#[inline]
+fn reconstruct_from_zigzag_deltas(zigzagged: &[u64]) -> Vec<u64> {
+    if zigzagged.is_empty() {
+        return Vec::new();
+    }
+    let mut vals = Vec::with_capacity(zigzagged.len());
+    vals.push(decode_zigzag(zigzagged[0]) as u64);
+    for &enc in zigzagged.iter().skip(1) {
+        let delta = decode_zigzag(enc);
+        let prev = *vals.last().unwrap() as i64;
+        vals.push((prev + delta) as u64);
+    }
+    vals
+}
+
 pub(crate) struct SmartDualAnalyzer {
     first_states: Vec<StreamState>,
     second_states: Vec<StreamState>,
@@ -111,22 +128,49 @@ pub(crate) struct SmartDualAnalyzer {
 
 impl SmartDualAnalyzer {
     pub fn new(zstd_level: i32, sample_limit: Option<usize>, parallel: bool) -> Self {
+        Self::with_layers(zstd_level, sample_limit, parallel, CompressionLayer::all())
+    }
+
+    /// Create analyzer for BGZIP whole-file mode (only tests Nocomp layer).
+    /// When the entire file is wrapped in BGZIP, per-record compression layers
+    /// are not used, so we only need to find the best strategy encoding.
+    pub fn for_whole_file_bgzip(
+        zstd_level: i32,
+        sample_limit: Option<usize>,
+        parallel: bool,
+    ) -> Self {
+        Self::with_layers(zstd_level, sample_limit, parallel, [CompressionLayer::Nocomp; 1])
+    }
+
+    fn with_layers<const N: usize>(
+        zstd_level: i32,
+        sample_limit: Option<usize>,
+        parallel: bool,
+        layers: [CompressionLayer; N],
+    ) -> Self {
         let strategies = CompressionStrategy::concrete_strategies(zstd_level);
-        let layers = CompressionLayer::all();
+        // Convert fixed-size array to a 3-element array, padding with first element if needed
+        let layers_vec: [CompressionLayer; 3] = [
+            layers[0],
+            if N > 1 { layers[1] } else { layers[0] },
+            if N > 2 { layers[2] } else { layers[0] },
+        ];
+        // For BGZIP mode (N=1), we only test one layer; otherwise all 3
+        let num_layers_to_test = N;
         let first_states = strategies
             .iter()
             .cloned()
-            .map(|s| StreamState::new(s, layers.len()))
+            .map(|s| StreamState::new(s, num_layers_to_test))
             .collect();
         let second_states = strategies
             .into_iter()
-            .map(|s| StreamState::new(s, layers.len()))
+            .map(|s| StreamState::new(s, num_layers_to_test))
             .collect();
 
         Self {
             first_states,
             second_states,
-            layers,
+            layers: layers_vec,
             parallel,
             sample_limit,
             processed_records: 0,
@@ -600,7 +644,8 @@ impl StreamState {
         };
 
         let level = self.strategy.zstd_level();
-        for (idx, layer) in layers.iter().enumerate() {
+        // Only iterate over the layers we're actually testing (self.totals.len())
+        for (idx, layer) in layers.iter().take(self.totals.len()).enumerate() {
             if let Some(total) = self.totals[idx] {
                 match compress_with_layer(&encoded[..], *layer, level) {
                     Ok(compressed) => {
@@ -1529,8 +1574,8 @@ fn lz77_decode(buf: &[u8], num_items: usize) -> io::Result<Vec<u64>> {
 fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(vals.len() * 2);
     match strategy {
-        CompressionStrategy::Raw(_) => {
-            // Raw varints
+        CompressionStrategy::Raw(_) | CompressionStrategy::HybridRLE(_) => {
+            // Raw varints (HybridRLE: first values as varint, second uses RLE in encode_second_stream)
             for &val in vals {
                 write_varint(&mut buf, val)?;
             }
@@ -1643,14 +1688,6 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
                 } else {
                     buf.extend_from_slice(&offset.to_le_bytes());
                 }
-            }
-        }
-        CompressionStrategy::HybridRLE(_) => {
-            // HybridRLE design: varint for first values (query offsets), RLE for second values (target offsets).
-            // This function encodes first values only - uses plain varint (same as Raw).
-            // The RLE part is in encode_second_stream() for the second/target stream.
-            for &val in vals {
-                write_varint(&mut buf, val)?;
             }
         }
         CompressionStrategy::XORDelta(_) => {
@@ -1800,8 +1837,8 @@ fn decode_tracepoint_values(
 ) -> io::Result<Vec<u64>> {
     let mut reader = buf;
     match strategy {
-        CompressionStrategy::Raw(_) => {
-            // Raw varints
+        CompressionStrategy::Raw(_) | CompressionStrategy::HybridRLE(_) => {
+            // Raw varints (HybridRLE: first values as varint, second uses RLE separately)
             let mut vals = Vec::with_capacity(num_items);
             for _ in 0..num_items {
                 vals.push(read_varint(&mut reader)?);
@@ -1942,14 +1979,6 @@ fn decode_tracepoint_values(
             }
             Ok(vals)
         }
-        CompressionStrategy::HybridRLE(_) => {
-            // Decode as regular varint (special handling for target in decode_standard_tracepoints)
-            let mut vals = Vec::with_capacity(num_items);
-            for _ in 0..num_items {
-                vals.push(read_varint(&mut reader)?);
-            }
-            Ok(vals)
-        }
         CompressionStrategy::XORDelta(_) => {
             // XOR decode
             if num_items == 0 {
@@ -2045,35 +2074,12 @@ fn decode_tracepoint_values(
             crate::hybrids::decode_selective_rle(buf)
         }
         CompressionStrategy::Rice(_) => {
-            if num_items == 0 {
-                return Ok(Vec::new());
-            }
             let zigzagged = decode_rice_values(buf, num_items)?;
-            let mut vals = Vec::with_capacity(num_items);
-            // First value
-            let first = ((zigzagged[0] >> 1) as i64) ^ -((zigzagged[0] & 1) as i64);
-            vals.push(first as u64);
-            for &enc in zigzagged.iter().skip(1) {
-                let delta = ((enc >> 1) as i64) ^ -((enc & 1) as i64);
-                let prev = *vals.last().unwrap() as i64;
-                vals.push((prev + delta) as u64);
-            }
-            Ok(vals)
+            Ok(reconstruct_from_zigzag_deltas(&zigzagged))
         }
         CompressionStrategy::Huffman(_) => {
-            if num_items == 0 {
-                return Ok(Vec::new());
-            }
             let zigzagged = huffman_decode(buf, num_items)?;
-            let mut vals = Vec::with_capacity(num_items);
-            let first = ((zigzagged[0] >> 1) as i64) ^ -((zigzagged[0] & 1) as i64);
-            vals.push(first as u64);
-            for &enc in zigzagged.iter().skip(1) {
-                let delta = ((enc >> 1) as i64) ^ -((enc & 1) as i64);
-                let prev = *vals.last().unwrap() as i64;
-                vals.push((prev + delta) as u64);
-            }
-            Ok(vals)
+            Ok(reconstruct_from_zigzag_deltas(&zigzagged))
         }
         CompressionStrategy::LZ77(_) => {
             // LZ77-style sequence matching decode

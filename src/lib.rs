@@ -25,8 +25,8 @@ use tracepoints::{
 };
 
 pub use format::{
-    AlignmentRecord, CompressionConfig, CompressionLayer, CompressionStrategy, StringTable, Tag,
-    TagValue, TpaHeader, TPA_MAGIC,
+    detect_bgzf, AlignmentRecord, CompressionConfig, CompressionLayer, CompressionStrategy,
+    StringTable, Tag, TagValue, TpaHeader, TPA_MAGIC,
 };
 pub use tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 
@@ -35,15 +35,19 @@ use crate::utils::{parse_u8, parse_usize};
 
 pub use index::{build_index, TpaIndex};
 pub use reader::{
-    read_mixed_tracepoints_at_offset, read_standard_tracepoints_at_offset,
-    read_standard_tracepoints_at_offset_with_strategies, read_variable_tracepoints_at_offset,
-    RecordIterator, TpaReader,
+    read_mixed_tracepoints_at_offset, read_mixed_tracepoints_at_vpos,
+    read_standard_tracepoints_at_offset_with_strategies, read_standard_tracepoints_at_vpos,
+    read_variable_tracepoints_at_offset, read_variable_tracepoints_at_vpos, RecordIterator,
+    TpaReader,
 };
+
+// Re-export noodles bgzf for BGZF mode standalone access
+pub use noodles::bgzf;
 
 // Re-export utility functions for external tools
 pub use utils::{read_varint, varint_size};
 
-use crate::binary::{decompress_varint, SmartDualAnalyzer};
+use crate::binary::{decompress_varint, write_paf_line_with_tracepoints, SmartDualAnalyzer};
 
 use crate::utils::open_paf_reader;
 
@@ -70,6 +74,22 @@ pub fn is_tpa_file(path: &str) -> io::Result<bool> {
     if path == "-" {
         return Ok(false);
     }
+
+    // First check if it's BGZF-wrapped
+    if detect_bgzf(path)? {
+        // Read through BGZF decompressor to check TPA magic
+        let file = File::open(path)?;
+        let buf_reader = BufReader::new(file);
+        let mut bgzf_reader = noodles::bgzf::io::Reader::new(buf_reader);
+        let mut magic = [0u8; 4];
+        match bgzf_reader.read_exact(&mut magic) {
+            Ok(()) => return Ok(&magic == TPA_MAGIC),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Classic mode: check raw magic bytes
     let mut file = File::open(path)?;
     let mut magic = [0u8; 4];
     match file.read_exact(&mut magic) {
@@ -144,12 +164,23 @@ pub fn compress_paf_to_tpa(
         config.complexity_metric,
         config.distance,
         config.use_cigar,
+        config.whole_file_bgzip,
+        config.bgzip_level,
     )
 }
 
 pub fn decompress_tpa(input_path: &str, output_path: &str) -> io::Result<()> {
     info!("Decompressing {} to text format...", input_path);
 
+    // Detect BGZF mode and use appropriate decompression path
+    if detect_bgzf(input_path)? {
+        decompress_bgzf_tpa(input_path, output_path)
+    } else {
+        decompress_classic_tpa(input_path, output_path)
+    }
+}
+
+fn decompress_classic_tpa(input_path: &str, output_path: &str) -> io::Result<()> {
     let (input, header, _after_header_pos) = open_with_footer(input_path)?;
     let reader = BufReader::new(input);
 
@@ -168,6 +199,43 @@ pub fn decompress_tpa(input_path: &str, output_path: &str) -> io::Result<()> {
     )
 }
 
+fn decompress_bgzf_tpa(input_path: &str, output_path: &str) -> io::Result<()> {
+    use std::io::Write;
+
+    // Use TpaReader which handles BGZF mode
+    let mut reader = TpaReader::open(input_path)?;
+    reader.load_string_table()?;
+
+    // Extract header info before mutably borrowing reader
+    let num_records = reader.header().num_records();
+    let num_strings = reader.header().num_strings();
+    let (first_strategy, second_strategy) = reader.header().strategies()?;
+    info!(
+        "Reading {} records ({} unique sequence names) [{} / {}] [BGZIP mode]",
+        num_records, num_strings, first_strategy, second_strategy
+    );
+
+    let string_table = reader.string_table_ref().clone();
+
+    // Open output file
+    let output: Box<dyn Write> = if output_path == "-" {
+        Box::new(std::io::stdout())
+    } else {
+        Box::new(File::create(output_path)?)
+    };
+    let mut writer = BufWriter::new(output);
+
+    // Write records using shared helper
+    for record_id in 0..num_records {
+        let record = reader.get_alignment_record(record_id)?;
+        write_paf_line_with_tracepoints(&mut writer, &record, &string_table)?;
+    }
+
+    writer.flush()?;
+    info!("Decompressed {} records", num_records);
+    Ok(())
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -184,6 +252,8 @@ fn compress_paf_internal(
     complexity_metric: ComplexityMetric,
     distance: Distance,
     use_cigar: bool,
+    whole_file_bgzip: bool,
+    _bgzip_level: u32,
 ) -> io::Result<()> {
     info!(
         "Compressing PAF with {} using strategies {} / {}...",
@@ -205,7 +275,12 @@ fn compress_paf_internal(
                 Some(*sample_size)
             };
             let parallel = *sample_size == 0; // Use parallel only for full-file analysis
-            Some(SmartDualAnalyzer::new(*level, limit, parallel))
+            if whole_file_bgzip {
+                // For BGZIP whole-file mode, only test strategies (layers handled by BGZF)
+                Some(SmartDualAnalyzer::for_whole_file_bgzip(*level, limit, parallel))
+            } else {
+                Some(SmartDualAnalyzer::new(*level, limit, parallel))
+            }
         }
         _ => None,
     };
@@ -269,6 +344,58 @@ fn compress_paf_internal(
     };
 
     // Pass 2: Write Header → StringTable → Records → Footer
+    if whole_file_bgzip {
+        // BGZIP whole-file mode: wrap entire output in BGZF, no per-record compression
+        compress_with_bgzip_wrapper(
+            input_path,
+            output_path,
+            record_count,
+            &mut string_table,
+            chosen_first,
+            chosen_second,
+            tp_type,
+            complexity_metric,
+            max_complexity,
+            distance,
+            _bgzip_level,
+            use_cigar,
+        )
+    } else {
+        // Classic mode: per-record compression with layers
+        compress_classic(
+            input_path,
+            output_path,
+            record_count,
+            &mut string_table,
+            chosen_first,
+            chosen_second,
+            first_layer,
+            second_layer,
+            tp_type,
+            complexity_metric,
+            max_complexity,
+            distance,
+            use_cigar,
+        )
+    }
+}
+
+/// Classic compression mode: per-record compression with layers
+fn compress_classic(
+    input_path: &str,
+    output_path: &str,
+    record_count: u64,
+    string_table: &mut StringTable,
+    chosen_first: CompressionStrategy,
+    chosen_second: CompressionStrategy,
+    first_layer: format::CompressionLayer,
+    second_layer: format::CompressionLayer,
+    tp_type: TracepointType,
+    complexity_metric: ComplexityMetric,
+    max_complexity: u32,
+    distance: Distance,
+    use_cigar: bool,
+) -> io::Result<()> {
     let mut output = File::create(output_path).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -288,6 +415,7 @@ fn compress_paf_internal(
         complexity_metric,
         max_complexity,
         distance,
+        false, // whole_file_bgzip = false
     )?;
     header.write(&mut output)?;
 
@@ -303,8 +431,12 @@ fn compress_paf_internal(
             continue;
         }
 
-        let Some(record) = parse_record(&line, line_num, &mut string_table) else {
-            continue;
+        let record = match parse_paf(&line, string_table, use_cigar, tp_type, max_complexity, complexity_metric) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Skipping malformed line {}: {}", line_num + 1, e);
+                continue;
+            }
         };
 
         // Write with chosen strategy and layer
@@ -330,6 +462,109 @@ fn compress_paf_internal(
         string_table.len(),
         chosen_first,
         chosen_second
+    );
+    Ok(())
+}
+
+/// BGZIP whole-file compression mode: wrap entire file in BGZF
+fn compress_with_bgzip_wrapper(
+    input_path: &str,
+    output_path: &str,
+    record_count: u64,
+    string_table: &mut StringTable,
+    chosen_first: CompressionStrategy,
+    chosen_second: CompressionStrategy,
+    tp_type: TracepointType,
+    complexity_metric: ComplexityMetric,
+    max_complexity: u32,
+    distance: Distance,
+    bgzip_level: u32,
+    use_cigar: bool,
+) -> io::Result<()> {
+    use noodles::bgzf;
+
+    let output_file = File::create(output_path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("Failed to create output file '{}': {}", output_path, e),
+        )
+    })?;
+
+    // Create BGZF writer with specified compression level
+    let mut bgzf_writer = bgzf::io::Writer::new(output_file);
+
+    // Track virtual positions for index
+    let mut virtual_positions = Vec::with_capacity(record_count as usize);
+
+    // Write header (whole_file_bgzip = true, layers set to Nocomp since BGZF handles compression)
+    let header = TpaHeader::new(
+        record_count,
+        string_table.len() as u64,
+        chosen_first.clone(),
+        chosen_second.clone(),
+        format::CompressionLayer::Nocomp, // Per-record layer ignored in this mode
+        format::CompressionLayer::Nocomp,
+        tp_type,
+        complexity_metric,
+        max_complexity,
+        distance,
+        true, // whole_file_bgzip = true
+    )?;
+    header.write(&mut bgzf_writer)?;
+
+    // Write string table
+    string_table.write(&mut bgzf_writer)?;
+
+    // Write records WITHOUT per-record compression
+    let input = open_paf_reader(input_path)?;
+    for (line_num, line_result) in input.lines().enumerate() {
+        let line = line_result?;
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let record = match parse_paf(&line, string_table, use_cigar, tp_type, max_complexity, complexity_metric) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Skipping malformed line {}: {}", line_num + 1, e);
+                continue;
+            }
+        };
+
+        // Capture virtual position BEFORE writing record
+        virtual_positions.push(u64::from(bgzf_writer.virtual_position()));
+
+        // Write with strategy encoding but NO per-record compression layer
+        // Use Nocomp layer since BGZF handles compression
+        record.write(
+            &mut bgzf_writer,
+            chosen_first.clone(),
+            chosen_second.clone(),
+            format::CompressionLayer::Nocomp,
+            format::CompressionLayer::Nocomp,
+        )?;
+    }
+
+    // Write footer
+    let footer = TpaFooter::new(record_count, string_table.len() as u64);
+    footer.write(&mut bgzf_writer)?;
+
+    // Finalize BGZF (flushes and writes EOF marker)
+    bgzf_writer.finish()?;
+
+    // Save index with virtual positions
+    let idx_path = format!("{}.idx", output_path);
+    let index = index::TpaIndex::new_virtual(virtual_positions);
+    index.save(&idx_path)?;
+
+    // Log compression level (default for noodles is 6)
+    info!(
+        "Compressed {} records ({} unique sequence names) with strategies {} / {} [BGZIP whole-file mode, level={}]",
+        record_count,
+        string_table.len(),
+        chosen_first,
+        chosen_second,
+        bgzip_level
     );
     Ok(())
 }

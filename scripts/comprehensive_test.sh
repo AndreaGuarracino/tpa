@@ -424,16 +424,26 @@ test_configuration() {
     local tp_type="$1"
     local first_strategy="$2"
     local second_strategy="${3:-$2}"  # Default to first_strategy if not provided (single mode)
+    local bgzip_all="${4:-0}"  # 1 for --whole-file-bgzip mode, 0 for classic
     local tp_paf="$OUTPUT_DIR/${tp_type}.tp.paf"
     local is_auto=0
     if [[ "$first_strategy" == automatic* ]]; then
         is_auto=1
     fi
 
-    # Create key from strategies
+    # Build bgzip-all flag for cigzip
+    local BGZIP_ALL_FLAG=""
+    if [ "$bgzip_all" -eq 1 ]; then
+        BGZIP_ALL_FLAG="--whole-file-bgzip"
+    fi
+
+    # Create key from strategies (add +bgzip-all suffix if enabled)
     local key="${tp_type}_${first_strategy}"
     if [ "$first_strategy" != "$second_strategy" ]; then
         key="${key}_${second_strategy}"
+    fi
+    if [ "$bgzip_all" -eq 1 ]; then
+        key="${key}+bgzip-all"
     fi
 
     echo "    Testing $first_strategy → $second_strategy..."
@@ -450,7 +460,7 @@ test_configuration() {
             /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.tpa" \
                 --type "$tp_type" --max-complexity "$MAX_COMPLEXITY" \
                 --complexity-metric "$COMPLEXITY_METRIC" --distance gap-affine --penalties 5,8,2 \
-                --strategy "$first_strategy" 2>&1 | \
+                --strategy "$first_strategy" $BGZIP_ALL_FLAG 2>&1 | \
                 tee "$OUTPUT_DIR/${key}_compress.log" >&2
             echo "      [$first_strategy] compress finished" >&2
         else
@@ -458,7 +468,7 @@ test_configuration() {
             /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.tpa" \
                 --type "$tp_type" --max-complexity "$MAX_COMPLEXITY" \
                 --complexity-metric "$COMPLEXITY_METRIC" --distance gap-affine --penalties 5,8,2 \
-                --strategy "$first_strategy,3" --strategy-second "$second_strategy,3" 2>&1 | \
+                --strategy "$first_strategy,3" --strategy-second "$second_strategy,3" $BGZIP_ALL_FLAG 2>&1 | \
                 tee "$OUTPUT_DIR/${key}_compress.log" >/dev/null
         fi
     else
@@ -471,7 +481,7 @@ test_configuration() {
         /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.tpa" \
             --type "$tp_type" --max-complexity "$MAX_COMPLEXITY" \
             --complexity-metric "$COMPLEXITY_METRIC" --distance gap-affine --penalties 5,8,2 \
-            --strategy "$strategy_arg" 2>&1 | tee "$OUTPUT_DIR/${key}_compress.log" >/dev/null
+            --strategy "$strategy_arg" $BGZIP_ALL_FLAG 2>&1 | tee "$OUTPUT_DIR/${key}_compress.log" >/dev/null
     fi
 
     COMPRESS_TIME[$key]=$(grep "Elapsed (wall clock)" "$OUTPUT_DIR/${key}_compress.log" | awk '{print $8}')
@@ -538,12 +548,13 @@ test_configuration() {
     SEEK_A_STDDEV[$key]="$seek_a_std"
 
     # Seek Mode B: 10 positions × 10 iterations (for quick testing)
-    # Output: avg_us stddev_us decode_ratio valid_ratio
+    # Uses standalone functions (read_*_tracepoints_at_offset / read_*_tracepoints_at_vpos)
+    # Supports both classic mode (raw byte offsets) and BGZIP whole-file mode (virtual positions)
     local seek_b_result=$("$SEEK_BENCH_DIRECT" "$OUTPUT_DIR/${key}.tpa" "$EXTRACTED" 10 10 "$tp_type" "$tp_paf" || echo "0 0 0 0")
     read -r seek_b_avg seek_b_std seek_b_decode seek_b_valid <<< "$seek_b_result"
     SEEK_B[$key]="$seek_b_avg"
     SEEK_B_STDDEV[$key]="$seek_b_std"
-    SEEK_DECODE_RATIO[$key]="${seek_b_decode:-0}"  # Using Mode B ratio (both should be identical)
+    SEEK_DECODE_RATIO[$key]="${seek_b_decode:-0}"
     SEEK_VALID_RATIO[$key]="${seek_b_valid:-0}"
 
     # Determine pass/fail for logging
@@ -902,6 +913,24 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
         output_tsv_row "$TP_TYPE" "$AUTO_STRATEGY"
         echo ""
         echo "✓ Completed automatic strategy test"
+
+        # Also test with BGZIP whole-file mode (--whole-file-bgzip)
+        echo ""
+        echo "Testing ${AUTO_STRATEGY}+bgzip-all (BGZIP whole-file mode)..."
+        test_configuration "$TP_TYPE" "$AUTO_STRATEGY" "$AUTO_STRATEGY" 1
+
+        # Extract the strategies for bgzip-all mode
+        auto_bgzip_tpa="$OUTPUT_DIR/${TP_TYPE}_${AUTO_STRATEGY}+bgzip-all.tpa"
+        bgzip_selected_strategies=$("$REPO_DIR/target/release/tpa-view" --strategies "$auto_bgzip_tpa")
+        bgzip_first_selected=$(echo "$bgzip_selected_strategies" | cut -f1)
+        bgzip_second_selected=$(echo "$bgzip_selected_strategies" | cut -f2)
+
+        echo "  → Selected: ${bgzip_first_selected} → ${bgzip_second_selected} [BGZIP whole-file]"
+
+        # Output TSV row for the bgzip-all run
+        output_tsv_row "$TP_TYPE" "${AUTO_STRATEGY}+bgzip-all"
+        echo ""
+        echo "✓ Completed BGZIP whole-file mode test"
     else
         # Single mode: test each strategy symmetrically (first==second)
         for STRATEGY in "${STRATEGIES[@]}"; do

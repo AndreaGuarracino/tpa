@@ -4,6 +4,8 @@
 //! Pre-computes offsets from index, then seeks directly to tracepoint data.
 //! This is the fastest access method when you only need tracepoints.
 //!
+//! Supports both classic TPA files (raw offsets) and BGZIP whole-file mode (virtual positions).
+//!
 //! Usage: seek_bench_direct <file.tpa> <num_records> <num_positions> <iterations> <tp_type> <reference.paf>
 //!
 //! Output: avg_us stddev_us decode_ratio valid_ratio
@@ -16,8 +18,10 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::time::Instant;
 use tpa::{
-    read_mixed_tracepoints_at_offset, read_standard_tracepoints_at_offset_with_strategies,
-    read_variable_tracepoints_at_offset, MixedRepresentation, TpaReader,
+    bgzf, read_mixed_tracepoints_at_offset, read_mixed_tracepoints_at_vpos,
+    read_standard_tracepoints_at_offset_with_strategies, read_standard_tracepoints_at_vpos,
+    read_variable_tracepoints_at_offset, read_variable_tracepoints_at_vpos, MixedRepresentation,
+    TpaReader,
 };
 
 /// Reference tracepoints parsed from PAF file
@@ -130,11 +134,12 @@ fn main() {
     let tp_type = &args[5];
     let reference_paf = &args[6];
 
-    // Open TpaReader to get strategies, layers, and offsets
+    // Open TpaReader to get strategies, layers, offsets, and detect mode
     let mut reader = TpaReader::open(tpa_path).unwrap();
     let (first_strategy, second_strategy) = reader.header().strategies().unwrap();
     let first_layer = reader.header().first_layer();
     let second_layer = reader.header().second_layer();
+    let is_bgzf = reader.is_bgzf_mode();
     let reference = parse_reference(reference_paf, num_records as usize, tp_type);
 
     // Generate deterministic pseudo-random positions
@@ -146,6 +151,7 @@ fn main() {
     }
 
     // Pre-compute byte offsets from index (one-time cost)
+    // For BGZF mode these are virtual positions, for classic mode these are raw offsets
     let offsets: Vec<u64> = positions
         .iter()
         .map(|&pos| reader.get_tracepoint_offset(pos).unwrap())
@@ -154,133 +160,264 @@ fn main() {
     // Drop reader - from here we use only standalone functions
     drop(reader);
 
-    // Open raw file handle for direct seeks
-    let mut file = File::open(tpa_path).unwrap();
     let mut sum_us = 0u128;
     let mut sum_sq_us = 0u128;
     let mut decode_count = 0usize;
     let mut valid_count = 0usize;
     let total_tests = num_positions * iterations_per_pos;
 
-    for (&offset, &record_id) in offsets.iter().zip(positions.iter()) {
-        // Warmup (3 iterations)
-        for _ in 0..3 {
-            match tp_type.as_str() {
-                "standard" => {
-                    let _ = read_standard_tracepoints_at_offset_with_strategies(
-                        &mut file,
-                        offset,
-                        first_strategy.clone(),
-                        second_strategy.clone(),
-                        first_layer,
-                        second_layer,
-                    );
+    if is_bgzf {
+        // BGZIP mode: use bgzf reader and _at_vpos functions
+        let file = File::open(tpa_path).unwrap();
+        let mut bgzf_reader = bgzf::io::Reader::new(file);
+
+        for (&vpos, &record_id) in offsets.iter().zip(positions.iter()) {
+            // Warmup (3 iterations)
+            for _ in 0..3 {
+                match tp_type.as_str() {
+                    "standard" => {
+                        let _ = read_standard_tracepoints_at_vpos(
+                            &mut bgzf_reader,
+                            vpos,
+                            first_strategy.clone(),
+                            second_strategy.clone(),
+                            first_layer,
+                            second_layer,
+                        );
+                    }
+                    "variable" => {
+                        let _ = read_variable_tracepoints_at_vpos(
+                            &mut bgzf_reader,
+                            vpos,
+                            first_strategy.clone(),
+                            second_strategy.clone(),
+                            first_layer,
+                            second_layer,
+                        );
+                    }
+                    "mixed" => {
+                        let _ = read_mixed_tracepoints_at_vpos(
+                            &mut bgzf_reader,
+                            vpos,
+                            first_strategy.clone(),
+                            second_strategy.clone(),
+                            first_layer,
+                            second_layer,
+                        );
+                    }
+                    _ => panic!("Invalid tp_type: {}", tp_type),
                 }
-                "variable" => {
-                    let _ = read_variable_tracepoints_at_offset(
-                        &mut file,
-                        offset,
-                        first_strategy.clone(),
-                        second_strategy.clone(),
-                        first_layer,
-                        second_layer,
-                    );
+            }
+
+            // Benchmark
+            for _ in 0..iterations_per_pos {
+                let start = Instant::now();
+                let (decoded, is_valid) = match tp_type.as_str() {
+                    "standard" => {
+                        match read_standard_tracepoints_at_vpos(
+                            &mut bgzf_reader,
+                            vpos,
+                            first_strategy.clone(),
+                            second_strategy.clone(),
+                            first_layer,
+                            second_layer,
+                        ) {
+                            Ok(tps) => {
+                                let valid = if let Reference::Standard(refs) = &reference {
+                                    refs.get(record_id as usize)
+                                        .map(|expected| expected.as_slice() == tps.as_slice())
+                                        .unwrap_or(false)
+                                } else {
+                                    false
+                                };
+                                (true, valid)
+                            }
+                            Err(_) => (false, false),
+                        }
+                    }
+                    "variable" => {
+                        match read_variable_tracepoints_at_vpos(
+                            &mut bgzf_reader,
+                            vpos,
+                            first_strategy.clone(),
+                            second_strategy.clone(),
+                            first_layer,
+                            second_layer,
+                        ) {
+                            Ok(tps) => {
+                                let valid = if let Reference::Variable(refs) = &reference {
+                                    refs.get(record_id as usize)
+                                        .map(|expected| expected.as_slice() == tps.as_slice())
+                                        .unwrap_or(false)
+                                } else {
+                                    false
+                                };
+                                (true, valid)
+                            }
+                            Err(_) => (false, false),
+                        }
+                    }
+                    "mixed" => {
+                        match read_mixed_tracepoints_at_vpos(
+                            &mut bgzf_reader,
+                            vpos,
+                            first_strategy.clone(),
+                            second_strategy.clone(),
+                            first_layer,
+                            second_layer,
+                        ) {
+                            Ok(items) => {
+                                let valid = if let Reference::Mixed(refs) = &reference {
+                                    refs.get(record_id as usize)
+                                        .map(|expected| expected.as_slice() == items.as_slice())
+                                        .unwrap_or(false)
+                                } else {
+                                    false
+                                };
+                                (true, valid)
+                            }
+                            Err(_) => (false, false),
+                        }
+                    }
+                    _ => panic!("Invalid tp_type: {}", tp_type),
+                };
+
+                if decoded {
+                    let time_us = start.elapsed().as_micros();
+                    sum_us += time_us;
+                    sum_sq_us += time_us * time_us;
+                    decode_count += 1;
+
+                    if is_valid {
+                        valid_count += 1;
+                    }
                 }
-                "mixed" => {
-                    let _ = read_mixed_tracepoints_at_offset(
-                        &mut file,
-                        offset,
-                        first_strategy.clone(),
-                        second_strategy.clone(),
-                        first_layer,
-                        second_layer,
-                    );
-                }
-                _ => panic!("Invalid tp_type: {}", tp_type),
             }
         }
+    } else {
+        // Classic mode: use raw file handle and _at_offset functions
+        let mut file = File::open(tpa_path).unwrap();
 
-        // Benchmark
-        for _ in 0..iterations_per_pos {
-            let start = Instant::now();
-            let (decoded, is_valid) = match tp_type.as_str() {
-                "standard" => {
-                    match read_standard_tracepoints_at_offset_with_strategies(
-                        &mut file,
-                        offset,
-                        first_strategy.clone(),
-                        second_strategy.clone(),
-                        first_layer,
-                        second_layer,
-                    ) {
-                        Ok(tps) => {
-                            let valid = if let Reference::Standard(refs) = &reference {
-                                refs.get(record_id as usize)
-                                    .map(|expected| expected.as_slice() == tps.as_slice())
-                                    .unwrap_or(false)
-                            } else {
-                                false
-                            };
-                            (true, valid)
-                        }
-                        Err(_) => (false, false),
+        for (&offset, &record_id) in offsets.iter().zip(positions.iter()) {
+            // Warmup (3 iterations)
+            for _ in 0..3 {
+                match tp_type.as_str() {
+                    "standard" => {
+                        let _ = read_standard_tracepoints_at_offset_with_strategies(
+                            &mut file,
+                            offset,
+                            first_strategy.clone(),
+                            second_strategy.clone(),
+                            first_layer,
+                            second_layer,
+                        );
                     }
-                }
-                "variable" => {
-                    match read_variable_tracepoints_at_offset(
-                        &mut file,
-                        offset,
-                        first_strategy.clone(),
-                        second_strategy.clone(),
-                        first_layer,
-                        second_layer,
-                    ) {
-                        Ok(tps) => {
-                            let valid = if let Reference::Variable(refs) = &reference {
-                                refs.get(record_id as usize)
-                                    .map(|expected| expected.as_slice() == tps.as_slice())
-                                    .unwrap_or(false)
-                            } else {
-                                false
-                            };
-                            (true, valid)
-                        }
-                        Err(_) => (false, false),
+                    "variable" => {
+                        let _ = read_variable_tracepoints_at_offset(
+                            &mut file,
+                            offset,
+                            first_strategy.clone(),
+                            second_strategy.clone(),
+                            first_layer,
+                            second_layer,
+                        );
                     }
-                }
-                "mixed" => {
-                    match read_mixed_tracepoints_at_offset(
-                        &mut file,
-                        offset,
-                        first_strategy.clone(),
-                        second_strategy.clone(),
-                        first_layer,
-                        second_layer,
-                    ) {
-                        Ok(items) => {
-                            let valid = if let Reference::Mixed(refs) = &reference {
-                                refs.get(record_id as usize)
-                                    .map(|expected| expected.as_slice() == items.as_slice())
-                                    .unwrap_or(false)
-                            } else {
-                                false
-                            };
-                            (true, valid)
-                        }
-                        Err(_) => (false, false),
+                    "mixed" => {
+                        let _ = read_mixed_tracepoints_at_offset(
+                            &mut file,
+                            offset,
+                            first_strategy.clone(),
+                            second_strategy.clone(),
+                            first_layer,
+                            second_layer,
+                        );
                     }
+                    _ => panic!("Invalid tp_type: {}", tp_type),
                 }
-                _ => panic!("Invalid tp_type: {}", tp_type),
-            };
+            }
 
-            if decoded {
-                let time_us = start.elapsed().as_micros();
-                sum_us += time_us;
-                sum_sq_us += time_us * time_us;
-                decode_count += 1;
+            // Benchmark
+            for _ in 0..iterations_per_pos {
+                let start = Instant::now();
+                let (decoded, is_valid) = match tp_type.as_str() {
+                    "standard" => {
+                        match read_standard_tracepoints_at_offset_with_strategies(
+                            &mut file,
+                            offset,
+                            first_strategy.clone(),
+                            second_strategy.clone(),
+                            first_layer,
+                            second_layer,
+                        ) {
+                            Ok(tps) => {
+                                let valid = if let Reference::Standard(refs) = &reference {
+                                    refs.get(record_id as usize)
+                                        .map(|expected| expected.as_slice() == tps.as_slice())
+                                        .unwrap_or(false)
+                                } else {
+                                    false
+                                };
+                                (true, valid)
+                            }
+                            Err(_) => (false, false),
+                        }
+                    }
+                    "variable" => {
+                        match read_variable_tracepoints_at_offset(
+                            &mut file,
+                            offset,
+                            first_strategy.clone(),
+                            second_strategy.clone(),
+                            first_layer,
+                            second_layer,
+                        ) {
+                            Ok(tps) => {
+                                let valid = if let Reference::Variable(refs) = &reference {
+                                    refs.get(record_id as usize)
+                                        .map(|expected| expected.as_slice() == tps.as_slice())
+                                        .unwrap_or(false)
+                                } else {
+                                    false
+                                };
+                                (true, valid)
+                            }
+                            Err(_) => (false, false),
+                        }
+                    }
+                    "mixed" => {
+                        match read_mixed_tracepoints_at_offset(
+                            &mut file,
+                            offset,
+                            first_strategy.clone(),
+                            second_strategy.clone(),
+                            first_layer,
+                            second_layer,
+                        ) {
+                            Ok(items) => {
+                                let valid = if let Reference::Mixed(refs) = &reference {
+                                    refs.get(record_id as usize)
+                                        .map(|expected| expected.as_slice() == items.as_slice())
+                                        .unwrap_or(false)
+                                } else {
+                                    false
+                                };
+                                (true, valid)
+                            }
+                            Err(_) => (false, false),
+                        }
+                    }
+                    _ => panic!("Invalid tp_type: {}", tp_type),
+                };
 
-                if is_valid {
-                    valid_count += 1;
+                if decoded {
+                    let time_us = start.elapsed().as_micros();
+                    sum_us += time_us;
+                    sum_sq_us += time_us * time_us;
+                    decode_count += 1;
+
+                    if is_valid {
+                        valid_count += 1;
+                    }
                 }
             }
         }

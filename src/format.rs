@@ -127,6 +127,10 @@ pub struct CompressionConfig {
     pub distance: Distance,
     /// True if input has CIGAR strings, false if tracepoints
     pub use_cigar: bool,
+    /// When true, wrap entire file in BGZIP instead of per-record compression
+    pub whole_file_bgzip: bool,
+    /// BGZIP compression level (0-9) for whole-file mode
+    pub bgzip_level: u32,
 }
 
 impl Default for CompressionConfig {
@@ -141,6 +145,8 @@ impl Default for CompressionConfig {
             complexity_metric: ComplexityMetric::EditDistance,
             distance: Distance::Edit,
             use_cigar: false,
+            whole_file_bgzip: false,
+            bgzip_level: 6,
         }
     }
 }
@@ -216,6 +222,21 @@ impl CompressionConfig {
     /// Mark input as having tracepoints (default)
     pub fn from_tracepoints(mut self) -> Self {
         self.use_cigar = false;
+        self
+    }
+
+    /// Enable whole-file BGZIP compression mode
+    /// Instead of per-record compression layers, wraps entire file in BGZIP.
+    /// Enables cross-record compression context for better compression ratios.
+    /// Random access uses BGZF virtual positions (block-level, ~64KB blocks).
+    pub fn whole_file_bgzip(mut self) -> Self {
+        self.whole_file_bgzip = true;
+        self
+    }
+
+    /// Set BGZIP compression level (0-9, default 6) for whole-file mode
+    pub fn bgzip_level(mut self, level: u32) -> Self {
+        self.bgzip_level = level.min(9);
         self
     }
 
@@ -546,25 +567,50 @@ impl CompressionStrategy {
     /// not for the pre-encoding step (which is strategy-specific).
     pub fn zstd_level(&self) -> i32 {
         match self {
-            CompressionStrategy::Automatic(level, _) => *level,
-            CompressionStrategy::Raw(level) => *level,
-            CompressionStrategy::ZigzagDelta(level) => *level,
-            CompressionStrategy::TwoDimDelta(level) => *level,
-            CompressionStrategy::RunLength(level) => *level,
-            CompressionStrategy::BitPacked(level) => *level,
-            CompressionStrategy::DeltaOfDelta(level) => *level,
-            CompressionStrategy::FrameOfReference(level) => *level,
-            CompressionStrategy::HybridRLE(level) => *level,
-            CompressionStrategy::XORDelta(level) => *level,
-            CompressionStrategy::Dictionary(level) => *level,
-            CompressionStrategy::StreamVByte(level) => *level,
-            CompressionStrategy::FastPFOR(level) => *level,
-            CompressionStrategy::Cascaded(level) => *level,
-            CompressionStrategy::Simple8bFull(level) => *level,
-            CompressionStrategy::SelectiveRLE(level) => *level,
-            CompressionStrategy::Rice(level) => *level,
-            CompressionStrategy::Huffman(level) => *level,
-            CompressionStrategy::LZ77(level) => *level,
+            CompressionStrategy::Automatic(level, _)
+            | CompressionStrategy::Raw(level)
+            | CompressionStrategy::ZigzagDelta(level)
+            | CompressionStrategy::TwoDimDelta(level)
+            | CompressionStrategy::RunLength(level)
+            | CompressionStrategy::BitPacked(level)
+            | CompressionStrategy::DeltaOfDelta(level)
+            | CompressionStrategy::FrameOfReference(level)
+            | CompressionStrategy::HybridRLE(level)
+            | CompressionStrategy::XORDelta(level)
+            | CompressionStrategy::Dictionary(level)
+            | CompressionStrategy::StreamVByte(level)
+            | CompressionStrategy::FastPFOR(level)
+            | CompressionStrategy::Cascaded(level)
+            | CompressionStrategy::Simple8bFull(level)
+            | CompressionStrategy::SelectiveRLE(level)
+            | CompressionStrategy::Rice(level)
+            | CompressionStrategy::Huffman(level)
+            | CompressionStrategy::LZ77(level) => *level,
+        }
+    }
+
+    /// Get the display name of this strategy
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            CompressionStrategy::Automatic(_, _) => "Automatic",
+            CompressionStrategy::Raw(_) => "Raw",
+            CompressionStrategy::ZigzagDelta(_) => "ZigzagDelta",
+            CompressionStrategy::TwoDimDelta(_) => "TwoDimDelta",
+            CompressionStrategy::RunLength(_) => "RunLength",
+            CompressionStrategy::BitPacked(_) => "BitPacked",
+            CompressionStrategy::DeltaOfDelta(_) => "DeltaOfDelta",
+            CompressionStrategy::FrameOfReference(_) => "FrameOfReference",
+            CompressionStrategy::HybridRLE(_) => "HybridRLE",
+            CompressionStrategy::XORDelta(_) => "XORDelta",
+            CompressionStrategy::Dictionary(_) => "Dictionary",
+            CompressionStrategy::StreamVByte(_) => "StreamVByte",
+            CompressionStrategy::FastPFOR(_) => "FastPFOR",
+            CompressionStrategy::Cascaded(_) => "Cascaded",
+            CompressionStrategy::Simple8bFull(_) => "Simple8bFull",
+            CompressionStrategy::SelectiveRLE(_) => "SelectiveRLE",
+            CompressionStrategy::Rice(_) => "Rice",
+            CompressionStrategy::Huffman(_) => "Huffman",
+            CompressionStrategy::LZ77(_) => "LZ77",
         }
     }
 }
@@ -581,69 +627,16 @@ impl FromStr for CompressionStrategy {
 
 impl std::fmt::Display for CompressionStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CompressionStrategy::Automatic(level, sample_size) => {
-                if *sample_size == 0 {
-                    write!(f, "Automatic (level {}, all records)", level)
-                } else {
-                    write!(f, "Automatic (level {}, {} records)", level, sample_size)
-                }
-            }
-            CompressionStrategy::Raw(level) => {
-                write!(f, "Raw (level {})", level)
-            }
-            CompressionStrategy::ZigzagDelta(level) => {
-                write!(f, "ZigzagDelta (level {})", level)
-            }
-            CompressionStrategy::TwoDimDelta(level) => {
-                write!(f, "TwoDimDelta (level {})", level)
-            }
-            CompressionStrategy::RunLength(level) => {
-                write!(f, "RunLength (level {})", level)
-            }
-            CompressionStrategy::BitPacked(level) => {
-                write!(f, "BitPacked (level {})", level)
-            }
-            CompressionStrategy::DeltaOfDelta(level) => {
-                write!(f, "DeltaOfDelta (level {})", level)
-            }
-            CompressionStrategy::FrameOfReference(level) => {
-                write!(f, "FrameOfReference (level {})", level)
-            }
-            CompressionStrategy::HybridRLE(level) => {
-                write!(f, "HybridRLE (level {})", level)
-            }
-            CompressionStrategy::XORDelta(level) => {
-                write!(f, "XORDelta (level {})", level)
-            }
-            CompressionStrategy::Dictionary(level) => {
-                write!(f, "Dictionary (level {})", level)
-            }
-            CompressionStrategy::StreamVByte(level) => {
-                write!(f, "StreamVByte (level {})", level)
-            }
-            CompressionStrategy::FastPFOR(level) => {
-                write!(f, "FastPFOR (level {})", level)
-            }
-            CompressionStrategy::Cascaded(level) => {
-                write!(f, "Cascaded (level {})", level)
-            }
-            CompressionStrategy::Simple8bFull(level) => {
-                write!(f, "Simple8bFull (level {})", level)
-            }
-            CompressionStrategy::SelectiveRLE(level) => {
-                write!(f, "SelectiveRLE (level {})", level)
-            }
-            CompressionStrategy::Rice(level) => {
-                write!(f, "Rice (level {})", level)
-            }
-            CompressionStrategy::Huffman(level) => {
-                write!(f, "Huffman (level {})", level)
-            }
-            CompressionStrategy::LZ77(level) => {
-                write!(f, "LZ77 (level {})", level)
-            }
+        // Special case for Automatic which has additional sample_size info
+        if let CompressionStrategy::Automatic(level, sample_size) = self {
+            return if *sample_size == 0 {
+                write!(f, "Automatic (level {}, all records)", level)
+            } else {
+                write!(f, "Automatic (level {}, {} records)", level, sample_size)
+            };
         }
+        // All other strategies: "Name (level N)"
+        write!(f, "{} (level {})", self.display_name(), self.zstd_level())
     }
 }
 
@@ -659,6 +652,8 @@ pub struct TpaHeader {
     pub(crate) complexity_metric: ComplexityMetric,
     pub(crate) max_complexity: u32, // For Standard/Mixed/Variable: max_value; For FASTGA: trace_spacing
     pub(crate) distance: Distance,
+    /// When true, entire file is wrapped in BGZIP; per-record layers are ignored
+    pub(crate) whole_file_bgzip: bool,
 }
 
 const STRATEGY_MASK: u8 = 0b0011_1111;
@@ -688,6 +683,7 @@ impl TpaHeader {
         complexity_metric: ComplexityMetric,
         max_complexity: u32,
         distance: Distance,
+        whole_file_bgzip: bool,
     ) -> io::Result<Self> {
         let first_strategy_code = first_strategy.to_code()?;
         let second_strategy_code = second_strategy.to_code()?;
@@ -704,6 +700,7 @@ impl TpaHeader {
             complexity_metric,
             max_complexity,
             distance,
+            whole_file_bgzip,
         })
     }
 
@@ -728,12 +725,6 @@ impl TpaHeader {
             CompressionStrategy::from_code(self.first_strategy_code)?,
             CompressionStrategy::from_code(self.second_strategy_code)?,
         ))
-    }
-
-    /// Backward-compatible accessor that returns the first strategy.
-    /// Prefer `strategies()` when you need both streams.
-    pub fn strategy(&self) -> io::Result<CompressionStrategy> {
-        CompressionStrategy::from_code(self.first_strategy_code)
     }
 
     /// Get strategy for first values
@@ -776,6 +767,11 @@ impl TpaHeader {
         self.second_layer
     }
 
+    /// Whether entire file is wrapped in BGZIP (whole-file mode)
+    pub fn whole_file_bgzip(&self) -> bool {
+        self.whole_file_bgzip
+    }
+
     pub(crate) fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         // Common prefix (same as footer)
         write_common_prefix(writer, self.num_records, self.num_strings)?;
@@ -793,6 +789,8 @@ impl TpaHeader {
         writer.write_all(&[self.complexity_metric.to_u8()])?;
         write_varint(writer, self.max_complexity as u64)?;
         write_distance(writer, &self.distance)?;
+        // Whole-file BGZIP mode flag
+        writer.write_all(&[if self.whole_file_bgzip { 1 } else { 0 }])?;
         Ok(())
     }
 
@@ -820,6 +818,11 @@ impl TpaHeader {
 
         let distance = read_distance(reader)?;
 
+        // Whole-file BGZIP mode flag
+        let mut bgzip_flag_buf = [0u8; 1];
+        reader.read_exact(&mut bgzip_flag_buf)?;
+        let whole_file_bgzip = bgzip_flag_buf[0] != 0;
+
         Ok(Self {
             version,
             first_strategy_code,
@@ -832,6 +835,7 @@ impl TpaHeader {
             complexity_metric,
             max_complexity,
             distance,
+            whole_file_bgzip,
         })
     }
 }
@@ -930,6 +934,20 @@ impl TpaFooter {
     }
 }
 
+/// Detect if a file is BGZF-compressed (starts with BGZF magic bytes)
+/// BGZF files start with 0x1f 0x8b (gzip magic) and have specific extra fields
+pub fn detect_bgzf(path: &str) -> io::Result<bool> {
+    let mut file = File::open(path)?;
+    let mut magic = [0u8; 4];
+    if file.read_exact(&mut magic).is_err() {
+        return Ok(false); // File too small
+    }
+    // BGZF starts with gzip magic (0x1f 0x8b) + deflate (0x08) + flags with FEXTRA set (0x04)
+    // Standard gzip: 1f 8b 08 xx
+    // BGZF: 1f 8b 08 04 (flags has FEXTRA=0x04)
+    Ok(magic[0] == 0x1f && magic[1] == 0x8b && magic[2] == 0x08 && (magic[3] & 0x04) != 0)
+}
+
 #[cfg(test)]
 mod footer_tests {
     use super::*;
@@ -951,7 +969,7 @@ mod footer_tests {
         // Build a minimal fake file: header (magic + fixed bytes), string table (empty), footer.
         // Header layout: magic(4) + version(1) + num_records(varint) + num_strings(varint)
         // + first_strategy_with_layer(1) + second_strategy_with_layer(1)
-        // + tp_type(1) + complexity_metric(1) + max_complexity(varint) + distance
+        // + tp_type(1) + complexity_metric(1) + max_complexity(varint) + distance + whole_file_bgzip(1)
         let mut file_bytes = Vec::new();
 
         // Common prefix (same order as footer)
@@ -973,6 +991,7 @@ mod footer_tests {
         file_bytes.push(ComplexityMetric::EditDistance.to_u8());
         write_varint(&mut file_bytes, 0).unwrap(); // max_complexity
         write_distance(&mut file_bytes, &Distance::Edit).unwrap();
+        file_bytes.push(0); // whole_file_bgzip = false
 
         // string table is empty
 
@@ -982,6 +1001,24 @@ mod footer_tests {
 
         let mut cursor = Cursor::new(file_bytes);
         let (_header, _pos) = crate::binary::read_header_and_footer(&mut cursor).unwrap();
+    }
+
+    #[test]
+    fn bgzf_detection_identifies_plain_files() {
+        use std::io::Write;
+        // Create a temp file with TPA magic (not BGZF)
+        let temp_dir = std::env::temp_dir();
+        let temp_path = temp_dir.join("test_bgzf_detect_plain.tpa");
+        let temp_path_str = temp_path.to_str().unwrap();
+
+        {
+            let mut file = std::fs::File::create(&temp_path).unwrap();
+            file.write_all(TPA_MAGIC).unwrap();
+            file.write_all(&[0u8; 100]).unwrap(); // Dummy content
+        }
+
+        assert!(!detect_bgzf(temp_path_str).unwrap());
+        std::fs::remove_file(&temp_path).ok();
     }
 }
 

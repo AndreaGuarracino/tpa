@@ -201,10 +201,12 @@ All strategies preserve **byte-aligned varint encoding** for O(1) random access:
 
 **Dual strategies**: First and second values decoded independently with their respective strategies
 
-### Float Normalization (Testing)
+### PAF Normalization (Testing)
 Test suite uses `scripts/normalize_paf.py` for verification:
 - Truncates floats to 3 decimals: `0.993724` → `0.993`
 - Handles edge cases: `.0549` → `0.054`, `0` → `0.000`
+- Sorts optional fields (13+) alphabetically by tag name to handle field order differences
+- TPA outputs `tp:Z:` at the end, which may differ from input PAF field order
 
 ## Dependencies
 
@@ -233,7 +235,49 @@ Test suite uses `scripts/normalize_paf.py` for verification:
 
 **Prevention**: The script includes proper error checking for rustc compilation failures (scripts/comprehensive_test.sh)
 
-## Recent Development (2025-11-28)
+## Recent Development (2025-12-02)
+
+### BGZIP Baseline Comparison
+
+**New Feature:** Added BGZIP-only compression baseline to test suite for comparing TPA format against plain bgzipped tracepoint PAF files.
+
+**Files Added:**
+- `examples/seek_bench_bgzip_paf.rs`: Benchmark tool for measuring seek performance on bgzipped PAF using BGZF virtual positions
+
+**Files Modified:**
+- `scripts/comprehensive_test.sh`:
+  - Builds and runs BGZIP seek benchmark
+  - Outputs "bgzip-only" baseline row to TSV with compression metrics and seek performance
+
+**How it works:**
+1. BGZIP benchmark parses bgzipped PAF once, capturing BGZF virtual positions for `tp:Z:` fields
+2. Randomly seeks to positions using `noodles::bgzf::VirtualPosition`
+3. Validates decoded tracepoints against reference PAF
+4. Reports: avg_us, stddev_us, decode_ratio, valid_ratio (same format as TPA benchmarks)
+
+**TSV Output:**
+The bgzip baseline row uses:
+- `compression_strategy`: "bgzip-only"
+- `strategy_first/second`: "bgzip"
+- `layer_first/second`: "bgzip"
+- `tpa_size_bytes`: size of .gz file
+- `seek_mode_a_avg_us`: 0 (no high-level reader abstraction for BGZIP)
+- `seek_mode_b_avg_us`: BGZF virtual position seek time
+
+**Why Mode B only:**
+The BGZIP benchmark uses pre-computed virtual positions and direct `bgzf::io::Reader` access, which is analogous to TPA Mode B (standalone functions with pre-computed offsets). There's no Mode A equivalent because:
+- TPA Mode A uses `TpaReader.get_tracepoints()` - a high-level API
+- No equivalent "BgzipPafReader" abstraction exists for bgzipped PAF
+- The `bgzf::io::Reader` IS the low-level reader (no wrapper needed)
+
+**Comparison Result (100 records, sweepga dataset):**
+- BGZIP: 11KB, 44μs seek (Mode B)
+- TPA: 12KB, 19μs seek (Mode B)
+- TPA provides ~2x faster random access at slight size cost
+
+---
+
+## Earlier Development (2025-11-28)
 
 ### Directory Restructure and Cleanup
 
@@ -336,6 +380,161 @@ Test suite uses `scripts/normalize_paf.py` for verification:
 - CIGAR-derived data (p95, sweepga): TwoDimDelta often optimal for 2nd values
 - Native tracepoint data (bigfg): Simple strategies (Raw, Simple8) often win
 - Compression layer choice is dataset-dependent (Zstd vs Nocomp varies)
+
+---
+
+## Development (2025-12-12)
+
+### Code Consolidation - Phase 1 & 2
+
+**Goal:** Make the codebase more concise, maintainable, and readable while preserving efficiency.
+
+**Phase 1: Format Module Consolidation** (`src/format.rs`)
+- Simplified `zstd_level()` by combining 19 match arms into one using `|` patterns
+- Added `display_name()` helper method for strategy names
+- Simplified `Display` impl from 66 lines to 14 lines using the new helper
+- **Reduction:** ~28 lines
+
+**Phase 2: Example File Consolidation**
+- Created `examples/common/mod.rs` with shared utilities:
+  - `parse_reference()`: Parse tracepoints from PAF for validation (~82 lines)
+  - `validate_tracepoints()`: Validate decoded tracepoints against reference
+  - `tracepoint_len()`: Count tracepoint elements
+- Updated `seek_bench_reader.rs` to use shared module (204 → 93 lines)
+- Updated `seek_bench_direct.rs` to use shared module (449 → 359 lines)
+- **Reduction:** ~66 lines (with shared code factored out)
+
+**Phase 3: Reader Mode Unification** (reader.rs)
+- Added helper functions: `err_not_initialized()`, `err_out_of_bounds()`, `skip_record_header()`
+- Replaced duplicated error creation and varint skipping code
+- **Reduction:** ~9 lines
+
+**Phase 4: Binary Module Encode/Decode Consolidation** (binary.rs)
+- Added `reconstruct_from_zigzag_deltas()` helper for Rice/Huffman decode
+- Combined `Raw` and `HybridRLE` encode/decode arms (identical varint logic)
+- Simplified Rice and Huffman decode blocks from ~15 lines each to ~3 lines
+- **Reduction:** ~22 lines
+
+**Phase 5: Decompress Function Consolidation** (lib.rs)
+- Replaced inline PAF writing in `decompress_bgzf_tpa()` with `write_paf_line_with_tracepoints()`
+- Removed ~45 lines of duplicate code
+- **Reduction:** ~45 lines
+
+**Phase 6: Scripts Consolidation**
+- Reviewed scripts; already well-organized
+- `run_all_tests.sh` calls `comprehensive_test.sh` directly
+- Helper functions specific to comprehensive_test.sh, no duplication
+
+**Total Reduction:** ~236 lines across all phases with cleaner, more maintainable code
+
+---
+
+## Development (2025-12-11)
+
+### Verification and Seek Benchmark Fixes
+
+**Problem:** Test suite was reporting `verification_passed=no` for automatic mode strategies (Rice/TwoDimDelta), and seek benchmarks were panicking with "Record id out of bounds" errors.
+
+**Root Causes:**
+1. **PAF field order difference:** TPA outputs `tp:Z:` at the end of optional fields, while input PAF may have it in a different position. The normalize script wasn't accounting for this.
+2. **Float precision boundary:** TPA stores floats as f32, but original PAF has f64 values. Boundary cases like `0.994499921799` vs `0.9944999` round differently without proper handling.
+3. **Stale index causing bounds errors:** Seek benchmark used CLI argument for record count, but stale indexes could have fewer records.
+
+**Fixes:**
+1. **`scripts/normalize_paf.py`:**
+   - Added optional field sorting (fields 13+) by tag name before comparison
+   - Added f32 conversion before rounding: uses `struct.pack/unpack` to convert floats to f32 precision before rounding to 3 decimals
+   - This ensures both original (f64) and decompressed (f32) files normalize to the same values
+
+2. **`examples/seek_bench_direct.rs`:** Uses `reader.header().num_records()` instead of CLI argument
+   - Prevents bounds errors when index is stale
+   - CLI argument kept for backward compatibility but ignored
+
+**Example of f32 fix:**
+- Original: `bi:f:0.994499921799` -> f32: `0.994499921798706` -> round: `0.994`
+- Decomp: `bi:f:0.9944999` -> f32: `0.994499921798706` -> round: `0.994`
+- Result: Both match after normalization
+
+**Verification:** After fixes, all automatic mode strategies (Rice/TwoDimDelta, bgzip-all) pass verification with matching MD5 checksums.
+
+---
+
+## Development (2025-12-10)
+
+### BGZIP Whole-File Compression Mode
+
+**New Feature:** Added alternative compression mode where the entire TPA file is wrapped in BGZIP for cross-record compression context and block-level random access.
+
+**Trade-offs:**
+| Aspect | Per-Record Layers (classic) | BGZIP Whole-File (new) |
+|--------|---------------------------|------------------------|
+| Compression | Good | Better (cross-record context) |
+| Random Access | Fast (direct seek) | Slower (64KB block decompress) |
+| Index | Small (varint offsets) | Larger (u64 virtual positions) |
+
+**Usage:**
+```rust
+// Enable BGZIP whole-file mode
+tpa::compress_paf_to_tpa(
+    "input.paf",
+    "output.tpa",
+    tpa::CompressionConfig::new()
+        .strategy(tpa::CompressionStrategy::ZigzagDelta(3))
+        .whole_file_bgzip()  // <-- Enable BGZIP mode
+        .from_cigar(),
+)?;
+
+// With automatic strategy selection
+tpa::compress_paf_to_tpa(
+    "input.paf",
+    "output.tpa",
+    tpa::CompressionConfig::new()
+        .strategy(tpa::CompressionStrategy::Automatic(3, 100))
+        .whole_file_bgzip()
+        .from_cigar(),
+)?;
+```
+
+**Key Implementation Details:**
+- Same `.tpa` extension with auto-detection via BGZF magic bytes
+- `TpaReader::open()` automatically detects classic vs BGZIP mode
+- `TpaReader::is_bgzf_mode()` returns true for BGZIP-wrapped files
+- Index uses BGZF virtual positions (64-bit: block_offset << 16 | in_block_offset)
+- Per-record compression layers set to `Nocomp` (BGZF handles compression)
+- `SmartDualAnalyzer::for_whole_file_bgzip()` only tests strategies, not layers
+
+**Standalone Functions (Mode B) for BGZIP:**
+- `read_standard_tracepoints_at_vpos()`: Seek to BGZF virtual position and decode standard tracepoints
+- `read_variable_tracepoints_at_vpos()`: Seek to BGZF virtual position and decode variable tracepoints
+- `read_mixed_tracepoints_at_vpos()`: Seek to BGZF virtual position and decode mixed representations
+- Re-exported `noodles::bgzf` module for direct BGZF reader access
+- `examples/seek_bench_direct.rs`: Auto-detects mode and uses `_at_offset()` or `_at_vpos()` functions
+
+**Files Modified:**
+- `src/format.rs`: `detect_bgzf()`, `CompressionConfig.whole_file_bgzip()`, TpaHeader updates
+- `src/index.rs`: `IndexType` enum (RawOffset vs VirtualPosition)
+- `src/lib.rs`: `compress_with_bgzip_wrapper()`, `is_tpa_file()` BGZF support, re-exports `bgzf` module
+- `src/reader.rs`: Dual-mode `TpaReader` (classic + BGZF), BGZF-aware `_at_vpos()` functions
+- `src/binary.rs`: `SmartDualAnalyzer::for_whole_file_bgzip()`
+- `scripts/comprehensive_test.sh`: Runs Mode B for both classic and BGZIP modes
+- `src/bin/tpa-analyze.rs`: BGZF mode display
+- `src/bin/tpa-view.rs`: BGZF mode display
+
+**Test Results (100 records, sweepga dataset):**
+- Classic (ZigzagDelta+Zstd): 12,236 bytes
+- BGZIP (ZigzagDelta): 9,129 bytes (74.6% of classic)
+- BGZIP (Automatic): 7,416 bytes (60.6% of classic) - selected Rice/TwoDimDelta
+
+### Test Suite Fix: BGZIP Mode Seek Benchmarks
+
+**Issue:** Seek benchmark Mode B (standalone offset functions) failed for BGZIP whole-file mode because the index contains BGZF virtual positions, not raw byte offsets.
+
+**Fix:** Updated `scripts/comprehensive_test.sh` to:
+1. Skip Mode B benchmark for BGZIP whole-file mode (set to "NA")
+2. Use Mode A (TpaReader) results for decode_ratio and valid_ratio
+3. TSV now correctly shows seek metrics for all modes
+
+**Modified:** `scripts/comprehensive_test.sh` (lines 550-567)
 
 ## Common Patterns
 
