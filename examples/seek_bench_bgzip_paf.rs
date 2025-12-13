@@ -322,13 +322,10 @@ fn main() {
             buffer.resize(record.tp_length, 0u8);
 
             let start = Instant::now();
-            if reader.seek(vpos).is_ok() && reader.read_exact(&mut buffer).is_ok() {
-                let time_us = start.elapsed().as_micros();
-                sum_us += time_us;
-                sum_sq_us += time_us * time_us;
-                decode_count += 1;
-
-                // Parse and validate
+            let (decoded, is_valid) = if reader.seek(vpos).is_ok()
+                && reader.read_exact(&mut buffer).is_ok()
+            {
+                // Parse INSIDE timing to match TPA benchmark (which includes decode)
                 if let Ok(tp_str) = std::str::from_utf8(&buffer) {
                     let is_valid = match tp_type.as_str() {
                         "variable" => {
@@ -362,10 +359,22 @@ fn main() {
                             }
                         }
                     };
+                    (true, is_valid)
+                } else {
+                    (true, false)
+                }
+            } else {
+                (false, false)
+            };
 
-                    if is_valid {
-                        valid_count += 1;
-                    }
+            if decoded {
+                let time_us = start.elapsed().as_micros();
+                sum_us += time_us;
+                sum_sq_us += time_us * time_us;
+                decode_count += 1;
+
+                if is_valid {
+                    valid_count += 1;
                 }
             }
         }
