@@ -178,7 +178,10 @@ fn analyze_tpa_size(path: &str) -> io::Result<(TpaSizeAnalysis, TpaHeader, [u8; 
     }
 }
 
-fn analyze_classic_tpa(path: &str, total_file_size: u64) -> io::Result<(TpaSizeAnalysis, TpaHeader, [u8; 4])> {
+fn analyze_classic_tpa(
+    path: &str,
+    total_file_size: u64,
+) -> io::Result<(TpaSizeAnalysis, TpaHeader, [u8; 4])> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
 
@@ -241,7 +244,10 @@ fn analyze_classic_tpa(path: &str, total_file_size: u64) -> io::Result<(TpaSizeA
     Ok((analysis, header, magic))
 }
 
-fn analyze_bgzf_tpa(path: &str, total_file_size: u64) -> io::Result<(TpaSizeAnalysis, TpaHeader, [u8; 4])> {
+fn analyze_bgzf_tpa(
+    path: &str,
+    total_file_size: u64,
+) -> io::Result<(TpaSizeAnalysis, TpaHeader, [u8; 4])> {
     let file = File::open(path)?;
     let buf_reader = BufReader::new(file);
     let mut bgzf_reader = bgzf::io::Reader::new(buf_reader);
@@ -286,7 +292,8 @@ fn analyze_bgzf_tpa(path: &str, total_file_size: u64) -> io::Result<(TpaSizeAnal
 
     // For BGZF mode, we report the compressed file size
     // The uncompressed breakdown is estimated from the string table
-    let estimated_string_table_size = string_name_length_varints + string_name_bytes + sequence_length_varints;
+    let estimated_string_table_size =
+        string_name_length_varints + string_name_bytes + sequence_length_varints;
 
     let analysis = TpaSizeAnalysis {
         total_file_size,

@@ -139,7 +139,12 @@ impl SmartDualAnalyzer {
         sample_limit: Option<usize>,
         parallel: bool,
     ) -> Self {
-        Self::with_layers(zstd_level, sample_limit, parallel, [CompressionLayer::Nocomp; 1])
+        Self::with_layers(
+            zstd_level,
+            sample_limit,
+            parallel,
+            [CompressionLayer::Nocomp; 1],
+        )
     }
 
     fn with_layers<const N: usize>(
@@ -735,8 +740,7 @@ fn encode_second_stream(
 }
 
 fn second_depends_on_first(strategy: &CompressionStrategy) -> bool {
-    matches!(strategy, CompressionStrategy::TwoDimDelta(_)
-    )
+    matches!(strategy, CompressionStrategy::TwoDimDelta(_))
 }
 
 // ============================================================================
@@ -1451,11 +1455,7 @@ const LZ77_WINDOW_SIZE: usize = 256;
 
 /// Find the longest match in the sliding window
 #[inline]
-fn lz77_find_longest_match(
-    values: &[u64],
-    pos: usize,
-    window_size: usize,
-) -> (usize, usize) {
+fn lz77_find_longest_match(values: &[u64], pos: usize, window_size: usize) -> (usize, usize) {
     let start = pos.saturating_sub(window_size);
     let mut best_offset = 0;
     let mut best_length = 0;

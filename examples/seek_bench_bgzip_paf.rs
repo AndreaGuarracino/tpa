@@ -146,7 +146,9 @@ fn build_virtual_position_index(bgzip_path: &str, limit: usize) -> Vec<Tracepoin
         let line_start_vpos = reader.virtual_position();
         line_bytes.clear();
 
-        let bytes_read = reader.read_until(b'\n', &mut line_bytes).expect("read line");
+        let bytes_read = reader
+            .read_until(b'\n', &mut line_bytes)
+            .expect("read line");
         if bytes_read == 0 {
             break; // EOF
         }
@@ -322,50 +324,49 @@ fn main() {
             buffer.resize(record.tp_length, 0u8);
 
             let start = Instant::now();
-            let (decoded, is_valid) = if reader.seek(vpos).is_ok()
-                && reader.read_exact(&mut buffer).is_ok()
-            {
-                // Parse INSIDE timing to match TPA benchmark (which includes decode)
-                if let Ok(tp_str) = std::str::from_utf8(&buffer) {
-                    let is_valid = match tp_type.as_str() {
-                        "variable" => {
-                            let parsed = parse_tracepoints_variable(tp_str);
-                            if let Reference::Variable(refs) = &reference {
-                                refs.get(pos)
-                                    .map(|expected| expected.as_slice() == parsed.as_slice())
-                                    .unwrap_or(false)
-                            } else {
-                                false
+            let (decoded, is_valid) =
+                if reader.seek(vpos).is_ok() && reader.read_exact(&mut buffer).is_ok() {
+                    // Parse INSIDE timing to match TPA benchmark (which includes decode)
+                    if let Ok(tp_str) = std::str::from_utf8(&buffer) {
+                        let is_valid = match tp_type.as_str() {
+                            "variable" => {
+                                let parsed = parse_tracepoints_variable(tp_str);
+                                if let Reference::Variable(refs) = &reference {
+                                    refs.get(pos)
+                                        .map(|expected| expected.as_slice() == parsed.as_slice())
+                                        .unwrap_or(false)
+                                } else {
+                                    false
+                                }
                             }
-                        }
-                        "mixed" => {
-                            let parsed = parse_tracepoints_mixed(tp_str);
-                            if let Reference::Mixed(refs) = &reference {
-                                refs.get(pos)
-                                    .map(|expected| expected.as_slice() == parsed.as_slice())
-                                    .unwrap_or(false)
-                            } else {
-                                false
+                            "mixed" => {
+                                let parsed = parse_tracepoints_mixed(tp_str);
+                                if let Reference::Mixed(refs) = &reference {
+                                    refs.get(pos)
+                                        .map(|expected| expected.as_slice() == parsed.as_slice())
+                                        .unwrap_or(false)
+                                } else {
+                                    false
+                                }
                             }
-                        }
-                        _ => {
-                            let parsed = parse_tracepoints_standard(tp_str);
-                            if let Reference::Standard(refs) = &reference {
-                                refs.get(pos)
-                                    .map(|expected| expected.as_slice() == parsed.as_slice())
-                                    .unwrap_or(false)
-                            } else {
-                                false
+                            _ => {
+                                let parsed = parse_tracepoints_standard(tp_str);
+                                if let Reference::Standard(refs) = &reference {
+                                    refs.get(pos)
+                                        .map(|expected| expected.as_slice() == parsed.as_slice())
+                                        .unwrap_or(false)
+                                } else {
+                                    false
+                                }
                             }
-                        }
-                    };
-                    (true, is_valid)
+                        };
+                        (true, is_valid)
+                    } else {
+                        (true, false)
+                    }
                 } else {
-                    (true, false)
-                }
-            } else {
-                (false, false)
-            };
+                    (false, false)
+                };
 
             if decoded {
                 let time_us = start.elapsed().as_micros();

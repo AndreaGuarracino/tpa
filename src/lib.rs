@@ -277,7 +277,9 @@ fn compress_paf_internal(
             let parallel = *sample_size == 0; // Use parallel only for full-file analysis
             if whole_file_bgzip {
                 // For BGZIP whole-file mode, only test strategies (layers handled by BGZF)
-                Some(SmartDualAnalyzer::for_whole_file_bgzip(*level, limit, parallel))
+                Some(SmartDualAnalyzer::for_whole_file_bgzip(
+                    *level, limit, parallel,
+                ))
             } else {
                 Some(SmartDualAnalyzer::new(*level, limit, parallel))
             }
@@ -431,7 +433,14 @@ fn compress_classic(
             continue;
         }
 
-        let record = match parse_paf(&line, string_table, use_cigar, tp_type, max_complexity, complexity_metric) {
+        let record = match parse_paf(
+            &line,
+            string_table,
+            use_cigar,
+            tp_type,
+            max_complexity,
+            complexity_metric,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 warn!("Skipping malformed line {}: {}", line_num + 1, e);
@@ -523,7 +532,14 @@ fn compress_with_bgzip_wrapper(
             continue;
         }
 
-        let record = match parse_paf(&line, string_table, use_cigar, tp_type, max_complexity, complexity_metric) {
+        let record = match parse_paf(
+            &line,
+            string_table,
+            use_cigar,
+            tp_type,
+            max_complexity,
+            complexity_metric,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 warn!("Skipping malformed line {}: {}", line_num + 1, e);

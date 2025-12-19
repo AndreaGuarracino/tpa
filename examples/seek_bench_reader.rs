@@ -163,21 +163,18 @@ fn main() {
                     // Validate against reference
                     let is_valid = match (&tp, &reference) {
                         (TracepointData::Standard(tps), Reference::Standard(refs))
-                        | (TracepointData::Fastga(tps), Reference::Standard(refs)) => {
-                            refs.get(pos as usize)
-                                .map(|expected| expected.as_slice() == tps.as_slice())
-                                .unwrap_or(false)
-                        }
-                        (TracepointData::Variable(tps), Reference::Variable(refs)) => {
-                            refs.get(pos as usize)
-                                .map(|expected| expected.as_slice() == tps.as_slice())
-                                .unwrap_or(false)
-                        }
-                        (TracepointData::Mixed(items), Reference::Mixed(refs)) => {
-                            refs.get(pos as usize)
-                                .map(|expected| expected.as_slice() == items.as_slice())
-                                .unwrap_or(false)
-                        }
+                        | (TracepointData::Fastga(tps), Reference::Standard(refs)) => refs
+                            .get(pos as usize)
+                            .map(|expected| expected.as_slice() == tps.as_slice())
+                            .unwrap_or(false),
+                        (TracepointData::Variable(tps), Reference::Variable(refs)) => refs
+                            .get(pos as usize)
+                            .map(|expected| expected.as_slice() == tps.as_slice())
+                            .unwrap_or(false),
+                        (TracepointData::Mixed(items), Reference::Mixed(refs)) => refs
+                            .get(pos as usize)
+                            .map(|expected| expected.as_slice() == items.as_slice())
+                            .unwrap_or(false),
                         _ => false, // Type mismatch
                     };
 
