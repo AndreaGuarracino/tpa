@@ -1,4 +1,4 @@
-use crate::binary::{read_header_and_footer, skip_record};
+use crate::binary::{read_header, skip_record};
 use crate::format::StringTable;
 use crate::utils::{read_varint, write_varint};
 use log::info;
@@ -32,7 +32,7 @@ impl IndexType {
 }
 
 /// File offset index for O(1) random access.
-/// Supports both raw byte offsets (classic TPA) and BGZF virtual positions (whole-file BGZIP mode).
+/// Supports both raw byte offsets (per-record mode) and BGZF virtual positions (all-records mode).
 pub struct TpaIndex {
     /// Type of positions stored (raw offsets or virtual positions)
     index_type: IndexType,
@@ -43,7 +43,7 @@ pub struct TpaIndex {
 impl TpaIndex {
     const INDEX_MAGIC: &'static [u8; 4] = b"TPAI";
 
-    /// Create a new index with raw byte offsets (classic mode)
+    /// Create a new index with raw byte offsets (per-record mode)
     pub fn new_raw(offsets: Vec<u64>) -> Self {
         Self {
             index_type: IndexType::RawOffset,
@@ -51,7 +51,7 @@ impl TpaIndex {
         }
     }
 
-    /// Create a new index with BGZF virtual positions (whole-file BGZIP mode)
+    /// Create a new index with BGZF virtual positions (all-records mode)
     pub fn new_virtual(positions: Vec<u64>) -> Self {
         Self {
             index_type: IndexType::VirtualPosition,
@@ -158,15 +158,15 @@ impl TpaIndex {
     }
 }
 
-/// Build an index from a TPA file by scanning record offsets (classic mode).
-/// For whole-file BGZIP mode, use the index built during compression.
+/// Build an index from a TPA file by scanning record offsets (per-record mode).
+/// For all-records mode, use the index built during compression.
 pub fn build_index(tpa_path: &str) -> io::Result<TpaIndex> {
     info!("Building index for {}", tpa_path);
 
     let file = File::open(tpa_path)?;
     let mut reader = BufReader::with_capacity(131072, file);
 
-    let (header, _after_header) = read_header_and_footer(&mut reader)?;
+    let header = read_header(&mut reader)?;
     StringTable::read(&mut reader, header.num_strings)?;
 
     let mut offsets = Vec::with_capacity(header.num_records as usize);

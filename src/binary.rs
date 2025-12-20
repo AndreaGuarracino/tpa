@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use tracepoints::{MixedRepresentation, TracepointData, TracepointType};
 
-use crate::ensure_tracepoints;
+use crate::check_not_empty_tps;
 use crate::format::*;
 use crate::utils::*;
 
@@ -116,52 +116,22 @@ fn reconstruct_from_zigzag_deltas(zigzagged: &[u64]) -> Vec<u64> {
     vals
 }
 
-pub(crate) struct SmartDualAnalyzer {
+pub(crate) struct StrategyAnalyzer {
     first_states: Vec<StreamState>,
     second_states: Vec<StreamState>,
     layers: [CompressionLayer; 3],
-    parallel: bool,
-    sample_limit: Option<usize>,
+    sample_limit: usize, // 0 = no limit
     processed_records: usize,
     processed_tracepoints: usize,
 }
 
-impl SmartDualAnalyzer {
-    pub fn new(zstd_level: i32, sample_limit: Option<usize>, parallel: bool) -> Self {
-        Self::with_layers(zstd_level, sample_limit, parallel, CompressionLayer::all())
-    }
-
-    /// Create analyzer for BGZIP whole-file mode (only tests Nocomp layer).
-    /// When the entire file is wrapped in BGZIP, per-record compression layers
-    /// are not used, so we only need to find the best strategy encoding.
-    pub fn for_whole_file_bgzip(
-        zstd_level: i32,
-        sample_limit: Option<usize>,
-        parallel: bool,
-    ) -> Self {
-        Self::with_layers(
-            zstd_level,
-            sample_limit,
-            parallel,
-            [CompressionLayer::Nocomp; 1],
-        )
-    }
-
-    fn with_layers<const N: usize>(
-        zstd_level: i32,
-        sample_limit: Option<usize>,
-        parallel: bool,
-        layers: [CompressionLayer; N],
-    ) -> Self {
+impl StrategyAnalyzer {
+    /// Create analyzer. If `test_layers` is true, tests all 3 compression layers (Zstd, Bgzip, Nocomp).
+    /// If false, only tests Nocomp (for BGZIP whole-file mode where per-record compression is redundant).
+    pub fn new(zstd_level: i32, sample_limit: usize, test_layers: bool) -> Self {
         let strategies = CompressionStrategy::concrete_strategies(zstd_level);
-        // Convert fixed-size array to a 3-element array, padding with first element if needed
-        let layers_vec: [CompressionLayer; 3] = [
-            layers[0],
-            if N > 1 { layers[1] } else { layers[0] },
-            if N > 2 { layers[2] } else { layers[0] },
-        ];
-        // For BGZIP mode (N=1), we only test one layer; otherwise all 3
-        let num_layers_to_test = N;
+        let layers = CompressionLayer::all();
+        let num_layers_to_test = if test_layers { 3 } else { 1 };
         let first_states = strategies
             .iter()
             .cloned()
@@ -175,22 +145,19 @@ impl SmartDualAnalyzer {
         Self {
             first_states,
             second_states,
-            layers: layers_vec,
-            parallel,
+            layers,
             sample_limit,
             processed_records: 0,
             processed_tracepoints: 0,
         }
     }
 
-    pub fn ingest(&mut self, record: &AlignmentRecord) -> io::Result<()> {
-        if let Some(limit) = self.sample_limit {
-            if self.processed_records >= limit {
-                return Ok(());
-            }
+    pub fn analyze_record(&mut self, record: &AlignmentRecord) -> io::Result<()> {
+        if self.sample_limit > 0 && self.processed_records >= self.sample_limit {
+            return Ok(());
         }
 
-        ensure_tracepoints(&record.tracepoints)?;
+        check_not_empty_tps(&record.tracepoints)?;
 
         match &record.tracepoints {
             TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
@@ -209,7 +176,6 @@ impl SmartDualAnalyzer {
                     &self.layers,
                     &first_vals,
                     &second_vals,
-                    self.parallel,
                     "First",
                     |first, _second, strategy| encode_first_stream(first, strategy),
                 );
@@ -218,7 +184,6 @@ impl SmartDualAnalyzer {
                     &self.layers,
                     &first_vals,
                     &second_vals,
-                    self.parallel,
                     "Second",
                     encode_second_stream,
                 );
@@ -240,7 +205,6 @@ impl SmartDualAnalyzer {
                     &self.layers,
                     &first_vals,
                     &second_vals,
-                    self.parallel,
                     "First",
                     |first, _second, strategy| encode_first_stream(first, strategy),
                 );
@@ -251,7 +215,6 @@ impl SmartDualAnalyzer {
                         &self.layers,
                         &first_vals,
                         &second_vals,
-                        self.parallel,
                         "Second",
                         encode_second_stream,
                     );
@@ -291,7 +254,6 @@ impl SmartDualAnalyzer {
                     &self.layers,
                     &first_vals,
                     &tp_second,
-                    self.parallel,
                     "First",
                     |first, _second, strategy| encode_first_stream(first, strategy),
                 );
@@ -302,7 +264,6 @@ impl SmartDualAnalyzer {
                         &self.layers,
                         &first_vals,
                         &tp_second,
-                        self.parallel,
                         "Second",
                         encode_second_stream,
                     );
@@ -312,12 +273,12 @@ impl SmartDualAnalyzer {
         Ok(())
     }
 
-    pub fn finalize_pair(
+    pub fn select_best(
         self,
     ) -> io::Result<(
         CompressionStrategy,
-        CompressionLayer,
         CompressionStrategy,
+        CompressionLayer,
         CompressionLayer,
     )> {
         if self.processed_records == 0 {
@@ -505,8 +466,8 @@ impl SmartDualAnalyzer {
 
         Ok((
             final_first,
-            final_first_layer,
             final_second,
+            final_first_layer,
             final_second_layer,
         ))
     }
@@ -676,20 +637,14 @@ fn process_stream_states<F>(
     layers: &[CompressionLayer; 3],
     first_vals: &[u64],
     second_vals: &[u64],
-    parallel: bool,
     stream_label: &'static str,
     encode_fn: F,
 ) where
     F: Fn(&[u64], &[u64], &CompressionStrategy) -> io::Result<Vec<u8>> + Sync,
 {
-    let worker = |state: &mut StreamState| {
+    states.par_iter_mut().for_each(|state| {
         state.process_sample(layers, first_vals, second_vals, &encode_fn, stream_label);
-    };
-    if parallel {
-        states.par_iter_mut().for_each(worker);
-    } else {
-        states.iter_mut().for_each(worker);
-    }
+    });
 }
 
 fn encode_first_stream(values: &[u64], strategy: &CompressionStrategy) -> io::Result<Vec<u8>> {
@@ -953,10 +908,8 @@ pub(crate) fn read_tracepoints<R: Read>(
 // SHARED HELPERS (HEADER/FOOTER, TRACEPOINTS, SKIPS)
 // ============================================================================
 
-/// Read header, validate footer, and reset position to just after the header.
-pub(crate) fn read_header_and_footer<R: Read + Seek>(
-    reader: &mut R,
-) -> io::Result<(TpaHeader, u64)> {
+/// Read and validate header (checks footer for crash-safety), positions reader after header.
+pub(crate) fn read_header<R: Read + Seek>(reader: &mut R) -> io::Result<TpaHeader> {
     let header = TpaHeader::read(reader)?;
     if header.version != TPA_VERSION {
         return Err(io::Error::new(
@@ -969,7 +922,7 @@ pub(crate) fn read_header_and_footer<R: Read + Seek>(
     let footer = TpaFooter::read_from_end(reader)?;
     footer.validate_against(&header)?;
     reader.seek(SeekFrom::Start(after_header))?;
-    Ok((header, after_header))
+    Ok(header)
 }
 
 /// Decode tracepoints from a known offset (seeks before reading).
@@ -2401,7 +2354,7 @@ impl AlignmentRecord {
         first_layer: CompressionLayer,
         second_layer: CompressionLayer,
     ) -> io::Result<()> {
-        ensure_tracepoints(&self.tracepoints)?;
+        check_not_empty_tps(&self.tracepoints)?;
         match &self.tracepoints {
             TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
                 write_varint(writer, tps.len() as u64)?;

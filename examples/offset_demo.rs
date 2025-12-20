@@ -24,7 +24,7 @@ fn main() -> std::io::Result<()> {
 
     println!("Opening {}...", tpa_path);
     let start = Instant::now();
-    let mut reader = TpaReader::open(tpa_path)?;
+    let mut reader = TpaReader::new(tpa_path)?;
     let open_time = start.elapsed();
 
     println!(

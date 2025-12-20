@@ -135,11 +135,11 @@ fn main() {
     let reference_paf = &args[6];
 
     // Open TpaReader to get strategies, layers, offsets, and detect mode
-    let mut reader = TpaReader::open(tpa_path).unwrap();
+    let mut reader = TpaReader::new(tpa_path).unwrap();
     let (first_strategy, second_strategy) = reader.header().strategies().unwrap();
     let first_layer = reader.header().first_layer();
     let second_layer = reader.header().second_layer();
-    let is_bgzf = reader.is_bgzf_mode();
+    let is_all_records = reader.is_all_records_mode();
     let reference = parse_reference(reference_paf, num_records as usize, tp_type);
 
     // Generate deterministic pseudo-random positions
@@ -166,8 +166,8 @@ fn main() {
     let mut valid_count = 0usize;
     let total_tests = num_positions * iterations_per_pos;
 
-    if is_bgzf {
-        // BGZIP mode: use bgzf reader and _at_vpos functions
+    if is_all_records {
+        // All-records mode: use bgzf reader and _at_vpos functions
         let file = File::open(tpa_path).unwrap();
         let mut bgzf_reader = bgzf::io::Reader::new(file);
 

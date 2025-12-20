@@ -60,15 +60,6 @@ pub enum CompressionLayer {
     Nocomp,
 }
 
-/// Open a TPA file, validate its footer, and return the file, parsed header,
-/// and byte offset where the string table starts (immediately after the header).
-/// Use this for any TPA open path to avoid duplicating header/footer validation.
-pub fn open_with_footer(path: &str) -> io::Result<(File, TpaHeader, u64)> {
-    let mut file = File::open(path)?;
-    let (header, string_table_offset) = crate::binary::read_header_and_footer(&mut file)?;
-    Ok((file, header, string_table_offset))
-}
-
 impl CompressionLayer {
     pub fn to_u8(self) -> u8 {
         match self {
@@ -87,7 +78,7 @@ impl CompressionLayer {
         }
     }
 
-    /// Return a stable, human-readable label for this layer
+    /// Return a human-readable label for this layer
     pub fn as_str(self) -> &'static str {
         match self {
             CompressionLayer::Zstd => "zstd",
@@ -111,12 +102,12 @@ impl CompressionLayer {
 pub struct CompressionConfig {
     /// Strategy for first values in tracepoint pairs
     pub first_strategy: CompressionStrategy,
-    /// Strategy for second values (None = use first_strategy)
-    pub second_strategy: Option<CompressionStrategy>,
+    /// Strategy for second values in tracepoint pairs
+    pub second_strategy: CompressionStrategy,
     /// Compression layer for first stream
     pub first_layer: CompressionLayer,
-    /// Compression layer for second stream (None = use first_layer)
-    pub second_layer: Option<CompressionLayer>,
+    /// Compression layer for second stream
+    pub second_layer: CompressionLayer,
     /// Tracepoint representation type
     pub tp_type: TracepointType,
     /// Maximum complexity/spacing parameter
@@ -126,9 +117,9 @@ pub struct CompressionConfig {
     /// Distance parameters for alignment
     pub distance: Distance,
     /// True if input has CIGAR strings, false if tracepoints
-    pub use_cigar: bool,
+    pub from_cigar: bool,
     /// When true, wrap entire file in BGZIP instead of per-record compression
-    pub whole_file_bgzip: bool,
+    pub bgzip_all_records: bool,
     /// BGZIP compression level (0-9) for whole-file mode
     pub bgzip_level: u32,
 }
@@ -137,15 +128,15 @@ impl Default for CompressionConfig {
     fn default() -> Self {
         Self {
             first_strategy: CompressionStrategy::Automatic(3, 10000),
-            second_strategy: None,
+            second_strategy: CompressionStrategy::Automatic(3, 10000),
             first_layer: CompressionLayer::Zstd,
-            second_layer: None,
+            second_layer: CompressionLayer::Zstd,
             tp_type: TracepointType::Standard,
             max_complexity: 32,
             complexity_metric: ComplexityMetric::EditDistance,
             distance: Distance::Edit,
-            use_cigar: false,
-            whole_file_bgzip: false,
+            from_cigar: false,
+            bgzip_all_records: false,
             bgzip_level: 6,
         }
     }
@@ -159,8 +150,8 @@ impl CompressionConfig {
 
     /// Set the compression strategy (used for both first and second values)
     pub fn strategy(mut self, s: CompressionStrategy) -> Self {
-        self.first_strategy = s;
-        self.second_strategy = None;
+        self.first_strategy = s.clone();
+        self.second_strategy = s;
         self
     }
 
@@ -171,21 +162,21 @@ impl CompressionConfig {
         second: CompressionStrategy,
     ) -> Self {
         self.first_strategy = first;
-        self.second_strategy = Some(second);
+        self.second_strategy = second;
         self
     }
 
     /// Set the compression layer (used for both first and second streams)
     pub fn layer(mut self, l: CompressionLayer) -> Self {
         self.first_layer = l;
-        self.second_layer = None;
+        self.second_layer = l;
         self
     }
 
     /// Set separate compression layers for first and second streams
     pub fn dual_layer(mut self, first: CompressionLayer, second: CompressionLayer) -> Self {
         self.first_layer = first;
-        self.second_layer = Some(second);
+        self.second_layer = second;
         self
     }
 
@@ -215,13 +206,13 @@ impl CompressionConfig {
 
     /// Mark input as having CIGAR strings (converts to tracepoints)
     pub fn from_cigar(mut self) -> Self {
-        self.use_cigar = true;
+        self.from_cigar = true;
         self
     }
 
     /// Mark input as having tracepoints (default)
     pub fn from_tracepoints(mut self) -> Self {
-        self.use_cigar = false;
+        self.from_cigar = false;
         self
     }
 
@@ -229,8 +220,8 @@ impl CompressionConfig {
     /// Instead of per-record compression layers, wraps entire file in BGZIP.
     /// Enables cross-record compression context for better compression ratios.
     /// Random access uses BGZF virtual positions (block-level, ~64KB blocks).
-    pub fn whole_file_bgzip(mut self) -> Self {
-        self.whole_file_bgzip = true;
+    pub fn bgzip_all_records(mut self) -> Self {
+        self.bgzip_all_records = true;
         self
     }
 
@@ -238,13 +229,6 @@ impl CompressionConfig {
     pub fn bgzip_level(mut self, level: u32) -> Self {
         self.bgzip_level = level.min(9);
         self
-    }
-
-    /// Get the effective second strategy (first if not explicitly set)
-    pub fn effective_second_strategy(&self) -> CompressionStrategy {
-        self.second_strategy
-            .clone()
-            .unwrap_or_else(|| self.first_strategy.clone())
     }
 }
 
@@ -653,7 +637,7 @@ pub struct TpaHeader {
     pub(crate) max_complexity: u32, // For Standard/Mixed/Variable: max_value; For FASTGA: trace_spacing
     pub(crate) distance: Distance,
     /// When true, entire file is wrapped in BGZIP; per-record layers are ignored
-    pub(crate) whole_file_bgzip: bool,
+    pub(crate) bgzip_all_records: bool,
 }
 
 const STRATEGY_MASK: u8 = 0b0011_1111;
@@ -683,7 +667,7 @@ impl TpaHeader {
         complexity_metric: ComplexityMetric,
         max_complexity: u32,
         distance: Distance,
-        whole_file_bgzip: bool,
+        bgzip_all_records: bool,
     ) -> io::Result<Self> {
         let first_strategy_code = first_strategy.to_code()?;
         let second_strategy_code = second_strategy.to_code()?;
@@ -700,7 +684,7 @@ impl TpaHeader {
             complexity_metric,
             max_complexity,
             distance,
-            whole_file_bgzip,
+            bgzip_all_records,
         })
     }
 
@@ -768,8 +752,8 @@ impl TpaHeader {
     }
 
     /// Whether entire file is wrapped in BGZIP (whole-file mode)
-    pub fn whole_file_bgzip(&self) -> bool {
-        self.whole_file_bgzip
+    pub fn bgzip_all_records(&self) -> bool {
+        self.bgzip_all_records
     }
 
     pub(crate) fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
@@ -790,7 +774,7 @@ impl TpaHeader {
         write_varint(writer, self.max_complexity as u64)?;
         write_distance(writer, &self.distance)?;
         // Whole-file BGZIP mode flag
-        writer.write_all(&[if self.whole_file_bgzip { 1 } else { 0 }])?;
+        writer.write_all(&[if self.bgzip_all_records { 1 } else { 0 }])?;
         Ok(())
     }
 
@@ -821,7 +805,7 @@ impl TpaHeader {
         // Whole-file BGZIP mode flag
         let mut bgzip_flag_buf = [0u8; 1];
         reader.read_exact(&mut bgzip_flag_buf)?;
-        let whole_file_bgzip = bgzip_flag_buf[0] != 0;
+        let bgzip_all_records = bgzip_flag_buf[0] != 0;
 
         Ok(Self {
             version,
@@ -835,7 +819,7 @@ impl TpaHeader {
             complexity_metric,
             max_complexity,
             distance,
-            whole_file_bgzip,
+            bgzip_all_records,
         })
     }
 }
@@ -935,7 +919,6 @@ impl TpaFooter {
 }
 
 /// Detect if a file is BGZF-compressed (starts with BGZF magic bytes)
-/// BGZF files start with 0x1f 0x8b (gzip magic) and have specific extra fields
 pub fn detect_bgzf(path: &str) -> io::Result<bool> {
     let mut file = File::open(path)?;
     let mut magic = [0u8; 4];
@@ -943,8 +926,6 @@ pub fn detect_bgzf(path: &str) -> io::Result<bool> {
         return Ok(false); // File too small
     }
     // BGZF starts with gzip magic (0x1f 0x8b) + deflate (0x08) + flags with FEXTRA set (0x04)
-    // Standard gzip: 1f 8b 08 xx
-    // BGZF: 1f 8b 08 04 (flags has FEXTRA=0x04)
     Ok(magic[0] == 0x1f && magic[1] == 0x8b && magic[2] == 0x08 && (magic[3] & 0x04) != 0)
 }
 
@@ -965,11 +946,11 @@ mod footer_tests {
     }
 
     #[test]
-    fn open_with_footer_validates() {
+    fn open_validates() {
         // Build a minimal fake file: header (magic + fixed bytes), string table (empty), footer.
         // Header layout: magic(4) + version(1) + num_records(varint) + num_strings(varint)
         // + first_strategy_with_layer(1) + second_strategy_with_layer(1)
-        // + tp_type(1) + complexity_metric(1) + max_complexity(varint) + distance + whole_file_bgzip(1)
+        // + tp_type(1) + complexity_metric(1) + max_complexity(varint) + distance + bgzip_all_records(1)
         let mut file_bytes = Vec::new();
 
         // Common prefix (same order as footer)
@@ -991,7 +972,7 @@ mod footer_tests {
         file_bytes.push(ComplexityMetric::EditDistance.to_u8());
         write_varint(&mut file_bytes, 0).unwrap(); // max_complexity
         write_distance(&mut file_bytes, &Distance::Edit).unwrap();
-        file_bytes.push(0); // whole_file_bgzip = false
+        file_bytes.push(0); // bgzip_all_records = false
 
         // string table is empty
 
@@ -1000,7 +981,7 @@ mod footer_tests {
         footer.write(&mut file_bytes).unwrap();
 
         let mut cursor = Cursor::new(file_bytes);
-        let (_header, _pos) = crate::binary::read_header_and_footer(&mut cursor).unwrap();
+        crate::binary::read_header(&mut cursor).unwrap();
     }
 
     #[test]

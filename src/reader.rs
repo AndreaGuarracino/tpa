@@ -1,7 +1,6 @@
-use crate::binary::{read_record, read_tracepoints, read_tracepoints_at_offset};
+use crate::binary::{read_header, read_record, read_tracepoints, read_tracepoints_at_offset};
 use crate::format::{
-    detect_bgzf, open_with_footer, AlignmentRecord, CompressionLayer, CompressionStrategy,
-    StringTable, TpaHeader,
+    detect_bgzf, AlignmentRecord, CompressionLayer, CompressionStrategy, StringTable, TpaHeader,
 };
 use crate::index::{build_index, IndexType, TpaIndex};
 use crate::utils::read_varint;
@@ -46,11 +45,11 @@ fn skip_record_header<R: Read>(reader: &mut R) -> io::Result<()> {
     Ok(())
 }
 
-/// TPA reader supporting both classic (raw file) and BGZIP whole-file modes.
+/// TPA reader supporting both per-record and all-records compression modes.
 pub struct TpaReader {
-    /// Raw file handle (used in classic mode)
+    /// Raw file handle (used in per-record compression mode)
     file: Option<File>,
-    /// BGZF reader (used in whole-file BGZIP mode)
+    /// BGZF reader (used in compress-all-records with BGZIP mode)
     bgzf_reader: Option<bgzf::io::Reader<BufReader<File>>>,
     index: TpaIndex,
     header: TpaHeader,
@@ -59,20 +58,22 @@ pub struct TpaReader {
 }
 
 impl TpaReader {
-    /// Open a TPA file with index (builds index if .tpa.idx doesn't exist)
-    /// Automatically detects BGZIP whole-file mode vs classic mode.
-    pub fn open(tpa_path: &str) -> io::Result<Self> {
+    /// Create a TPA reader with index (builds index if .tpa.idx doesn't exist)
+    /// Automatically detects all-records vs per-record compression mode.
+    pub fn new(tpa_path: &str) -> io::Result<Self> {
         // Check if file is BGZF-compressed
         if detect_bgzf(tpa_path)? {
-            Self::open_bgzf_mode(tpa_path)
+            Self::open_all_records_mode(tpa_path)
         } else {
-            Self::open_classic_mode(tpa_path)
+            Self::open_per_record_mode(tpa_path)
         }
     }
 
-    /// Open a classic (non-BGZF) TPA file
-    fn open_classic_mode(tpa_path: &str) -> io::Result<Self> {
-        let (file, header, string_table_pos) = open_with_footer(tpa_path)?;
+    /// Open a per-record compressed TPA file
+    fn open_per_record_mode(tpa_path: &str) -> io::Result<Self> {
+        let mut file = File::open(tpa_path)?;
+        let header = read_header(&mut file)?;
+        let string_table_pos = file.stream_position()?;
 
         let idx_path = format!("{}.idx", tpa_path);
 
@@ -114,7 +115,7 @@ impl TpaReader {
     }
 
     /// Open a BGZIP whole-file mode TPA file
-    fn open_bgzf_mode(tpa_path: &str) -> io::Result<Self> {
+    fn open_all_records_mode(tpa_path: &str) -> io::Result<Self> {
         let file = File::open(tpa_path)?;
         let buf_reader = BufReader::new(file);
         let mut bgzf_reader = bgzf::io::Reader::new(buf_reader);
@@ -176,8 +177,8 @@ impl TpaReader {
         &self.header
     }
 
-    /// Check if this reader is in BGZIP whole-file mode
-    pub fn is_bgzf_mode(&self) -> bool {
+    /// Check if this reader is in all-records compression mode
+    pub fn is_all_records_mode(&self) -> bool {
         self.bgzf_reader.is_some()
     }
 
@@ -201,7 +202,7 @@ impl TpaReader {
             bgzf.seek(vpos)?;
             self.string_table = StringTable::read(bgzf, self.header.num_strings())?;
         } else if let Some(ref mut file) = self.file {
-            // Classic mode: seek to raw offset
+            // Per-record mode: seek to raw offset
             file.seek(SeekFrom::Start(self.string_table_pos))?;
             self.string_table = StringTable::read(file, self.header.num_strings())?;
         }
@@ -235,7 +236,7 @@ impl TpaReader {
                 self.header.second_layer,
             )
         } else if let Some(ref mut file) = self.file {
-            // Classic mode: seek to raw offset
+            // Per-record mode: seek to raw offset
             file.seek(SeekFrom::Start(position))?;
             read_record(
                 file,
@@ -267,7 +268,7 @@ impl TpaReader {
                 self.header.second_layer,
             )
         } else if let Some(ref mut file) = self.file {
-            // Classic mode: position is raw file offset
+            // Per-record mode: position is raw file offset
             file.seek(SeekFrom::Start(position))?;
             read_record(
                 file,
@@ -306,7 +307,7 @@ impl TpaReader {
             skip_record_header(bgzf)?;
             Ok(u64::from(bgzf.virtual_position()))
         } else if let Some(ref mut file) = self.file {
-            // Classic mode
+            // Per-record mode
             file.seek(SeekFrom::Start(record_position))?;
             skip_record_header(file)?;
             file.stream_position()
@@ -341,7 +342,7 @@ impl TpaReader {
                 self.header.second_layer,
             )?
         } else if let Some(ref mut file) = self.file {
-            // Classic mode
+            // Per-record mode
             read_tracepoints_at_offset(
                 file,
                 tracepoint_position,

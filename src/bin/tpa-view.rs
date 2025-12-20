@@ -70,7 +70,7 @@ fn main() -> io::Result<()> {
     };
 
     // Open TPA file
-    let reader = TpaReader::open(tpa_path)?;
+    let reader = TpaReader::new(tpa_path)?;
 
     // If --strategies flag, output strategies and exit
     if strategies_only {
@@ -90,7 +90,7 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    let mut reader = TpaReader::open(tpa_path)?;
+    let mut reader = TpaReader::new(tpa_path)?;
 
     // Load string table
     reader.load_string_table()?;
@@ -103,7 +103,11 @@ fn main() -> io::Result<()> {
     println!("Format version: {}", header.version());
     println!(
         "BGZF whole-file mode: {}",
-        if reader.is_bgzf_mode() { "YES" } else { "NO" }
+        if reader.is_all_records_mode() {
+            "YES"
+        } else {
+            "NO"
+        }
     );
     println!("Number of records: {}", header.num_records());
     println!("Number of unique strings: {}", header.num_strings());

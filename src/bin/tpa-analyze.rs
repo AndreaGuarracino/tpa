@@ -16,7 +16,7 @@ struct TpaSizeAnalysis {
     // Metadata
     num_records: u64,
     num_strings: u64,
-    bgzf_mode: bool,
+    all_records_mode: bool,
 
     // String table breakdown
     string_name_length_varints: u64,
@@ -64,7 +64,7 @@ impl TpaSizeAnalysis {
         println!(
             "  BGZF whole-file mode:       {:>12} - value: {}",
             "", // no size, just metadata
-            if self.bgzf_mode { "YES" } else { "NO" }
+            if self.all_records_mode { "YES" } else { "NO" }
         );
         println!(
             "  First layer (packed):       {:>12} bytes - value: {}",
@@ -166,19 +166,19 @@ impl TpaSizeAnalysis {
 }
 
 fn analyze_tpa_size(path: &str) -> io::Result<(TpaSizeAnalysis, TpaHeader, [u8; 4])> {
-    let bgzf_mode = detect_bgzf(path)?;
+    let all_records_mode = detect_bgzf(path)?;
     let file = File::open(path)?;
     let total_file_size = file.metadata()?.len();
 
     // For BGZF mode, we need to read through the BGZF decompressor
-    if bgzf_mode {
-        analyze_bgzf_tpa(path, total_file_size)
+    if all_records_mode {
+        analyze_all_records_tpa(path, total_file_size)
     } else {
-        analyze_classic_tpa(path, total_file_size)
+        analyze_per_record_tpa(path, total_file_size)
     }
 }
 
-fn analyze_classic_tpa(
+fn analyze_per_record_tpa(
     path: &str,
     total_file_size: u64,
 ) -> io::Result<(TpaSizeAnalysis, TpaHeader, [u8; 4])> {
@@ -235,7 +235,7 @@ fn analyze_classic_tpa(
         records_section_size,
         num_records: header.num_records(),
         num_strings,
-        bgzf_mode: false,
+        all_records_mode: false,
         string_name_length_varints,
         string_name_bytes,
         sequence_length_varints,
@@ -244,7 +244,7 @@ fn analyze_classic_tpa(
     Ok((analysis, header, magic))
 }
 
-fn analyze_bgzf_tpa(
+fn analyze_all_records_tpa(
     path: &str,
     total_file_size: u64,
 ) -> io::Result<(TpaSizeAnalysis, TpaHeader, [u8; 4])> {
@@ -302,7 +302,7 @@ fn analyze_bgzf_tpa(
         records_section_size: 0, // Cannot determine in BGZF mode
         num_records: header.num_records(),
         num_strings,
-        bgzf_mode: true,
+        all_records_mode: true,
         string_name_length_varints,
         string_name_bytes,
         sequence_length_varints,

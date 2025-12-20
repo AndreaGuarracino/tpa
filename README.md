@@ -65,7 +65,7 @@ tpa = { git = "https://github.com/AndreaGuarracino/tpa" }
 use tpa::{TpaReader, TracepointType};
 
 // Open with index for O(1) record access
-let mut reader = TpaReader::open("alignments.tpa")?;
+let mut reader = TpaReader::new("alignments.tpa")?;
 println!("Total records: {}", reader.len());
 
 // Jump to any record instantly
@@ -145,34 +145,34 @@ for record in reader.iter_records() {
 ### Compression
 
 ```rust
-use tpa::{compress_paf_to_tpa, CompressionConfig, CompressionStrategy, CompressionLayer};
+use tpa::{paf_to_tpa, CompressionConfig, CompressionStrategy, CompressionLayer};
 
 // Automatic (default): samples 10000 records to find best strategy
-compress_paf_to_tpa("alignments.paf", "alignments.tpa", CompressionConfig::new())?;
+paf_to_tpa("alignments.paf", "alignments.tpa", CompressionConfig::new())?;
 
 // Automatic with custom sample size (500 records)
-compress_paf_to_tpa(
+paf_to_tpa(
     "alignments.paf",
     "alignments.tpa",
     CompressionConfig::new().strategy(CompressionStrategy::Automatic(3, 500)),
 )?;
 
 // Automatic with entire file analysis (sample_size = 0)
-compress_paf_to_tpa(
+paf_to_tpa(
     "alignments.paf",
     "alignments.tpa",
     CompressionConfig::new().strategy(CompressionStrategy::Automatic(3, 0)),
 )?;
 
 // ZigzagDelta: Delta + zigzag transform + varint + zstd
-compress_paf_to_tpa(
+paf_to_tpa(
     "alignments.paf",
     "alignments.tpa",
     CompressionConfig::new().strategy(CompressionStrategy::ZigzagDelta(3)),
 )?;
 
 // Dual strategy: different strategies for first/second values
-compress_paf_to_tpa(
+paf_to_tpa(
     "alignments.paf",
     "alignments.tpa",
     CompressionConfig::new()
@@ -180,7 +180,7 @@ compress_paf_to_tpa(
 )?;
 
 // From CIGAR input (converts to tracepoints)
-compress_paf_to_tpa(
+paf_to_tpa(
     "alignments.paf",
     "alignments.tpa",
     CompressionConfig::new().from_cigar(),

@@ -126,7 +126,7 @@ fn main() {
     let tp_type = &args[5];
     let reference_paf = &args[6];
 
-    let mut reader = TpaReader::open(tpa_path).unwrap();
+    let mut reader = TpaReader::new(tpa_path).unwrap();
     let reference = parse_reference(reference_paf, num_records as usize, tp_type);
 
     // Generate deterministic pseudo-random positions

@@ -21,7 +21,8 @@ use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 // Re-export public types
 pub use lib_wfa2::affine_wavefront::Distance;
 use tracepoints::{
-    cigar_to_mixed_tracepoints, cigar_to_tracepoints, cigar_to_variable_tracepoints,
+    cigar_to_mixed_tracepoints, cigar_to_tracepoints, cigar_to_tracepoints_fastga,
+    cigar_to_variable_tracepoints,
 };
 
 pub use format::{
@@ -30,7 +31,8 @@ pub use format::{
 };
 pub use tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 
-use crate::format::{open_with_footer, parse_tag, TpaFooter};
+use crate::binary::read_header;
+use crate::format::{parse_tag, TpaFooter};
 use crate::utils::{parse_u8, parse_usize};
 
 pub use index::{build_index, TpaIndex};
@@ -47,243 +49,62 @@ pub use noodles::bgzf;
 // Re-export utility functions for external tools
 pub use utils::{read_varint, varint_size};
 
-use crate::binary::{decompress_varint, write_paf_line_with_tracepoints, SmartDualAnalyzer};
+use crate::binary::{decompress_varint, write_paf_line_with_tracepoints, StrategyAnalyzer};
 
 use crate::utils::open_paf_reader;
-
-pub(crate) fn ensure_tracepoints(data: &TracepointData) -> io::Result<()> {
-    let has = match data {
-        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => !tps.is_empty(),
-        TracepointData::Variable(tps) => !tps.is_empty(),
-        TracepointData::Mixed(items) => !items.is_empty(),
-    };
-    if !has {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Encountered record without tracepoints",
-        ));
-    }
-    Ok(())
-}
 
 // ============================================================================
 // PUBLIC API
 // ============================================================================
 
 pub fn is_tpa_file(path: &str) -> io::Result<bool> {
+    fn check_magic<R: Read>(reader: &mut R) -> io::Result<bool> {
+        let mut magic = [0u8; 4];
+        match reader.read_exact(&mut magic) {
+            Ok(()) => Ok(&magic == TPA_MAGIC),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     if path == "-" {
         return Ok(false);
     }
 
-    // First check if it's BGZF-wrapped
     if detect_bgzf(path)? {
-        // Read through BGZF decompressor to check TPA magic
         let file = File::open(path)?;
-        let buf_reader = BufReader::new(file);
-        let mut bgzf_reader = noodles::bgzf::io::Reader::new(buf_reader);
-        let mut magic = [0u8; 4];
-        match bgzf_reader.read_exact(&mut magic) {
-            Ok(()) => return Ok(&magic == TPA_MAGIC),
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
-            Err(e) => return Err(e),
-        }
-    }
-
-    // Classic mode: check raw magic bytes
-    let mut file = File::open(path)?;
-    let mut magic = [0u8; 4];
-    match file.read_exact(&mut magic) {
-        Ok(()) => Ok(&magic == TPA_MAGIC),
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
-        Err(e) => Err(e),
+        check_magic(&mut noodles::bgzf::io::Reader::new(BufReader::new(file)))
+    } else {
+        check_magic(&mut File::open(path)?)
     }
 }
 
-/// Compress a PAF file to TPA format
-///
-/// # Example
-/// ```no_run
-/// use tpa::{compress_paf_to_tpa, CompressionConfig, CompressionStrategy, CompressionLayer};
-///
-/// // Simple usage with defaults (Automatic, Zstd, Standard tracepoints)
-/// compress_paf_to_tpa("input.paf", "output.tpa", CompressionConfig::new())?;
-///
-/// // With specific strategy
-/// compress_paf_to_tpa(
-///     "input.paf",
-///     "output.tpa",
-///     CompressionConfig::new()
-///         .strategy(CompressionStrategy::ZigzagDelta(3))
-///         .layer(CompressionLayer::Zstd),
-/// )?;
-///
-/// // Dual strategy with CIGAR input
-/// compress_paf_to_tpa(
-///     "input.paf",
-///     "output.tpa",
-///     CompressionConfig::new()
-///         .dual_strategy(
-///             CompressionStrategy::Raw(3),
-///             CompressionStrategy::ZigzagDelta(3),
-///         )
-///         .from_cigar(),
-/// )?;
-/// # Ok::<(), std::io::Error>(())
-/// ```
-pub fn compress_paf_to_tpa(
+/// Convert a PAF file to TPA format
+pub fn paf_to_tpa(
     input_path: &str,
     output_path: &str,
     config: CompressionConfig,
 ) -> io::Result<()> {
-    let second = config.effective_second_strategy();
-
-    // If using dual strategies, require explicit dual layers
-    let (first_layer, second_layer) = if config.second_strategy.is_some() {
-        // Dual strategy mode - require explicit second_layer
-        let second_layer = config.second_layer.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Dual strategy mode requires explicit second layer (use dual_layer() instead of layer())",
-            )
-        })?;
-        (config.first_layer, second_layer)
-    } else {
-        // Single strategy mode - use first_layer for both
-        (config.first_layer, config.first_layer)
-    };
-
-    compress_paf_internal(
-        input_path,
-        output_path,
+    info!(
+        "Converting PAF (with {}) to TPA using strategies {} / {}...",
+        if config.from_cigar {
+            "CIGAR"
+        } else {
+            "TRACEPOINTS"
+        },
         config.first_strategy,
-        second,
-        first_layer,
-        second_layer,
-        config.tp_type,
-        config.max_complexity,
-        config.complexity_metric,
-        config.distance,
-        config.use_cigar,
-        config.whole_file_bgzip,
-        config.bgzip_level,
-    )
-}
-
-pub fn decompress_tpa(input_path: &str, output_path: &str) -> io::Result<()> {
-    info!("Decompressing {} to text format...", input_path);
-
-    // Detect BGZF mode and use appropriate decompression path
-    if detect_bgzf(input_path)? {
-        decompress_bgzf_tpa(input_path, output_path)
-    } else {
-        decompress_classic_tpa(input_path, output_path)
-    }
-}
-
-fn decompress_classic_tpa(input_path: &str, output_path: &str) -> io::Result<()> {
-    let (input, header, _after_header_pos) = open_with_footer(input_path)?;
-    let reader = BufReader::new(input);
-
-    let (first_strategy, second_strategy) = header.strategies()?;
-    info!(
-        "Reading {} records ({} unique sequence names) [{} / {}]",
-        header.num_records, header.num_strings, first_strategy, second_strategy
-    );
-
-    decompress_varint(
-        reader,
-        output_path,
-        &header,
-        first_strategy,
-        second_strategy,
-    )
-}
-
-fn decompress_bgzf_tpa(input_path: &str, output_path: &str) -> io::Result<()> {
-    use std::io::Write;
-
-    // Use TpaReader which handles BGZF mode
-    let mut reader = TpaReader::open(input_path)?;
-    reader.load_string_table()?;
-
-    // Extract header info before mutably borrowing reader
-    let num_records = reader.header().num_records();
-    let num_strings = reader.header().num_strings();
-    let (first_strategy, second_strategy) = reader.header().strategies()?;
-    info!(
-        "Reading {} records ({} unique sequence names) [{} / {}] [BGZIP mode]",
-        num_records, num_strings, first_strategy, second_strategy
-    );
-
-    let string_table = reader.string_table_ref().clone();
-
-    // Open output file
-    let output: Box<dyn Write> = if output_path == "-" {
-        Box::new(std::io::stdout())
-    } else {
-        Box::new(File::create(output_path)?)
-    };
-    let mut writer = BufWriter::new(output);
-
-    // Write records using shared helper
-    for record_id in 0..num_records {
-        let record = reader.get_alignment_record(record_id)?;
-        write_paf_line_with_tracepoints(&mut writer, &record, &string_table)?;
-    }
-
-    writer.flush()?;
-    info!("Decompressed {} records", num_records);
-    Ok(())
-}
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-fn compress_paf_internal(
-    input_path: &str,
-    output_path: &str,
-    first_strategy: CompressionStrategy,
-    second_strategy: CompressionStrategy,
-    user_first_layer: format::CompressionLayer,
-    user_second_layer: format::CompressionLayer,
-    tp_type: TracepointType,
-    max_complexity: u32,
-    complexity_metric: ComplexityMetric,
-    distance: Distance,
-    use_cigar: bool,
-    whole_file_bgzip: bool,
-    _bgzip_level: u32,
-) -> io::Result<()> {
-    info!(
-        "Compressing PAF with {} using strategies {} / {}...",
-        if use_cigar { "CIGAR" } else { "TRACEPOINTS" },
-        first_strategy,
-        second_strategy
+        config.second_strategy
     );
 
     // Pass 1: Build string table + collect sample for analysis
     let mut string_table = StringTable::new();
     let mut record_count = 0u64;
 
-    let mut analyzer = match (&first_strategy, &second_strategy) {
+    let mut analyzer = match (&config.first_strategy, &config.second_strategy) {
         (CompressionStrategy::Automatic(level, sample_size), _)
-        | (_, CompressionStrategy::Automatic(level, sample_size)) => {
-            let limit = if *sample_size == 0 {
-                None // 0 = entire file
-            } else {
-                Some(*sample_size)
-            };
-            let parallel = *sample_size == 0; // Use parallel only for full-file analysis
-            if whole_file_bgzip {
-                // For BGZIP whole-file mode, only test strategies (layers handled by BGZF)
-                Some(SmartDualAnalyzer::for_whole_file_bgzip(
-                    *level, limit, parallel,
-                ))
-            } else {
-                Some(SmartDualAnalyzer::new(*level, limit, parallel))
-            }
-        }
+        | (_, CompressionStrategy::Automatic(level, sample_size)) => Some(
+            StrategyAnalyzer::new(*level, *sample_size, !config.bgzip_all_records),
+        ),
         _ => None,
     };
 
@@ -292,10 +113,10 @@ fn compress_paf_internal(
             match parse_paf(
                 line,
                 table,
-                use_cigar,
-                tp_type,
-                max_complexity,
-                complexity_metric,
+                config.from_cigar,
+                config.tp_type,
+                config.max_complexity,
+                config.complexity_metric,
             ) {
                 Ok(r) => Some(r),
                 Err(e) => {
@@ -316,8 +137,9 @@ fn compress_paf_internal(
             continue;
         };
 
+        // Analyze record if automatic strategy is enabled
         if let Some(an) = analyzer.as_mut() {
-            an.ingest(&record)?;
+            an.analyze_record(&record)?;
         }
         record_count += 1;
     }
@@ -330,41 +152,37 @@ fn compress_paf_internal(
         ));
     }
 
-    // Choose strategy based on user's preference
+    // Choose strategy (automatic or explicit)
     let (chosen_first, chosen_second, first_layer, second_layer) = match analyzer {
-        Some(analyzer) => {
-            let (first_strat, first_layer, second_strat, second_layer) =
-                analyzer.finalize_pair()?;
-            (first_strat, second_strat, first_layer, second_layer)
-        }
+        Some(analyzer) => analyzer.select_best()?,
         None => (
-            first_strategy,
-            second_strategy,
-            user_first_layer,
-            user_second_layer,
+            config.first_strategy,
+            config.second_strategy,
+            config.first_layer,
+            config.second_layer,
         ),
     };
 
     // Pass 2: Write Header → StringTable → Records → Footer
-    if whole_file_bgzip {
-        // BGZIP whole-file mode: wrap entire output in BGZF, no per-record compression
-        compress_with_bgzip_wrapper(
+    if config.bgzip_all_records {
+        // Compress all records with BGZIP, without layers
+        compress_all_records(
             input_path,
             output_path,
             record_count,
             &mut string_table,
             chosen_first,
             chosen_second,
-            tp_type,
-            complexity_metric,
-            max_complexity,
-            distance,
-            _bgzip_level,
-            use_cigar,
+            config.tp_type,
+            config.complexity_metric,
+            config.max_complexity,
+            config.distance,
+            config.bgzip_level,
+            config.from_cigar,
         )
     } else {
-        // Classic mode: per-record compression with layers
-        compress_classic(
+        // Per-record compression with layers
+        compress_per_record(
             input_path,
             output_path,
             record_count,
@@ -373,17 +191,98 @@ fn compress_paf_internal(
             chosen_second,
             first_layer,
             second_layer,
-            tp_type,
-            complexity_metric,
-            max_complexity,
-            distance,
-            use_cigar,
+            config.tp_type,
+            config.complexity_metric,
+            config.max_complexity,
+            config.distance,
+            config.from_cigar,
         )
     }
 }
 
-/// Classic compression mode: per-record compression with layers
-fn compress_classic(
+pub fn tpa_to_paf(input_path: &str, output_path: &str) -> io::Result<()> {
+    info!("Converting {} to PAF format...", input_path);
+
+    if detect_bgzf(input_path)? {
+        decompress_all_records(input_path, output_path)
+    } else {
+        decompress_per_record(input_path, output_path)
+    }
+}
+
+fn decompress_per_record(input_path: &str, output_path: &str) -> io::Result<()> {
+    let mut file = File::open(input_path)?;
+    let header = read_header(&mut file)?;
+    let reader = BufReader::new(file);
+
+    let (first_strategy, second_strategy) = header.strategies()?;
+    info!(
+        "Reading {} records ({} unique sequence names) [{} / {}]",
+        header.num_records, header.num_strings, first_strategy, second_strategy
+    );
+
+    decompress_varint(
+        reader,
+        output_path,
+        &header,
+        first_strategy,
+        second_strategy,
+    )
+}
+
+fn decompress_all_records(input_path: &str, output_path: &str) -> io::Result<()> {
+    use std::io::Write;
+
+    // Use TpaReader which handles BGZF mode
+    let mut reader = TpaReader::new(input_path)?;
+    reader.load_string_table()?; // Lazy load string table
+
+    // Extract header info before mutably borrowing reader
+    let num_records = reader.header().num_records();
+    let num_strings = reader.header().num_strings();
+    let (first_strategy, second_strategy) = reader.header().strategies()?;
+    info!(
+        "Reading {} records ({} unique sequence names) [{} / {}] [BGZIP mode]",
+        num_records, num_strings, first_strategy, second_strategy
+    );
+
+    let string_table = reader.string_table_ref().clone();
+
+    // Open output file
+    let output: Box<dyn Write> = if output_path == "-" {
+        Box::new(std::io::stdout())
+    } else {
+        Box::new(File::create(output_path)?)
+    };
+    let mut writer = BufWriter::new(output);
+
+    // Write record
+    for record_id in 0..num_records {
+        let record = reader.get_alignment_record(record_id)?;
+        write_paf_line_with_tracepoints(&mut writer, &record, &string_table)?;
+    }
+
+    writer.flush()?;
+    info!("Converted {} records", num_records);
+    Ok(())
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+pub(crate) fn check_not_empty_tps(data: &TracepointData) -> io::Result<()> {
+    if data.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Encountered record without tracepoints",
+        ));
+    }
+    Ok(())
+}
+
+/// Per-record compression mode: each record compressed with layers
+fn compress_per_record(
     input_path: &str,
     output_path: &str,
     record_count: u64,
@@ -396,7 +295,7 @@ fn compress_classic(
     complexity_metric: ComplexityMetric,
     max_complexity: u32,
     distance: Distance,
-    use_cigar: bool,
+    from_cigar: bool,
 ) -> io::Result<()> {
     let mut output = File::create(output_path).map_err(|e| {
         io::Error::new(
@@ -417,7 +316,7 @@ fn compress_classic(
         complexity_metric,
         max_complexity,
         distance,
-        false, // whole_file_bgzip = false
+        false, // bgzip_all_records = false
     )?;
     header.write(&mut output)?;
 
@@ -436,7 +335,7 @@ fn compress_classic(
         let record = match parse_paf(
             &line,
             string_table,
-            use_cigar,
+            from_cigar,
             tp_type,
             max_complexity,
             complexity_metric,
@@ -466,7 +365,7 @@ fn compress_classic(
     output.sync_all()?;
 
     info!(
-        "Compressed {} records ({} unique sequence names) with strategies {} / {}",
+        "Converted {} records ({} unique sequence names) with strategies {} / {}",
         record_count,
         string_table.len(),
         chosen_first,
@@ -475,8 +374,8 @@ fn compress_classic(
     Ok(())
 }
 
-/// BGZIP whole-file compression mode: wrap entire file in BGZF
-fn compress_with_bgzip_wrapper(
+/// All-records compression mode: wrap entire file in BGZF
+fn compress_all_records(
     input_path: &str,
     output_path: &str,
     record_count: u64,
@@ -488,7 +387,7 @@ fn compress_with_bgzip_wrapper(
     max_complexity: u32,
     distance: Distance,
     bgzip_level: u32,
-    use_cigar: bool,
+    from_cigar: bool,
 ) -> io::Result<()> {
     use noodles::bgzf;
 
@@ -505,7 +404,7 @@ fn compress_with_bgzip_wrapper(
     // Track virtual positions for index
     let mut virtual_positions = Vec::with_capacity(record_count as usize);
 
-    // Write header (whole_file_bgzip = true, layers set to Nocomp since BGZF handles compression)
+    // Write header (bgzip_all_records = true, layers set to Nocomp since BGZF handles compression)
     let header = TpaHeader::new(
         record_count,
         string_table.len() as u64,
@@ -517,7 +416,7 @@ fn compress_with_bgzip_wrapper(
         complexity_metric,
         max_complexity,
         distance,
-        true, // whole_file_bgzip = true
+        true, // bgzip_all_records = true
     )?;
     header.write(&mut bgzf_writer)?;
 
@@ -535,7 +434,7 @@ fn compress_with_bgzip_wrapper(
         let record = match parse_paf(
             &line,
             string_table,
-            use_cigar,
+            from_cigar,
             tp_type,
             max_complexity,
             complexity_metric,
@@ -575,7 +474,7 @@ fn compress_with_bgzip_wrapper(
 
     // Log compression level (default for noodles is 6)
     info!(
-        "Compressed {} records ({} unique sequence names) with strategies {} / {} [BGZIP whole-file mode, level={}]",
+        "Converted {} records ({} unique sequence names) with strategies {} / {} [BGZIP whole-file mode, level={}]",
         record_count,
         string_table.len(),
         chosen_first,
@@ -588,7 +487,7 @@ fn compress_with_bgzip_wrapper(
 fn parse_paf(
     line: &str,
     string_table: &mut StringTable,
-    use_cigar: bool,
+    from_cigar: bool,
     tp_type: TracepointType,
     max_complexity: u32,
     complexity_metric: ComplexityMetric,
@@ -628,7 +527,7 @@ fn parse_paf(
     let mut tags = Vec::new();
 
     for field in fields.iter().skip(12) {
-        if use_cigar {
+        if from_cigar {
             if let Some(cg) = field.strip_prefix("cg:Z:") {
                 cigar = Some(cg);
                 continue;
@@ -642,8 +541,8 @@ fn parse_paf(
         }
     }
 
-    let tracepoints = if use_cigar {
-        // CIGAR mode: convert CIGAR to tracepoints
+    let tracepoints = if from_cigar {
+        // Convert CIGAR to tracepoints
         let cigar_str = cigar.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -667,9 +566,21 @@ fn parse_paf(
                 TracepointData::Variable(tps)
             }
             TracepointType::Fastga => {
-                // FASTGA requires sequence information which we don't have here
-                // Fall back to Standard tracepoints
-                let tps = cigar_to_tracepoints(cigar_str, max_complexity, complexity_metric);
+                let complement = strand == '-';
+                let segments = cigar_to_tracepoints_fastga(
+                    cigar_str,
+                    max_complexity,
+                    query_start as usize,
+                    query_end as usize,
+                    query_len as usize,
+                    target_start as usize,
+                    target_end as usize,
+                    target_len as usize,
+                    complement,
+                );
+                // Flatten all segments into single tracepoint list
+                let tps: Vec<(usize, usize)> =
+                    segments.into_iter().flat_map(|(tps, _)| tps).collect();
                 TracepointData::Fastga(tps)
             }
         }
@@ -685,7 +596,7 @@ fn parse_paf(
         parse_tracepoints(tp_data, tp_type)?
     };
 
-    ensure_tracepoints(&tracepoints)?;
+    check_not_empty_tps(&tracepoints)?;
 
     Ok(AlignmentRecord {
         query_name_id,

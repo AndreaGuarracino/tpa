@@ -39,7 +39,7 @@ fn main() -> std::io::Result<()> {
 
     // Open TPA file - builds index if it doesn't exist
     println!("Opening {}...", tpa_path);
-    let mut reader = TpaReader::open(tpa_path)?;
+    let mut reader = TpaReader::new(tpa_path)?;
 
     println!("File info:");
     println!("  Total records: {}", reader.len());
