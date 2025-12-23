@@ -1,6 +1,6 @@
-use crate::binary::{read_header, read_record, read_tracepoints, read_tracepoints_at_offset};
+use crate::binary::{read_record, read_tracepoints, read_tracepoints_at_offset};
 use crate::format::{
-    detect_bgzf, AlignmentRecord, CompressionLayer, CompressionStrategy, StringTable, TpaHeader,
+    AlignmentRecord, CompressionLayer, CompressionStrategy, StringTable, TpaHeader,
 };
 use crate::index::{build_index, IndexType, TpaIndex};
 use crate::utils::read_varint;
@@ -49,30 +49,41 @@ fn skip_record_header<R: Read>(reader: &mut R) -> io::Result<()> {
 pub struct TpaReader {
     /// Raw file handle (used in per-record compression mode)
     file: Option<File>,
-    /// BGZF reader (used in compress-all-records with BGZIP mode)
+    /// BGZF reader (used in all-records mode)
     bgzf_reader: Option<bgzf::io::Reader<BufReader<File>>>,
     index: TpaIndex,
     header: TpaHeader,
     string_table: StringTable,
+    /// Position of string table (raw file offset)
     string_table_pos: u64,
+    /// File path for reopening when needed (all-records mode)
+    tpa_path: Option<String>,
+    /// BGZF section start offset (for all-records mode, 0 for per-record mode)
+    bgzf_section_start: u64,
 }
 
 impl TpaReader {
     /// Create a TPA reader with index (builds index if .tpa.idx doesn't exist)
-    /// Automatically detects all-records vs per-record compression mode.
+    /// Automatically detects compression mode based on header's bgzip_all_records flag:
+    /// - true → all-records mode (header/string table plain, records BGZIP-compressed)
+    /// - false → per-record compression mode
     pub fn new(tpa_path: &str) -> io::Result<Self> {
-        // Check if file is BGZF-compressed
-        if detect_bgzf(tpa_path)? {
-            Self::open_all_records_mode(tpa_path)
+        let mut file = File::open(tpa_path)?;
+        let header = TpaHeader::read(&mut file)?;
+
+        if header.bgzip_all_records() {
+            Self::open_bgzip_mode(tpa_path, file, header)
         } else {
-            Self::open_per_record_mode(tpa_path)
+            Self::open_per_record_mode(tpa_path, file, header)
         }
     }
 
     /// Open a per-record compressed TPA file
-    fn open_per_record_mode(tpa_path: &str) -> io::Result<Self> {
-        let mut file = File::open(tpa_path)?;
-        let header = read_header(&mut file)?;
+    fn open_per_record_mode(
+        tpa_path: &str,
+        mut file: File,
+        header: TpaHeader,
+    ) -> io::Result<Self> {
         let string_table_pos = file.stream_position()?;
 
         let idx_path = format!("{}.idx", tpa_path);
@@ -111,28 +122,28 @@ impl TpaReader {
             header,
             string_table,
             string_table_pos,
+            tpa_path: None, // Not needed for per-record mode
+            bgzf_section_start: 0,
         })
     }
 
-    /// Open a BGZIP whole-file mode TPA file
-    fn open_all_records_mode(tpa_path: &str) -> io::Result<Self> {
-        let file = File::open(tpa_path)?;
-        let buf_reader = BufReader::new(file);
-        let mut bgzf_reader = bgzf::io::Reader::new(buf_reader);
+    /// Open an all-records mode TPA file
+    /// Format: [Header (plain)] [StringTable (plain)] [BGZF: Records...] [BGZF EOF] [Footer (plain)]
+    fn open_bgzip_mode(
+        tpa_path: &str,
+        mut file: File,
+        header: TpaHeader,
+    ) -> io::Result<Self> {
+        // String table position is current position after header
+        let string_table_pos = file.stream_position()?;
 
-        // Read header from BGZF stream
-        let header = TpaHeader::read(&mut bgzf_reader)?;
-
-        // Get string table position (virtual position after header)
-        let string_table_pos = u64::from(bgzf_reader.virtual_position());
-
-        // Load index (must exist for BGZIP mode - built during compression)
+        // Load index - it contains bgzf_section_start for fast open
         let idx_path = format!("{}.idx", tpa_path);
         let index = TpaIndex::load(&idx_path).map_err(|e| {
             io::Error::new(
                 e.kind(),
                 format!(
-                    "BGZIP mode requires index file '{}': {}. \
+                    "All-records mode requires index file '{}': {}. \
                      Re-compress the file to generate the index.",
                     idx_path, e
                 ),
@@ -144,11 +155,18 @@ impl TpaReader {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "BGZIP mode requires virtual position index, found {:?}",
+                    "All-records mode requires virtual position index, found {:?}",
                     index.index_type()
                 ),
             ));
         }
+
+        let bgzf_start = index.bgzf_section_start();
+
+        // Create BGZF reader starting at records section
+        file.seek(SeekFrom::Start(bgzf_start))?;
+        let buf_reader = BufReader::new(file);
+        let bgzf_reader = bgzf::io::Reader::new(buf_reader);
 
         let string_table = StringTable::new();
 
@@ -159,6 +177,8 @@ impl TpaReader {
             header,
             string_table,
             string_table_pos,
+            tpa_path: Some(tpa_path.to_string()), // Need path to reopen for string table
+            bgzf_section_start: bgzf_start,
         })
     }
 
@@ -177,9 +197,14 @@ impl TpaReader {
         &self.header
     }
 
-    /// Check if this reader is in all-records compression mode
-    pub fn is_all_records_mode(&self) -> bool {
+    /// Check if this reader is in all-records mode
+    pub fn is_bgzip_mode(&self) -> bool {
         self.bgzf_reader.is_some()
+    }
+
+    /// Get BGZF section start offset (0 for per-record mode)
+    pub fn bgzf_section_start(&self) -> u64 {
+        self.bgzf_section_start
     }
 
     /// Get string table (loads on first access if needed)
@@ -196,15 +221,16 @@ impl TpaReader {
             return Ok(());
         }
 
-        if let Some(ref mut bgzf) = self.bgzf_reader {
-            // BGZIP mode: seek to virtual position
-            let vpos = bgzf::VirtualPosition::from(self.string_table_pos);
-            bgzf.seek(vpos)?;
-            self.string_table = StringTable::read(bgzf, self.header.num_strings())?;
-        } else if let Some(ref mut file) = self.file {
-            // Per-record mode: seek to raw offset
+        // String table is at raw file offset (both per-record and all-records modes)
+        if let Some(ref mut file) = self.file {
+            // Per-record mode: use existing file handle
             file.seek(SeekFrom::Start(self.string_table_pos))?;
             self.string_table = StringTable::read(file, self.header.num_strings())?;
+        } else if let Some(ref path) = self.tpa_path {
+            // All-records mode: reopen file to read plain bytes
+            let mut file = File::open(path)?;
+            file.seek(SeekFrom::Start(self.string_table_pos))?;
+            self.string_table = StringTable::read(&mut file, self.header.num_strings())?;
         }
         Ok(())
     }
@@ -224,7 +250,7 @@ impl TpaReader {
         let (first_strategy, second_strategy) = self.header.strategies()?;
 
         if let Some(ref mut bgzf) = self.bgzf_reader {
-            // BGZIP mode: seek to virtual position
+            // All-records mode: seek to virtual position
             let vpos = bgzf::VirtualPosition::from(position);
             bgzf.seek(vpos)?;
             read_record(
@@ -256,7 +282,7 @@ impl TpaReader {
         let (first_strategy, second_strategy) = self.header.strategies()?;
 
         if let Some(ref mut bgzf) = self.bgzf_reader {
-            // BGZIP mode: position is a virtual position
+            // All-records mode: position is a virtual position
             let vpos = bgzf::VirtualPosition::from(position);
             bgzf.seek(vpos)?;
             read_record(
@@ -301,7 +327,7 @@ impl TpaReader {
             .ok_or_else(|| err_out_of_bounds(record_id))?;
 
         if let Some(ref mut bgzf) = self.bgzf_reader {
-            // BGZIP mode
+            // All-records mode
             let vpos = bgzf::VirtualPosition::from(record_position);
             bgzf.seek(vpos)?;
             skip_record_header(bgzf)?;
@@ -329,7 +355,7 @@ impl TpaReader {
         let (first_strategy, second_strategy) = self.header.strategies()?;
 
         let tracepoints = if let Some(ref mut bgzf) = self.bgzf_reader {
-            // BGZIP mode: seek to virtual position, then read directly
+            // All-records mode: seek to virtual position, then read directly
             // (BGZF reader doesn't implement std::io::Seek, only bgzf::io::Seek)
             let vpos = bgzf::VirtualPosition::from(tracepoint_position);
             bgzf.seek(vpos)?;
@@ -459,7 +485,7 @@ pub fn read_mixed_tracepoints_at_offset<R: Read + Seek>(
 }
 
 // ============================================================================
-// BGZF-aware standalone functions for Mode B benchmark with BGZIP whole-file mode
+// BGZF-aware standalone functions for Mode B benchmark with all-records mode
 // ============================================================================
 
 /// Decode standard tracepoints from a BGZF reader at a virtual position.

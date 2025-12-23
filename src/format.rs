@@ -2,7 +2,6 @@
 
 use crate::{utils::*, Distance};
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::str::FromStr;
 use tracepoints::{ComplexityMetric, TracepointData, TracepointType};
@@ -118,9 +117,9 @@ pub struct CompressionConfig {
     pub distance: Distance,
     /// True if input has CIGAR strings, false if tracepoints
     pub from_cigar: bool,
-    /// When true, wrap entire file in BGZIP instead of per-record compression
-    pub bgzip_all_records: bool,
-    /// BGZIP compression level (0-9) for whole-file mode
+    /// When true, wrap records in BGZIP (header/string table stay plain)
+    pub bgzip: bool,
+    /// BGZIP compression level (0-9)
     pub bgzip_level: u32,
 }
 
@@ -136,7 +135,7 @@ impl Default for CompressionConfig {
             complexity_metric: ComplexityMetric::EditDistance,
             distance: Distance::Edit,
             from_cigar: false,
-            bgzip_all_records: false,
+            bgzip: false,
             bgzip_level: 6,
         }
     }
@@ -216,16 +215,16 @@ impl CompressionConfig {
         self
     }
 
-    /// Enable whole-file BGZIP compression mode
-    /// Instead of per-record compression layers, wraps entire file in BGZIP.
-    /// Enables cross-record compression context for better compression ratios.
+    /// Enable BGZIP compression mode.
+    /// Header and string table are plain bytes, only records are BGZIP-compressed.
+    /// Enables cross-record compression context with fast file opening.
     /// Random access uses BGZF virtual positions (block-level, ~64KB blocks).
-    pub fn bgzip_all_records(mut self) -> Self {
-        self.bgzip_all_records = true;
+    pub fn bgzip(mut self) -> Self {
+        self.bgzip = true;
         self
     }
 
-    /// Set BGZIP compression level (0-9, default 6) for whole-file mode
+    /// Set BGZIP compression level (0-9, default 6)
     pub fn bgzip_level(mut self, level: u32) -> Self {
         self.bgzip_level = level.min(9);
         self
@@ -751,7 +750,7 @@ impl TpaHeader {
         self.second_layer
     }
 
-    /// Whether entire file is wrapped in BGZIP (whole-file mode)
+    /// Whether records are BGZIP-compressed (header/string table stay plain)
     pub fn bgzip_all_records(&self) -> bool {
         self.bgzip_all_records
     }
@@ -773,7 +772,7 @@ impl TpaHeader {
         writer.write_all(&[self.complexity_metric.to_u8()])?;
         write_varint(writer, self.max_complexity as u64)?;
         write_distance(writer, &self.distance)?;
-        // Whole-file BGZIP mode flag
+        // All-records mode flag
         writer.write_all(&[if self.bgzip_all_records { 1 } else { 0 }])?;
         Ok(())
     }
@@ -802,7 +801,7 @@ impl TpaHeader {
 
         let distance = read_distance(reader)?;
 
-        // Whole-file BGZIP mode flag
+        // All-records mode flag
         let mut bgzip_flag_buf = [0u8; 1];
         reader.read_exact(&mut bgzip_flag_buf)?;
         let bgzip_all_records = bgzip_flag_buf[0] != 0;
@@ -918,17 +917,6 @@ impl TpaFooter {
     }
 }
 
-/// Detect if a file is BGZF-compressed (starts with BGZF magic bytes)
-pub fn detect_bgzf(path: &str) -> io::Result<bool> {
-    let mut file = File::open(path)?;
-    let mut magic = [0u8; 4];
-    if file.read_exact(&mut magic).is_err() {
-        return Ok(false); // File too small
-    }
-    // BGZF starts with gzip magic (0x1f 0x8b) + deflate (0x08) + flags with FEXTRA set (0x04)
-    Ok(magic[0] == 0x1f && magic[1] == 0x8b && magic[2] == 0x08 && (magic[3] & 0x04) != 0)
-}
-
 #[cfg(test)]
 mod footer_tests {
     use super::*;
@@ -984,23 +972,6 @@ mod footer_tests {
         crate::binary::read_header(&mut cursor).unwrap();
     }
 
-    #[test]
-    fn bgzf_detection_identifies_plain_files() {
-        use std::io::Write;
-        // Create a temp file with TPA magic (not BGZF)
-        let temp_dir = std::env::temp_dir();
-        let temp_path = temp_dir.join("test_bgzf_detect_plain.tpa");
-        let temp_path_str = temp_path.to_str().unwrap();
-
-        {
-            let mut file = std::fs::File::create(&temp_path).unwrap();
-            file.write_all(TPA_MAGIC).unwrap();
-            file.write_all(&[0u8; 100]).unwrap(); // Dummy content
-        }
-
-        assert!(!detect_bgzf(temp_path_str).unwrap());
-        std::fs::remove_file(&temp_path).ok();
-    }
 }
 
 /// String table for deduplicating sequence names
@@ -1085,6 +1056,19 @@ impl StringTable {
             lengths,
             index,
         })
+    }
+
+    /// Skip over string table entries without loading them into memory.
+    /// Used for all-records mode where we need to find the BGZF section start.
+    pub fn skip<R: Read>(reader: &mut R, num_strings: u64) -> io::Result<()> {
+        for _ in 0..num_strings {
+            let name_len = read_varint(reader)? as usize;
+            // Skip over the name bytes
+            io::copy(&mut reader.take(name_len as u64), &mut io::sink())?;
+            // Skip the sequence length varint
+            read_varint(reader)?;
+        }
+        Ok(())
     }
 }
 

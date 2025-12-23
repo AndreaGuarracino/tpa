@@ -4,7 +4,7 @@
 //! Pre-computes offsets from index, then seeks directly to tracepoint data.
 //! This is the fastest access method when you only need tracepoints.
 //!
-//! Supports both classic TPA files (raw offsets) and BGZIP whole-file mode (virtual positions).
+//! Supports both per-record mode (raw offsets) and all-records mode (virtual positions).
 //!
 //! Usage: seek_bench_direct <file.tpa> <num_records> <num_positions> <iterations> <tp_type> <reference.paf>
 //!
@@ -139,7 +139,8 @@ fn main() {
     let (first_strategy, second_strategy) = reader.header().strategies().unwrap();
     let first_layer = reader.header().first_layer();
     let second_layer = reader.header().second_layer();
-    let is_all_records = reader.is_all_records_mode();
+    let is_bgzip = reader.is_bgzip_mode();
+    let _bgzf_section_start = reader.bgzf_section_start();
     let reference = parse_reference(reference_paf, num_records as usize, tp_type);
 
     // Generate deterministic pseudo-random positions
@@ -151,7 +152,7 @@ fn main() {
     }
 
     // Pre-compute byte offsets from index (one-time cost)
-    // For BGZF mode these are virtual positions, for classic mode these are raw offsets
+    // For all-records mode these are virtual positions, for per-record mode these are raw offsets
     let offsets: Vec<u64> = positions
         .iter()
         .map(|&pos| reader.get_tracepoint_offset(pos).unwrap())
@@ -166,8 +167,9 @@ fn main() {
     let mut valid_count = 0usize;
     let total_tests = num_positions * iterations_per_pos;
 
-    if is_all_records {
+    if is_bgzip {
         // All-records mode: use bgzf reader and _at_vpos functions
+        // We use absolute virtual positions, so open file from start
         let file = File::open(tpa_path).unwrap();
         let mut bgzf_reader = bgzf::io::Reader::new(file);
 

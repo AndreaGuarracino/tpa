@@ -216,7 +216,7 @@ mkdir -p "$OUTPUT_BASE"
 # Initialize master TSV file
 MASTER_TSV="$OUTPUT_BASE/all_results.tsv"
 cat > "$MASTER_TSV" << TSV_HEADER
-dataset_name	dataset_type	original_size_bytes	num_records	encoding_type	encoding_runtime_sec	encoding_memory_mb	tp_file_size_bytes	max_complexity	complexity_metric	compression_strategy	strategy_first	strategy_second	compression_layer_first	compression_layer_second	compression_runtime_sec	compression_memory_mb	tpa_size_bytes	ratio_orig_to_tp	ratio_tp_to_tpa	ratio_orig_to_tpa	decompression_runtime_sec	decompression_memory_mb	verification_passed	seek_positions_tested	seek_iterations_per_position	seek_total_tests	seek_mode_a_avg_us	seek_mode_a_stddev_us	seek_mode_b_avg_us	seek_mode_b_stddev_us	seek_decode_ratio	seek_valid_ratio
+dataset_name	dataset_type	original_size_bytes	num_records	encoding_type	encoding_runtime_sec	encoding_memory_mb	tp_file_size_bytes	max_complexity	complexity_metric	compression_strategy	strategy_first	strategy_second	compression_layer_first	compression_layer_second	compression_runtime_sec	compression_memory_mb	tpa_size_bytes	ratio_orig_to_tp	ratio_tp_to_tpa	ratio_orig_to_tpa	decompression_runtime_sec	decompression_memory_mb	verification_passed	seek_positions_tested	seek_iterations_per_position	seek_total_tests	seek_mode_a_avg_us	seek_mode_a_stddev_us	seek_mode_b_avg_us	seek_mode_b_stddev_us	seek_decode_ratio	seek_valid_ratio	file_open_time_us
 TSV_HEADER
 
 echo "###################################################################"
@@ -440,6 +440,8 @@ for NAME in "${FILE_NAMES[@]}"; do
     echo "  - TSV:      $OUTPUT_BASE/$NAME/results.tsv"
 done
 echo ""
+
+exit 0
 
 # Generate plots
 echo "###################################################################"

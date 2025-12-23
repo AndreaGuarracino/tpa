@@ -102,12 +102,8 @@ fn main() -> io::Result<()> {
     println!("=== TPA Header ===");
     println!("Format version: {}", header.version());
     println!(
-        "BGZF whole-file mode: {}",
-        if reader.is_all_records_mode() {
-            "YES"
-        } else {
-            "NO"
-        }
+        "All-records mode: {}",
+        if reader.is_bgzip_mode() { "YES" } else { "NO" }
     );
     println!("Number of records: {}", header.num_records());
     println!("Number of unique strings: {}", header.num_strings());

@@ -10,7 +10,7 @@ use std::io::{self, BufReader, Read, Seek, Write};
 pub enum IndexType {
     /// Raw byte offsets into uncompressed file
     RawOffset = 0,
-    /// BGZF virtual positions for whole-file BGZIP mode
+    /// BGZF virtual positions for all-records mode
     VirtualPosition = 1,
 }
 
@@ -38,24 +38,29 @@ pub struct TpaIndex {
     index_type: IndexType,
     /// Positions for each record (byte offset or BGZF virtual position)
     positions: Vec<u64>,
+    /// BGZF section start offset (for all-records mode, 0 for per-record mode)
+    bgzf_section_start: u64,
 }
 
 impl TpaIndex {
     const INDEX_MAGIC: &'static [u8; 4] = b"TPAI";
+    const INDEX_VERSION: u8 = 2;
 
-    /// Create a new index with raw byte offsets (per-record mode)
+    /// Create a new index with raw byte offsets (classic per-record mode)
     pub fn new_raw(offsets: Vec<u64>) -> Self {
         Self {
             index_type: IndexType::RawOffset,
             positions: offsets,
+            bgzf_section_start: 0,
         }
     }
 
-    /// Create a new index with BGZF virtual positions (all-records mode)
-    pub fn new_virtual(positions: Vec<u64>) -> Self {
+    /// Create a new index with BGZF virtual positions and section start (all-records mode)
+    pub fn new_virtual_with_section_start(positions: Vec<u64>, bgzf_section_start: u64) -> Self {
         Self {
             index_type: IndexType::VirtualPosition,
             positions,
+            bgzf_section_start,
         }
     }
 
@@ -64,9 +69,9 @@ impl TpaIndex {
         let mut file = File::create(idx_path)?;
 
         file.write_all(Self::INDEX_MAGIC)?;
-        file.write_all(&[1u8])?; // Version 1
-        file.write_all(&[self.index_type.to_u8()])?; // Index type
-
+        file.write_all(&[Self::INDEX_VERSION])?;
+        file.write_all(&[self.index_type.to_u8()])?;
+        file.write_all(&self.bgzf_section_start.to_le_bytes())?;
         write_varint(&mut file, self.positions.len() as u64)?;
 
         // For virtual positions, use fixed u64 for precision; for raw offsets, use varint
@@ -102,16 +107,20 @@ impl TpaIndex {
 
         let mut version = [0u8; 1];
         reader.read_exact(&mut version)?;
-        if version[0] != 1 {
+        if version[0] != Self::INDEX_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Unsupported index version: {}", version[0]),
+                format!("Unsupported index version: {} (expected {})", version[0], Self::INDEX_VERSION),
             ));
         }
 
         let mut type_buf = [0u8; 1];
         reader.read_exact(&mut type_buf)?;
         let index_type = IndexType::from_u8(type_buf[0])?;
+
+        let mut bgzf_buf = [0u8; 8];
+        reader.read_exact(&mut bgzf_buf)?;
+        let bgzf_section_start = u64::from_le_bytes(bgzf_buf);
 
         let num_positions = read_varint(&mut reader)? as usize;
 
@@ -134,6 +143,7 @@ impl TpaIndex {
         Ok(Self {
             index_type,
             positions,
+            bgzf_section_start,
         })
     }
 
@@ -155,6 +165,11 @@ impl TpaIndex {
     /// Get position for a specific record ID (raw offset or virtual position depending on type)
     pub fn get_position(&self, record_id: u64) -> Option<u64> {
         self.positions.get(record_id as usize).copied()
+    }
+
+    /// Get the BGZF section start offset (for all-records mode, 0 for per-record mode)
+    pub fn bgzf_section_start(&self) -> u64 {
+        self.bgzf_section_start
     }
 }
 

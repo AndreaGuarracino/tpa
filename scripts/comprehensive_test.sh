@@ -268,8 +268,9 @@ fi
 SEEK_BENCH_READER="$REPO_DIR/target/release/examples/seek_bench_reader"
 SEEK_BENCH_DIRECT="$REPO_DIR/target/release/examples/seek_bench_direct"
 SEEK_BENCH_BGZIP_PAF="$REPO_DIR/target/release/examples/seek_bench_bgzip_paf"
+OPEN_BENCH="$REPO_DIR/target/release/examples/open_bench"
 
-if [ ! -f "$SEEK_BENCH_READER" ] || [ ! -f "$SEEK_BENCH_DIRECT" ] || [ ! -f "$SEEK_BENCH_BGZIP_PAF" ]; then
+if [ ! -f "$SEEK_BENCH_READER" ] || [ ! -f "$SEEK_BENCH_DIRECT" ] || [ ! -f "$SEEK_BENCH_BGZIP_PAF" ] || [ ! -f "$OPEN_BENCH" ]; then
     echo "=== Building seek benchmark examples ==="
     cd "$REPO_DIR"
     cargo build --release --examples 2>&1 | tail -3
@@ -287,8 +288,12 @@ if [ ! -f "$SEEK_BENCH_BGZIP_PAF" ]; then
     echo "✗ Error: Failed to build seek_bench_bgzip_paf"
     exit 1
 fi
+if [ ! -f "$OPEN_BENCH" ]; then
+    echo "✗ Error: Failed to build open_bench"
+    exit 1
+fi
 
-echo "✓ Seek benchmark tools ready"
+echo "✓ Benchmark tools ready"
 echo ""
 
 # Results storage - declare arrays before use
@@ -300,8 +305,10 @@ declare -A VERIFIED
 declare -A TP_SIZE
 declare -A BGZIP_TIME BGZIP_MEM BGZIP_SIZE
 declare -A BGZIP_SEEK_AVG BGZIP_SEEK_STDDEV BGZIP_SEEK_DECODE BGZIP_SEEK_VALID
+declare -A BGZIP_OPEN_TIME
 declare -A STRATEGY_FIRST STRATEGY_SECOND
 declare -A LAYER_FIRST LAYER_SECOND
+declare -A FILE_OPEN_TIME
 
 # Use tracepoint types from argument
 TP_TYPES=("${TP_TYPES_FROM_ARG[@]}")
@@ -420,31 +427,32 @@ done
 # When TEST_MODE is "auto:ROWS", we use "automatic,3,ROWS" strategy
 
 # Test function
+# bgzip_mode: 0 = per-record, 1 = all-records
 test_configuration() {
     local tp_type="$1"
     local first_strategy="$2"
     local second_strategy="${3:-$2}"  # Default to first_strategy if not provided (single mode)
-    local bgzip_all="${4:-0}"  # 1 for --whole-file-bgzip mode, 0 for classic
+    local bgzip_mode="${4:-0}"  # 0=per-record, 1=all-records
     local tp_paf="$OUTPUT_DIR/${tp_type}.tp.paf"
     local is_auto=0
     if [[ "$first_strategy" == automatic* ]]; then
         is_auto=1
     fi
 
-    # Build bgzip-all flag for cigzip
-    local BGZIP_ALL_FLAG=""
-    if [ "$bgzip_all" -eq 1 ]; then
-        BGZIP_ALL_FLAG="--whole-file-bgzip"
+    # Build bgzip flag for cigzip
+    local BGZIP_FLAG=""
+    local key_suffix=""
+    if [ "$bgzip_mode" -eq 1 ]; then
+        BGZIP_FLAG="--bgzip"
+        key_suffix="+bgzip"
     fi
 
-    # Create key from strategies (add +bgzip-all suffix if enabled)
+    # Create key from strategies (add bgzip suffix if enabled)
     local key="${tp_type}_${first_strategy}"
     if [ "$first_strategy" != "$second_strategy" ]; then
         key="${key}_${second_strategy}"
     fi
-    if [ "$bgzip_all" -eq 1 ]; then
-        key="${key}+bgzip-all"
-    fi
+    key="${key}${key_suffix}"
 
     echo "    Testing $first_strategy → $second_strategy..."
 
@@ -460,7 +468,7 @@ test_configuration() {
             /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.tpa" \
                 --type "$tp_type" --max-complexity "$MAX_COMPLEXITY" \
                 --complexity-metric "$COMPLEXITY_METRIC" --distance gap-affine --penalties 5,8,2 \
-                --strategy "$first_strategy" $BGZIP_ALL_FLAG 2>&1 | \
+                --strategy "$first_strategy" $BGZIP_FLAG 2>&1 | \
                 tee "$OUTPUT_DIR/${key}_compress.log" >&2
             echo "      [$first_strategy] compress finished" >&2
         else
@@ -468,7 +476,7 @@ test_configuration() {
             /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.tpa" \
                 --type "$tp_type" --max-complexity "$MAX_COMPLEXITY" \
                 --complexity-metric "$COMPLEXITY_METRIC" --distance gap-affine --penalties 5,8,2 \
-                --strategy "$first_strategy,3" --strategy-second "$second_strategy,3" $BGZIP_ALL_FLAG 2>&1 | \
+                --strategy "$first_strategy,3" --strategy-second "$second_strategy,3" $BGZIP_FLAG 2>&1 | \
                 tee "$OUTPUT_DIR/${key}_compress.log" >/dev/null
         fi
     else
@@ -481,7 +489,7 @@ test_configuration() {
         /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.tpa" \
             --type "$tp_type" --max-complexity "$MAX_COMPLEXITY" \
             --complexity-metric "$COMPLEXITY_METRIC" --distance gap-affine --penalties 5,8,2 \
-            --strategy "$strategy_arg" $BGZIP_ALL_FLAG 2>&1 | tee "$OUTPUT_DIR/${key}_compress.log" >/dev/null
+            --strategy "$strategy_arg" $BGZIP_FLAG 2>&1 | tee "$OUTPUT_DIR/${key}_compress.log" >/dev/null
     fi
 
     COMPRESS_TIME[$key]=$(grep "Elapsed (wall clock)" "$OUTPUT_DIR/${key}_compress.log" | awk '{print $8}')
@@ -495,7 +503,11 @@ test_configuration() {
     STRATEGY_SECOND[$key]="$second_strat"
     LAYER_FIRST[$key]="$first_layer"
     LAYER_SECOND[$key]="$second_layer"
-    
+
+    # Measure file open time (100 iterations for quick but stable results)
+    local open_time=$("$OPEN_BENCH" "$OUTPUT_DIR/${key}.tpa" 100 --simple || echo "0")
+    FILE_OPEN_TIME[$key]="$open_time"
+
     # Decompress
     if [ $is_auto -eq 1 ]; then
         echo "      [$first_strategy] decompress starting..." >&2
@@ -549,7 +561,7 @@ test_configuration() {
 
     # Seek Mode B: 10 positions × 10 iterations (for quick testing)
     # Uses standalone functions (read_*_tracepoints_at_offset / read_*_tracepoints_at_vpos)
-    # Supports both classic mode (raw byte offsets) and BGZIP whole-file mode (virtual positions)
+    # Supports both per-record mode (raw byte offsets) and all-records mode (virtual positions)
     local seek_b_result=$("$SEEK_BENCH_DIRECT" "$OUTPUT_DIR/${key}.tpa" "$EXTRACTED" 10 10 "$tp_type" "$tp_paf" || echo "0 0 0 0")
     read -r seek_b_avg seek_b_std seek_b_decode seek_b_valid <<< "$seek_b_result"
     SEEK_B[$key]="$seek_b_avg"
@@ -607,19 +619,28 @@ output_tsv_row() {
     local tp_type="$1"
     local first_strategy="$2"
     local second_strategy="${3:-$2}"  # Default to first_strategy if not provided
+    local bgzip_mode="${4:-0}"  # 0=per-record, 1=all-records
     local tsv_file="$OUTPUT_DIR/results.tsv"
+
+    # Build key suffix for all-records mode
+    local key_suffix=""
+    if [ "$bgzip_mode" -eq 1 ]; then
+        key_suffix="+bgzip"
+    fi
 
     # Create key from strategies (must match test_configuration)
     local key="${tp_type}_${first_strategy}"
     if [ "$first_strategy" != "$second_strategy" ]; then
         key="${key}_${second_strategy}"
     fi
+    key="${key}${key_suffix}"
 
-    # Strategy label for display
+    # Strategy label for display (includes all-records mode suffix)
     local strategy_label="$first_strategy"
     if [ "$first_strategy" != "$second_strategy" ]; then
         strategy_label="${first_strategy}→${second_strategy}"
     fi
+    strategy_label="${strategy_label}${key_suffix}"
 
     # Calculate ratios with guards to avoid division by zero or empty values
     local tp_size_bytes=${TP_SIZE[$tp_type]:-0}
@@ -658,8 +679,11 @@ output_tsv_row() {
     # Dataset name from input file
     local dataset_name=$(basename "$INPUT_PAF" .paf.gz | sed 's/.paf$//')
 
-    # Output TSV row (33 columns - includes strategy/layer pairs)
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    # File open time
+    local file_open_time="${FILE_OPEN_TIME[$key]:-0}"
+
+    # Output TSV row (34 columns - includes strategy/layer pairs and file open time)
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$dataset_name" \
         "$INPUT_TYPE" \
         "$SIZE" \
@@ -693,6 +717,7 @@ output_tsv_row() {
         "${SEEK_B_STDDEV[$key]}" \
         "$seek_decode" \
         "$seek_valid" \
+        "$file_open_time" \
         >> "$tsv_file"
 }
 
@@ -733,20 +758,21 @@ output_bgzip_baseline_row() {
     # Dataset name from input file
     local dataset_name=$(basename "$INPUT_PAF" .paf.gz | sed 's/.paf$//')
 
-    # Output TSV row (33 columns - same structure as TPA rows)
+    # Output TSV row (34 columns - same structure as TPA rows)
     # For BGZIP baseline:
     #   - compression_strategy: "bgzip-only"
     #   - strategy_first/second: "bgzip"
     #   - layer_first/second: "bgzip"
     #   - tpa_size_bytes column contains BGZIP compressed size
-    #   - seek_mode_a: 0 (no high-level reader abstraction for BGZIP)
+    #   - seek_mode_a: NA (no high-level reader abstraction for BGZIP)
     #   - seek_mode_b: BGZIP seek time (direct BGZF virtual position seeking)
+    #   - file_open_time_us: NA (no TpaReader for BGZIP PAF)
     #
     # NOTE: BGZIP seek is placed in Mode B because it uses pre-computed virtual positions
     # and direct bgzf::io::Reader access, which is analogous to TPA Mode B (standalone functions
     # with pre-computed offsets). There's no Mode A equivalent because no "BgzipPafReader"
     # high-level abstraction exists - the bgzf::io::Reader IS the low-level reader.
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$dataset_name" \
         "$INPUT_TYPE" \
         "$SIZE" \
@@ -780,13 +806,14 @@ output_bgzip_baseline_row() {
         "${BGZIP_SEEK_STDDEV[$tp_type]:-0}" \
         "${BGZIP_SEEK_DECODE[$tp_type]:-0}" \
         "$seek_valid" \
+        "NA" \
         >> "$tsv_file"
 }
 
 # Initialize TSV file with header
 TSV_FILE="$OUTPUT_DIR/results.tsv"
 cat > "$TSV_FILE" << TSV_HEADER
-dataset_name	dataset_type	original_size_bytes	num_records	encoding_type	encoding_runtime_sec	encoding_memory_mb	tp_file_size_bytes	max_complexity	complexity_metric	compression_strategy	strategy_first	strategy_second	layer_first	layer_second	compression_runtime_sec	compression_memory_mb	tpa_size_bytes	ratio_orig_to_tp	ratio_tp_to_tpa	ratio_orig_to_tpa	decompression_runtime_sec	decompression_memory_mb	verification_passed	seek_positions_tested	seek_iterations_per_position	seek_total_tests	seek_mode_a_avg_us	seek_mode_a_stddev_us	seek_mode_b_avg_us	seek_mode_b_stddev_us	seek_decode_ratio	seek_valid_ratio
+dataset_name	dataset_type	original_size_bytes	num_records	encoding_type	encoding_runtime_sec	encoding_memory_mb	tp_file_size_bytes	max_complexity	complexity_metric	compression_strategy	strategy_first	strategy_second	compression_layer_first	compression_layer_second	compression_runtime_sec	compression_memory_mb	tpa_size_bytes	ratio_orig_to_tp	ratio_tp_to_tpa	ratio_orig_to_tpa	decompression_runtime_sec	decompression_memory_mb	verification_passed	seek_positions_tested	seek_iterations_per_position	seek_total_tests	seek_mode_a_avg_us	seek_mode_a_stddev_us	seek_mode_b_avg_us	seek_mode_b_stddev_us	seek_decode_ratio	seek_valid_ratio	file_open_time_us
 TSV_HEADER
 
 # Run all tests
@@ -909,28 +936,28 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
 
         echo "  → Selected: ${first_selected}[${first_layer_selected}] → ${second_selected}[${second_layer_selected}]"
 
-        # Output TSV row for the automatic run
-        output_tsv_row "$TP_TYPE" "$AUTO_STRATEGY"
+        # Output TSV row for the automatic run (per-record mode)
+        output_tsv_row "$TP_TYPE" "$AUTO_STRATEGY" "$AUTO_STRATEGY" 0
         echo ""
-        echo "✓ Completed automatic strategy test"
+        echo "✓ Completed automatic strategy test (per-record mode)"
 
-        # Also test with BGZIP whole-file mode (--whole-file-bgzip)
+        # Test all-records mode (--bgzip flag, header/string table plain, records BGZIP-compressed)
         echo ""
-        echo "Testing ${AUTO_STRATEGY}+bgzip-all (BGZIP whole-file mode)..."
+        echo "Testing ${AUTO_STRATEGY}+bgzip (all-records mode)..."
         test_configuration "$TP_TYPE" "$AUTO_STRATEGY" "$AUTO_STRATEGY" 1
 
-        # Extract the strategies for bgzip-all mode
-        auto_bgzip_tpa="$OUTPUT_DIR/${TP_TYPE}_${AUTO_STRATEGY}+bgzip-all.tpa"
+        # Extract the strategies for all-records mode
+        auto_bgzip_tpa="$OUTPUT_DIR/${TP_TYPE}_${AUTO_STRATEGY}+bgzip.tpa"
         bgzip_selected_strategies=$("$REPO_DIR/target/release/tpa-view" --strategies "$auto_bgzip_tpa")
         bgzip_first_selected=$(echo "$bgzip_selected_strategies" | cut -f1)
         bgzip_second_selected=$(echo "$bgzip_selected_strategies" | cut -f2)
 
-        echo "  → Selected: ${bgzip_first_selected} → ${bgzip_second_selected} [BGZIP whole-file]"
+        echo "  → Selected: ${bgzip_first_selected} → ${bgzip_second_selected} [all-records]"
 
-        # Output TSV row for the bgzip-all run
-        output_tsv_row "$TP_TYPE" "${AUTO_STRATEGY}+bgzip-all"
+        # Output TSV row for all-records mode
+        output_tsv_row "$TP_TYPE" "$AUTO_STRATEGY" "$AUTO_STRATEGY" 1
         echo ""
-        echo "✓ Completed BGZIP whole-file mode test"
+        echo "✓ Completed all-records mode test"
     else
         # Single mode: test each strategy symmetrically (first==second)
         for STRATEGY in "${STRATEGIES[@]}"; do
@@ -1014,7 +1041,7 @@ else
 ## Tracepoint Type: ${TP_TYPE^^}
 
 **Baseline Sizes:**
-- Original Input (CIGAR PAF): $SIZE bytes ($(python3 - <<'PY'\nsize = int($SIZE)\nprint(f\"{size/1024/1024:.2f}\")\nPY\n) MB)
+- Original Input (CIGAR PAF): $SIZE bytes ($(echo "scale=2; $SIZE / 1048576" | bc) MB)
 - Tracepoint PAF ($TP_TYPE): $tp_size_bytes bytes ($tp_size_mb MB)
 
 | Strategy | Compressed Size (bytes) | TPA Ratio | End-to-End Ratio | Compress Time | Compress Mem (KB) | Decompress Time | Decompress Mem (KB) | Seek A (μs) | Seek B (μs) | Verified |

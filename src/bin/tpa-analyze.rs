@@ -1,8 +1,7 @@
-use noodles::bgzf;
 use std::env;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek};
-use tpa::{detect_bgzf, is_tpa_file, varint_size, StringTable, TpaHeader};
+use tpa::{is_tpa_file, varint_size, StringTable, TpaHeader};
 
 /// Structure to hold detailed size analysis of a TPA file
 #[derive(Debug)]
@@ -62,7 +61,7 @@ impl TpaSizeAnalysis {
             header.version()
         );
         println!(
-            "  BGZF whole-file mode:       {:>12} - value: {}",
+            "  All-records mode:           {:>12} - value: {}",
             "", // no size, just metadata
             if self.all_records_mode { "YES" } else { "NO" }
         );
@@ -166,19 +165,12 @@ impl TpaSizeAnalysis {
 }
 
 fn analyze_tpa_size(path: &str) -> io::Result<(TpaSizeAnalysis, TpaHeader, [u8; 4])> {
-    let all_records_mode = detect_bgzf(path)?;
     let file = File::open(path)?;
     let total_file_size = file.metadata()?.len();
-
-    // For BGZF mode, we need to read through the BGZF decompressor
-    if all_records_mode {
-        analyze_all_records_tpa(path, total_file_size)
-    } else {
-        analyze_per_record_tpa(path, total_file_size)
-    }
+    analyze_tpa(path, total_file_size)
 }
 
-fn analyze_per_record_tpa(
+fn analyze_tpa(
     path: &str,
     total_file_size: u64,
 ) -> io::Result<(TpaSizeAnalysis, TpaHeader, [u8; 4])> {
@@ -235,74 +227,7 @@ fn analyze_per_record_tpa(
         records_section_size,
         num_records: header.num_records(),
         num_strings,
-        all_records_mode: false,
-        string_name_length_varints,
-        string_name_bytes,
-        sequence_length_varints,
-    };
-
-    Ok((analysis, header, magic))
-}
-
-fn analyze_all_records_tpa(
-    path: &str,
-    total_file_size: u64,
-) -> io::Result<(TpaSizeAnalysis, TpaHeader, [u8; 4])> {
-    let file = File::open(path)?;
-    let buf_reader = BufReader::new(file);
-    let mut bgzf_reader = bgzf::io::Reader::new(buf_reader);
-
-    // Read magic bytes through BGZF decompressor
-    let mut magic = [0u8; 4];
-    bgzf_reader.read_exact(&mut magic)?;
-
-    // For BGZF mode, we can't track byte positions in the same way
-    // (positions are virtual positions, not raw bytes)
-    // Instead, we read the header and report the compressed file size
-
-    // Re-open to reset position
-    let file = File::open(path)?;
-    let buf_reader = BufReader::new(file);
-    let mut bgzf_reader = bgzf::io::Reader::new(buf_reader);
-
-    // Read header
-    let header = TpaHeader::read(&mut bgzf_reader)?;
-
-    // Read string table
-    let num_strings = header.num_strings();
-    let string_table = StringTable::read(&mut bgzf_reader, num_strings)?;
-
-    // Calculate string table breakdown
-    let mut string_name_length_varints = 0u64;
-    let mut string_name_bytes = 0u64;
-    let mut sequence_length_varints = 0u64;
-
-    for i in 0..string_table.len() {
-        let Some(name) = string_table.get(i as u64) else {
-            continue;
-        };
-        let Some(seq_len) = string_table.get_length(i as u64) else {
-            continue;
-        };
-
-        string_name_length_varints += varint_size(name.len() as u64);
-        string_name_bytes += name.len() as u64;
-        sequence_length_varints += varint_size(seq_len);
-    }
-
-    // For BGZF mode, we report the compressed file size
-    // The uncompressed breakdown is estimated from the string table
-    let estimated_string_table_size =
-        string_name_length_varints + string_name_bytes + sequence_length_varints;
-
-    let analysis = TpaSizeAnalysis {
-        total_file_size,
-        header_size: 0, // Cannot determine compressed header size
-        string_table_size: estimated_string_table_size,
-        records_section_size: 0, // Cannot determine in BGZF mode
-        num_records: header.num_records(),
-        num_strings,
-        all_records_mode: true,
+        all_records_mode: header.bgzip_all_records(),
         string_name_length_varints,
         string_name_bytes,
         sequence_length_varints,

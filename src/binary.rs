@@ -127,7 +127,7 @@ pub(crate) struct StrategyAnalyzer {
 
 impl StrategyAnalyzer {
     /// Create analyzer. If `test_layers` is true, tests all 3 compression layers (Zstd, Bgzip, Nocomp).
-    /// If false, only tests Nocomp (for BGZIP whole-file mode where per-record compression is redundant).
+    /// If false, only tests Nocomp (for all-records mode where per-record compression is redundant).
     pub fn new(zstd_level: i32, sample_limit: usize, test_layers: bool) -> Self {
         let strategies = CompressionStrategy::concrete_strategies(zstd_level);
         let layers = CompressionLayer::all();
