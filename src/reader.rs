@@ -2,7 +2,7 @@ use crate::binary::{read_record, read_tracepoints, read_tracepoints_at_offset};
 use crate::format::{
     AlignmentRecord, CompressionLayer, CompressionStrategy, StringTable, TpaHeader,
 };
-use crate::index::{build_index, IndexType, TpaIndex};
+use crate::index::{build_index_all_records, build_index_per_record, IndexType, TpaIndex};
 use crate::utils::read_varint;
 use log::{debug, info};
 use noodles::bgzf;
@@ -64,26 +64,22 @@ pub struct TpaReader {
 
 impl TpaReader {
     /// Create a TPA reader with index (builds index if .tpa.idx doesn't exist)
-    /// Automatically detects compression mode based on header's bgzip_all_records flag:
+    /// Automatically detects compression mode based on header's all_records flag:
     /// - true → all-records mode (header/string table plain, records BGZIP-compressed)
     /// - false → per-record compression mode
     pub fn new(tpa_path: &str) -> io::Result<Self> {
         let mut file = File::open(tpa_path)?;
         let header = TpaHeader::read(&mut file)?;
 
-        if header.bgzip_all_records() {
-            Self::open_bgzip_mode(tpa_path, file, header)
+        if header.all_records() {
+            Self::open_all_records_mode(tpa_path, file, header)
         } else {
             Self::open_per_record_mode(tpa_path, file, header)
         }
     }
 
     /// Open a per-record compressed TPA file
-    fn open_per_record_mode(
-        tpa_path: &str,
-        mut file: File,
-        header: TpaHeader,
-    ) -> io::Result<Self> {
+    fn open_per_record_mode(tpa_path: &str, mut file: File, header: TpaHeader) -> io::Result<Self> {
         let string_table_pos = file.stream_position()?;
 
         let idx_path = format!("{}.idx", tpa_path);
@@ -98,7 +94,7 @@ impl TpaReader {
                     loaded_idx.len(),
                     header.num_records()
                 );
-                let idx = build_index(tpa_path)?;
+                let idx = build_index_per_record(tpa_path)?;
                 idx.save(&idx_path)?;
                 debug!("Index saved to {}", idx_path);
                 idx
@@ -107,7 +103,7 @@ impl TpaReader {
             }
         } else {
             info!("No index found, building...");
-            let idx = build_index(tpa_path)?;
+            let idx = build_index_per_record(tpa_path)?;
             idx.save(&idx_path)?;
             debug!("Index saved to {}", idx_path);
             idx
@@ -129,7 +125,7 @@ impl TpaReader {
 
     /// Open an all-records mode TPA file
     /// Format: [Header (plain)] [StringTable (plain)] [BGZF: Records...] [BGZF EOF] [Footer (plain)]
-    fn open_bgzip_mode(
+    fn open_all_records_mode(
         tpa_path: &str,
         mut file: File,
         header: TpaHeader,
@@ -137,18 +133,38 @@ impl TpaReader {
         // String table position is current position after header
         let string_table_pos = file.stream_position()?;
 
-        // Load index - it contains bgzf_section_start for fast open
+        // Load or rebuild index
         let idx_path = format!("{}.idx", tpa_path);
-        let index = TpaIndex::load(&idx_path).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!(
-                    "All-records mode requires index file '{}': {}. \
-                     Re-compress the file to generate the index.",
-                    idx_path, e
-                ),
-            )
-        })?;
+        let index = if Path::new(&idx_path).exists() {
+            debug!("Loading existing index: {}", idx_path);
+            let loaded_idx = TpaIndex::load(&idx_path)?;
+            // Validate index matches header record count - rebuild if stale
+            if loaded_idx.len() != header.num_records() as usize {
+                info!(
+                    "Index record count ({}) doesn't match header ({}), rebuilding...",
+                    loaded_idx.len(),
+                    header.num_records()
+                );
+                drop(file); // Release file handle before rebuilding
+                let idx = build_index_all_records(tpa_path)?;
+                idx.save(&idx_path)?;
+                debug!("Index saved to {}", idx_path);
+                // Reopen file after rebuilding
+                file = File::open(tpa_path)?;
+                idx
+            } else {
+                loaded_idx
+            }
+        } else {
+            info!("No index found, building...");
+            drop(file); // Release file handle before rebuilding
+            let idx = build_index_all_records(tpa_path)?;
+            idx.save(&idx_path)?;
+            debug!("Index saved to {}", idx_path);
+            // Reopen file after rebuilding
+            file = File::open(tpa_path)?;
+            idx
+        };
 
         // Verify index type
         if index.index_type() != IndexType::VirtualPosition {
@@ -198,7 +214,7 @@ impl TpaReader {
     }
 
     /// Check if this reader is in all-records mode
-    pub fn is_bgzip_mode(&self) -> bool {
+    pub fn is_all_records_mode(&self) -> bool {
         self.bgzf_reader.is_some()
     }
 

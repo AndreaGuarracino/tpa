@@ -440,11 +440,11 @@ test_configuration() {
     fi
 
     # Build bgzip flag for cigzip
-    local BGZIP_FLAG=""
+    local ALL_RECORDS_FLAG=""
     local key_suffix=""
     if [ "$bgzip_mode" -eq 1 ]; then
-        BGZIP_FLAG="--bgzip"
-        key_suffix="+bgzip"
+        ALL_RECORDS_FLAG="--all-records"
+        key_suffix="+all-records"
     fi
 
     # Create key from strategies (add bgzip suffix if enabled)
@@ -468,7 +468,7 @@ test_configuration() {
             /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.tpa" \
                 --type "$tp_type" --max-complexity "$MAX_COMPLEXITY" \
                 --complexity-metric "$COMPLEXITY_METRIC" --distance gap-affine --penalties 5,8,2 \
-                --strategy "$first_strategy" $BGZIP_FLAG 2>&1 | \
+                --strategy "$first_strategy" $ALL_RECORDS_FLAG 2>&1 | \
                 tee "$OUTPUT_DIR/${key}_compress.log" >&2
             echo "      [$first_strategy] compress finished" >&2
         else
@@ -476,7 +476,7 @@ test_configuration() {
             /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.tpa" \
                 --type "$tp_type" --max-complexity "$MAX_COMPLEXITY" \
                 --complexity-metric "$COMPLEXITY_METRIC" --distance gap-affine --penalties 5,8,2 \
-                --strategy "$first_strategy,3" --strategy-second "$second_strategy,3" $BGZIP_FLAG 2>&1 | \
+                --strategy "$first_strategy,3" --strategy-second "$second_strategy,3" $ALL_RECORDS_FLAG 2>&1 | \
                 tee "$OUTPUT_DIR/${key}_compress.log" >/dev/null
         fi
     else
@@ -489,7 +489,7 @@ test_configuration() {
         /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.tpa" \
             --type "$tp_type" --max-complexity "$MAX_COMPLEXITY" \
             --complexity-metric "$COMPLEXITY_METRIC" --distance gap-affine --penalties 5,8,2 \
-            --strategy "$strategy_arg" $BGZIP_FLAG 2>&1 | tee "$OUTPUT_DIR/${key}_compress.log" >/dev/null
+            --strategy "$strategy_arg" $ALL_RECORDS_FLAG 2>&1 | tee "$OUTPUT_DIR/${key}_compress.log" >/dev/null
     fi
 
     COMPRESS_TIME[$key]=$(grep "Elapsed (wall clock)" "$OUTPUT_DIR/${key}_compress.log" | awk '{print $8}')
@@ -625,7 +625,7 @@ output_tsv_row() {
     # Build key suffix for all-records mode
     local key_suffix=""
     if [ "$bgzip_mode" -eq 1 ]; then
-        key_suffix="+bgzip"
+        key_suffix="+all-records"
     fi
 
     # Create key from strategies (must match test_configuration)
@@ -941,18 +941,18 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
         echo ""
         echo "✓ Completed automatic strategy test (per-record mode)"
 
-        # Test all-records mode (--bgzip flag, header/string table plain, records BGZIP-compressed)
+        # Test all-records mode (--all-records flag, header/string table plain, records BGZIP-compressed)
         echo ""
-        echo "Testing ${AUTO_STRATEGY}+bgzip (all-records mode)..."
+        echo "Testing ${AUTO_STRATEGY}+all-records (all-records mode)..."
         test_configuration "$TP_TYPE" "$AUTO_STRATEGY" "$AUTO_STRATEGY" 1
 
         # Extract the strategies for all-records mode
-        auto_bgzip_tpa="$OUTPUT_DIR/${TP_TYPE}_${AUTO_STRATEGY}+bgzip.tpa"
-        bgzip_selected_strategies=$("$REPO_DIR/target/release/tpa-view" --strategies "$auto_bgzip_tpa")
-        bgzip_first_selected=$(echo "$bgzip_selected_strategies" | cut -f1)
-        bgzip_second_selected=$(echo "$bgzip_selected_strategies" | cut -f2)
+        auto_all_records_tpa="$OUTPUT_DIR/${TP_TYPE}_${AUTO_STRATEGY}+all-records.tpa"
+        all_records_selected_strategies=$("$REPO_DIR/target/release/tpa-view" --strategies "$auto_all_records_tpa")
+        all_records_first_selected=$(echo "$all_records_selected_strategies" | cut -f1)
+        all_records_second_selected=$(echo "$all_records_selected_strategies" | cut -f2)
 
-        echo "  → Selected: ${bgzip_first_selected} → ${bgzip_second_selected} [all-records]"
+        echo "  → Selected: ${all_records_first_selected} → ${all_records_second_selected} [all-records]"
 
         # Output TSV row for all-records mode
         output_tsv_row "$TP_TYPE" "$AUTO_STRATEGY" "$AUTO_STRATEGY" 1

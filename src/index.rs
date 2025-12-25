@@ -1,9 +1,10 @@
-use crate::binary::{read_header, skip_record};
+use crate::binary::{read_header, skip_record, skip_record_sequential};
 use crate::format::StringTable;
 use crate::utils::{read_varint, write_varint};
 use log::info;
+use noodles::bgzf;
 use std::fs::File;
-use std::io::{self, BufReader, Read, Seek, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 
 /// Index type: raw byte offsets or BGZF virtual positions
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,7 +111,11 @@ impl TpaIndex {
         if version[0] != Self::INDEX_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Unsupported index version: {} (expected {})", version[0], Self::INDEX_VERSION),
+                format!(
+                    "Unsupported index version: {} (expected {})",
+                    version[0],
+                    Self::INDEX_VERSION
+                ),
             ));
         }
 
@@ -174,8 +179,7 @@ impl TpaIndex {
 }
 
 /// Build an index from a TPA file by scanning record offsets (per-record mode).
-/// For all-records mode, use the index built during compression.
-pub fn build_index(tpa_path: &str) -> io::Result<TpaIndex> {
+pub fn build_index_per_record(tpa_path: &str) -> io::Result<TpaIndex> {
     info!("Building index for {}", tpa_path);
 
     let file = File::open(tpa_path)?;
@@ -192,4 +196,56 @@ pub fn build_index(tpa_path: &str) -> io::Result<TpaIndex> {
 
     info!("Index built: {} records", offsets.len());
     Ok(TpaIndex::new_raw(offsets))
+}
+
+/// Build an index from an all-records mode TPA file by scanning BGZF virtual positions.
+/// This allows recovery if the .idx file is deleted.
+pub fn build_index_all_records(tpa_path: &str) -> io::Result<TpaIndex> {
+    info!("Building index for all-records mode: {}", tpa_path);
+
+    let mut file = File::open(tpa_path)?;
+
+    // Read header (plain bytes)
+    let header = read_header(&mut file)?;
+    if !header.all_records() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "File is not in all-records mode, use build_index_per_record() instead",
+        ));
+    }
+
+    // Skip string table (plain bytes)
+    StringTable::read(&mut file, header.num_strings)?;
+
+    // Record where BGZF section starts
+    let bgzf_section_start = file.stream_position()?;
+
+    // Create BGZF reader starting at records section
+    file.seek(SeekFrom::Start(bgzf_section_start))?;
+    let buf_reader = BufReader::with_capacity(131072, file);
+    let mut bgzf_reader = bgzf::io::Reader::new(buf_reader);
+
+    // Scan records and capture virtual positions
+    let mut virtual_positions = Vec::with_capacity(header.num_records as usize);
+    for _ in 0..header.num_records {
+        // Capture virtual position BEFORE reading record
+        let relative_vpos = u64::from(bgzf_reader.virtual_position());
+        let block_offset = relative_vpos >> 16;
+        let uncompressed_offset = relative_vpos & 0xFFFF;
+        let absolute_block_offset = block_offset + bgzf_section_start;
+        let absolute_vpos = (absolute_block_offset << 16) | uncompressed_offset;
+        virtual_positions.push(absolute_vpos);
+
+        // Skip record using read-only function (no Seek required)
+        skip_record_sequential(&mut bgzf_reader, header.tracepoint_type)?;
+    }
+
+    info!(
+        "Index built: {} records (all-records mode)",
+        virtual_positions.len()
+    );
+    Ok(TpaIndex::new_virtual_with_section_start(
+        virtual_positions,
+        bgzf_section_start,
+    ))
 }

@@ -139,7 +139,7 @@ fn main() {
     let (first_strategy, second_strategy) = reader.header().strategies().unwrap();
     let first_layer = reader.header().first_layer();
     let second_layer = reader.header().second_layer();
-    let is_bgzip = reader.is_bgzip_mode();
+    let is_bgzip = reader.is_all_records_mode();
     let _bgzf_section_start = reader.bgzf_section_start();
     let reference = parse_reference(reference_paf, num_records as usize, tp_type);
 

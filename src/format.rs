@@ -115,12 +115,10 @@ pub struct CompressionConfig {
     pub complexity_metric: ComplexityMetric,
     /// Distance parameters for alignment
     pub distance: Distance,
-    /// True if input has CIGAR strings, false if tracepoints
-    pub from_cigar: bool,
-    /// When true, wrap records in BGZIP (header/string table stay plain)
-    pub bgzip: bool,
-    /// BGZIP compression level (0-9)
-    pub bgzip_level: u32,
+    /// When true, compress all records together with BGZIP
+    pub all_records: bool,
+    /// BGZIP compression level for all-records mode (0-9)
+    pub all_records_level: u32,
 }
 
 impl Default for CompressionConfig {
@@ -134,9 +132,8 @@ impl Default for CompressionConfig {
             max_complexity: 32,
             complexity_metric: ComplexityMetric::EditDistance,
             distance: Distance::Edit,
-            from_cigar: false,
-            bgzip: false,
-            bgzip_level: 6,
+            all_records: false,
+            all_records_level: 6,
         }
     }
 }
@@ -149,7 +146,7 @@ impl CompressionConfig {
 
     /// Set the compression strategy (used for both first and second values)
     pub fn strategy(mut self, s: CompressionStrategy) -> Self {
-        self.first_strategy = s.clone();
+        self.first_strategy = s;
         self.second_strategy = s;
         self
     }
@@ -203,35 +200,23 @@ impl CompressionConfig {
         self
     }
 
-    /// Mark input as having CIGAR strings (converts to tracepoints)
-    pub fn from_cigar(mut self) -> Self {
-        self.from_cigar = true;
-        self
-    }
-
-    /// Mark input as having tracepoints (default)
-    pub fn from_tracepoints(mut self) -> Self {
-        self.from_cigar = false;
-        self
-    }
-
-    /// Enable BGZIP compression mode.
-    /// Header and string table are plain bytes, only records are BGZIP-compressed.
+    /// Enable all-records compression mode.
+    /// Header and string table are plain bytes, all records are BGZIP-compressed together.
     /// Enables cross-record compression context with fast file opening.
     /// Random access uses BGZF virtual positions (block-level, ~64KB blocks).
-    pub fn bgzip(mut self) -> Self {
-        self.bgzip = true;
+    pub fn all_records(mut self) -> Self {
+        self.all_records = true;
         self
     }
 
-    /// Set BGZIP compression level (0-9, default 6)
-    pub fn bgzip_level(mut self, level: u32) -> Self {
-        self.bgzip_level = level.min(9);
+    /// Set compression level for all-records mode (0-9, default 6)
+    pub fn all_records_level(mut self, level: u32) -> Self {
+        self.all_records_level = level.min(9);
         self
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum CompressionStrategy {
     /// Automatic strategy selection
     /// - Tests every concrete strategy × layer on sampled records
@@ -623,22 +608,6 @@ impl std::fmt::Display for CompressionStrategy {
     }
 }
 
-pub struct TpaHeader {
-    pub(crate) version: u8,
-    pub(crate) first_strategy_code: u8,
-    pub(crate) second_strategy_code: u8,
-    pub(crate) first_layer: CompressionLayer,
-    pub(crate) second_layer: CompressionLayer,
-    pub(crate) num_records: u64,
-    pub(crate) num_strings: u64,
-    pub(crate) tracepoint_type: TracepointType,
-    pub(crate) complexity_metric: ComplexityMetric,
-    pub(crate) max_complexity: u32, // For Standard/Mixed/Variable: max_value; For FASTGA: trace_spacing
-    pub(crate) distance: Distance,
-    /// When true, entire file is wrapped in BGZIP; per-record layers are ignored
-    pub(crate) bgzip_all_records: bool,
-}
-
 const STRATEGY_MASK: u8 = 0b0011_1111;
 const LAYER_SHIFT: u8 = 6;
 
@@ -651,6 +620,21 @@ fn decode_strategy_with_layer(value: u8) -> io::Result<(CompressionLayer, u8)> {
     let layer = CompressionLayer::from_u8(layer_bits)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok((layer, value & STRATEGY_MASK))
+}
+
+pub struct TpaHeader {
+    pub(crate) version: u8,
+    pub(crate) first_strategy_code: u8,
+    pub(crate) second_strategy_code: u8,
+    pub(crate) first_layer: CompressionLayer,
+    pub(crate) second_layer: CompressionLayer,
+    pub(crate) num_records: u64,
+    pub(crate) num_strings: u64,
+    pub(crate) tracepoint_type: TracepointType,
+    pub(crate) complexity_metric: ComplexityMetric,
+    pub(crate) max_complexity: u32, // For Standard/Mixed/Variable: max_value; For FASTGA: trace_spacing
+    pub(crate) distance: Distance,
+    pub(crate) all_records: bool, // When true, all records compressed together with BGZIP
 }
 
 impl TpaHeader {
@@ -666,7 +650,7 @@ impl TpaHeader {
         complexity_metric: ComplexityMetric,
         max_complexity: u32,
         distance: Distance,
-        bgzip_all_records: bool,
+        all_records: bool,
     ) -> io::Result<Self> {
         let first_strategy_code = first_strategy.to_code()?;
         let second_strategy_code = second_strategy.to_code()?;
@@ -683,7 +667,7 @@ impl TpaHeader {
             complexity_metric,
             max_complexity,
             distance,
-            bgzip_all_records,
+            all_records,
         })
     }
 
@@ -750,9 +734,9 @@ impl TpaHeader {
         self.second_layer
     }
 
-    /// Whether records are BGZIP-compressed (header/string table stay plain)
-    pub fn bgzip_all_records(&self) -> bool {
-        self.bgzip_all_records
+    /// Whether all records are compressed together with BGZIP (header/string table stay plain)
+    pub fn all_records(&self) -> bool {
+        self.all_records
     }
 
     pub(crate) fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
@@ -773,7 +757,7 @@ impl TpaHeader {
         write_varint(writer, self.max_complexity as u64)?;
         write_distance(writer, &self.distance)?;
         // All-records mode flag
-        writer.write_all(&[if self.bgzip_all_records { 1 } else { 0 }])?;
+        writer.write_all(&[if self.all_records { 1 } else { 0 }])?;
         Ok(())
     }
 
@@ -802,9 +786,9 @@ impl TpaHeader {
         let distance = read_distance(reader)?;
 
         // All-records mode flag
-        let mut bgzip_flag_buf = [0u8; 1];
-        reader.read_exact(&mut bgzip_flag_buf)?;
-        let bgzip_all_records = bgzip_flag_buf[0] != 0;
+        let mut all_records_flag = [0u8; 1];
+        reader.read_exact(&mut all_records_flag)?;
+        let all_records = all_records_flag[0] != 0;
 
         Ok(Self {
             version,
@@ -818,7 +802,7 @@ impl TpaHeader {
             complexity_metric,
             max_complexity,
             distance,
-            bgzip_all_records,
+            all_records,
         })
     }
 }
@@ -960,7 +944,7 @@ mod footer_tests {
         file_bytes.push(ComplexityMetric::EditDistance.to_u8());
         write_varint(&mut file_bytes, 0).unwrap(); // max_complexity
         write_distance(&mut file_bytes, &Distance::Edit).unwrap();
-        file_bytes.push(0); // bgzip_all_records = false
+        file_bytes.push(0); // all_records = false
 
         // string table is empty
 
@@ -971,7 +955,6 @@ mod footer_tests {
         let mut cursor = Cursor::new(file_bytes);
         crate::binary::read_header(&mut cursor).unwrap();
     }
-
 }
 
 /// String table for deduplicating sequence names
@@ -997,7 +980,8 @@ impl StringTable {
         }
     }
 
-    pub fn intern(&mut self, s: &str, length: u64) -> u64 {
+    /// Get existing ID for string, or insert and return new ID
+    pub fn get_or_insert_id(&mut self, s: &str, length: u64) -> u64 {
         if let Some(&id) = self.index.get(s) {
             id
         } else {

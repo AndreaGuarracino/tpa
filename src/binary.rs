@@ -301,12 +301,9 @@ impl StrategyAnalyzer {
             for (layer_idx, maybe_size) in state.totals.into_iter().enumerate() {
                 if let Some(size) = maybe_size {
                     let layer = self.layers[layer_idx];
-                    first_candidates.push((state.strategy.clone(), layer, size));
-                    if better_stream_candidate(
-                        &(state.strategy.clone(), layer, size),
-                        best_first.clone(),
-                    ) {
-                        best_first = Some((state.strategy.clone(), layer, size));
+                    first_candidates.push((state.strategy, layer, size));
+                    if better_stream_candidate(&(state.strategy, layer, size), best_first) {
+                        best_first = Some((state.strategy, layer, size));
                     }
                     worst_first = Some(worst_first.map(|w| w.max(size)).unwrap_or(size));
                 }
@@ -317,12 +314,9 @@ impl StrategyAnalyzer {
             for (layer_idx, maybe_size) in state.totals.into_iter().enumerate() {
                 if let Some(size) = maybe_size {
                     let layer = self.layers[layer_idx];
-                    second_candidates.push((state.strategy.clone(), layer, size));
-                    if better_stream_candidate(
-                        &(state.strategy.clone(), layer, size),
-                        best_second.clone(),
-                    ) {
-                        best_second = Some((state.strategy.clone(), layer, size));
+                    second_candidates.push((state.strategy, layer, size));
+                    if better_stream_candidate(&(state.strategy, layer, size), best_second) {
+                        best_second = Some((state.strategy, layer, size));
                     }
                     worst_second = Some(worst_second.map(|w| w.max(size)).unwrap_or(size));
                 }
@@ -341,9 +335,9 @@ impl StrategyAnalyzer {
         let (best_second_strategy, best_second_layer, best_second_size) =
             best_second.expect("second_candidates not empty implies best_second is Some");
 
-        let mut final_first = best_first_strategy.clone();
+        let mut final_first = best_first_strategy;
         let mut final_first_layer = best_first_layer;
-        let mut final_second = best_second_strategy.clone();
+        let mut final_second = best_second_strategy;
         let mut final_second_layer = best_second_layer;
         let mut best_total_size = best_first_size + best_second_size;
 
@@ -364,9 +358,9 @@ impl StrategyAnalyzer {
                 dependent_combo_count += 1;
                 let total = first_size + second_size;
                 let candidate = (
-                    first_strat.clone(),
+                    *first_strat,
                     *first_layer,
-                    second_strat.clone(),
+                    *second_strat,
                     *second_layer,
                     total,
                 );
@@ -653,7 +647,7 @@ fn encode_first_stream(values: &[u64], strategy: &CompressionStrategy) -> io::Re
             io::ErrorKind::InvalidInput,
             "Automatic strategy must be resolved before encoding",
         )),
-        _ => encode_tracepoint_values(values, strategy.clone()),
+        _ => encode_tracepoint_values(values, *strategy),
     }
 }
 
@@ -690,7 +684,7 @@ fn encode_second_stream(
             }
             Ok(buf)
         }
-        _ => encode_tracepoint_values(second_vals, strategy.clone()),
+        _ => encode_tracepoint_values(second_vals, *strategy),
     }
 }
 
@@ -781,8 +775,8 @@ pub(crate) fn decompress_varint<R: Read>(
     for _ in 0..header.num_records {
         let record = read_record(
             &mut reader,
-            first_strategy.clone(),
-            second_strategy.clone(),
+            first_strategy,
+            second_strategy,
             header.tracepoint_type,
             header.first_layer,
             header.second_layer,
@@ -1030,6 +1024,82 @@ fn skip_tracepoints<R: Read + Seek>(reader: &mut R, tp_type: TracepointType) -> 
             skip_block(reader)?; // cigar ops
         }
     }
+    Ok(())
+}
+
+/// Skip over a record using only Read (no Seek) - for BGZF sequential scanning.
+pub(crate) fn skip_record_sequential<R: Read>(
+    reader: &mut R,
+    tp_type: TracepointType,
+) -> io::Result<()> {
+    // Helper to skip n bytes by reading into a buffer
+    fn skip_bytes<R: Read>(reader: &mut R, n: usize) -> io::Result<()> {
+        io::copy(&mut reader.take(n as u64), &mut io::sink())?;
+        Ok(())
+    }
+
+    // Helper to read length-prefixed block and skip its data
+    fn skip_block<R: Read>(reader: &mut R) -> io::Result<()> {
+        let len = read_varint(reader)? as usize;
+        skip_bytes(reader, len)
+    }
+
+    read_varint(reader)?; // query_name_id
+    read_varint(reader)?; // query_start
+    read_varint(reader)?; // query_end
+    skip_bytes(reader, 1)?; // strand
+    read_varint(reader)?; // target_name_id
+    read_varint(reader)?; // target_start
+    read_varint(reader)?; // target_end
+    read_varint(reader)?; // residue_matches
+    read_varint(reader)?; // alignment_block_len
+    skip_bytes(reader, 1)?; // mapping_quality
+
+    // Skip tracepoints
+    let _num_items = read_varint(reader)?;
+    match tp_type {
+        TracepointType::Standard | TracepointType::Fastga => {
+            skip_block(reader)?;
+            skip_block(reader)?;
+        }
+        TracepointType::Variable => {
+            skip_block(reader)?; // presence bitmap
+            skip_block(reader)?; // first values
+            skip_block(reader)?; // second values
+        }
+        TracepointType::Mixed => {
+            skip_block(reader)?; // type bitmap
+            skip_block(reader)?; // tp first values
+            skip_block(reader)?; // tp second values
+            skip_block(reader)?; // cigar lengths
+            skip_block(reader)?; // cigar ops
+        }
+    }
+
+    // Skip tags
+    let num_tags = read_varint(reader)? as usize;
+    for _ in 0..num_tags {
+        skip_bytes(reader, 2)?; // key
+        let mut tag_type = [0u8; 1];
+        reader.read_exact(&mut tag_type)?;
+        match tag_type[0] {
+            b'i' | b'f' => skip_bytes(reader, 4)?,
+            b'Z' => {
+                let len = read_varint(reader)? as usize;
+                skip_bytes(reader, len)?;
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Invalid tag type: '{}' (byte: {})",
+                        tag_type[0] as char, tag_type[0]
+                    ),
+                ))
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -2113,7 +2183,7 @@ pub(crate) fn decode_standard_tracepoints<R: Read>(
     // Decode directly to (usize, usize) tuples
     let mut tps = Vec::with_capacity(num_items);
 
-    let first_vals_u64 = decode_tracepoint_values(&first_buf, num_items, first_strategy.clone())?;
+    let first_vals_u64 = decode_tracepoint_values(&first_buf, num_items, first_strategy)?;
     let first_vals: Vec<usize> = first_vals_u64.iter().map(|v| *v as usize).collect();
 
     let second_vals_u64: Vec<u64> = match second_strategy {
@@ -2257,7 +2327,7 @@ pub(crate) fn decode_mixed_tracepoints<R: Read>(
         let mut tp_first_compressed = vec![0u8; tp_first_len];
         reader.read_exact(&mut tp_first_compressed)?;
         let tp_first_buf = decompress_with_layer(&tp_first_compressed, first_layer)?;
-        decode_tracepoint_values(&tp_first_buf, tp_count, first_strategy.clone())?
+        decode_tracepoint_values(&tp_first_buf, tp_count, first_strategy)?
     };
 
     // Read tracepoint second stream
@@ -2361,7 +2431,7 @@ impl AlignmentRecord {
                 let (first_vals, second_vals): (Vec<u64>, Vec<u64>) =
                     tps.iter().map(|(a, b)| (*a as u64, *b as u64)).unzip();
 
-                let first_val_buf = encode_tracepoint_values(&first_vals, first_strategy.clone())?;
+                let first_val_buf = encode_tracepoint_values(&first_vals, first_strategy)?;
                 let second_val_buf = match &second_strategy {
                     CompressionStrategy::TwoDimDelta(_) => {
                         encode_2d_delta_second_values(&first_vals, &second_vals)?
@@ -2387,7 +2457,7 @@ impl AlignmentRecord {
                         }
                         buf
                     }
-                    _ => encode_tracepoint_values(&second_vals, second_strategy.clone())?,
+                    _ => encode_tracepoint_values(&second_vals, second_strategy)?,
                 };
 
                 // Use the explicitly passed layer parameter
@@ -2426,11 +2496,11 @@ impl AlignmentRecord {
                     .collect();
 
                 // Encode with strategies
-                let first_buf = encode_tracepoint_values(&first_vals, first_strategy.clone())?;
+                let first_buf = encode_tracepoint_values(&first_vals, first_strategy)?;
                 let second_buf = if second_vals.is_empty() {
                     Vec::new()
                 } else {
-                    encode_tracepoint_values(&second_vals, second_strategy.clone())?
+                    encode_tracepoint_values(&second_vals, second_strategy)?
                 };
 
                 // Compress with layers
@@ -2480,19 +2550,19 @@ impl AlignmentRecord {
                 let tp_first_buf = if tp_first.is_empty() {
                     Vec::new()
                 } else {
-                    encode_tracepoint_values(&tp_first, first_strategy.clone())?
+                    encode_tracepoint_values(&tp_first, first_strategy)?
                 };
                 let tp_second_buf = if tp_second.is_empty() {
                     Vec::new()
                 } else {
-                    encode_tracepoint_values(&tp_second, second_strategy.clone())?
+                    encode_tracepoint_values(&tp_second, second_strategy)?
                 };
 
                 // Encode CIGAR lengths with first strategy (if any CIGARs)
                 let cigar_len_buf = if cigar_lens.is_empty() {
                     Vec::new()
                 } else {
-                    encode_tracepoint_values(&cigar_lens, first_strategy.clone())?
+                    encode_tracepoint_values(&cigar_lens, first_strategy)?
                 };
 
                 // Compress all streams

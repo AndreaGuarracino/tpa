@@ -6,7 +6,6 @@
 /// 1. Opens the TPA file multiple times (default: 1000 iterations)
 /// 2. Measures average, min, max open time
 /// 3. Reports mode detection (per-record or all-records)
-
 use std::time::Instant;
 use tpa::TpaReader;
 
@@ -24,13 +23,17 @@ fn main() -> std::io::Result<()> {
         eprintln!("Example:");
         eprintln!("  {} alignments.tpa", args[0]);
         eprintln!("  {} alignments.tpa 5000", args[0]);
-        eprintln!("  {} alignments.tpa 100 --simple  # outputs just the average μs", args[0]);
+        eprintln!(
+            "  {} alignments.tpa 100 --simple  # outputs just the average μs",
+            args[0]
+        );
         std::process::exit(1);
     }
 
     let tpa_path = &args[1];
     let simple_mode = args.iter().any(|a| a == "--simple");
-    let iterations: usize = args.iter()
+    let iterations: usize = args
+        .iter()
         .skip(2)
         .filter(|s| *s != "--simple")
         .next()
@@ -48,11 +51,11 @@ fn main() -> std::io::Result<()> {
     let reader = TpaReader::new(tpa_path)?;
     let num_records = reader.header().num_records();
     let num_strings = reader.header().num_strings();
-    let is_bgzip_mode = reader.is_bgzip_mode();
+    let is_all_records_mode = reader.is_all_records_mode();
     let (first_strategy, second_strategy) = reader.header().strategies()?;
 
     // Determine mode description
-    let mode_desc = if is_bgzip_mode {
+    let mode_desc = if is_all_records_mode {
         "All-records mode"
     } else {
         "Per-record mode"
@@ -99,14 +102,12 @@ fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
-    let min = open_times
-        .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min);
+    let min = open_times.iter().copied().fold(f64::INFINITY, f64::min);
     let max = open_times.iter().copied().fold(0.0, f64::max);
 
     // Standard deviation
-    let variance: f64 = open_times.iter().map(|t| (t - avg).powi(2)).sum::<f64>() / iterations as f64;
+    let variance: f64 =
+        open_times.iter().map(|t| (t - avg).powi(2)).sum::<f64>() / iterations as f64;
     let stddev = variance.sqrt();
 
     // Percentiles

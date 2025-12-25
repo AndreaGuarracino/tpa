@@ -103,7 +103,11 @@ fn main() -> io::Result<()> {
     println!("Format version: {}", header.version());
     println!(
         "All-records mode: {}",
-        if reader.is_bgzip_mode() { "YES" } else { "NO" }
+        if reader.is_all_records_mode() {
+            "YES"
+        } else {
+            "NO"
+        }
     );
     println!("Number of records: {}", header.num_records());
     println!("Number of unique strings: {}", header.num_strings());

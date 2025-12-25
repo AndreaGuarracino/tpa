@@ -227,7 +227,7 @@ fn analyze_tpa(
         records_section_size,
         num_records: header.num_records(),
         num_strings,
-        all_records_mode: header.bgzip_all_records(),
+        all_records_mode: header.all_records(),
         string_name_length_varints,
         string_name_bytes,
         sequence_length_varints,
