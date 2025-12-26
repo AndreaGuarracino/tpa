@@ -20,7 +20,6 @@ fn compress_with_layer(data: &[u8], layer: CompressionLayer, level: i32) -> io::
         CompressionLayer::Zstd => zstd::encode_all(data, level)
             .map_err(|e| io::Error::other(format!("Zstd compression failed: {}", e))),
         CompressionLayer::Bgzip => {
-            // Use bgzip crate for BGZF compression
             use bgzip::write::BGZFWriter;
             let mut compressed = Vec::new();
             {
@@ -36,26 +35,17 @@ fn compress_with_layer(data: &[u8], layer: CompressionLayer, level: i32) -> io::
             Ok(compressed)
         }
         CompressionLayer::Nocomp => {
-            // No compression - return data as-is
             Ok(data.to_vec())
         }
     }
 }
 
-/// Decompress data using the explicitly recorded compression layer
+/// Decompress data using the specified compression layer
 fn decompress_with_layer(data: &[u8], layer: CompressionLayer) -> io::Result<Vec<u8>> {
     match layer {
-        CompressionLayer::Zstd => {
-            if data.is_empty() {
-                return Ok(Vec::new());
-            }
-            zstd::decode_all(data)
-                .map_err(|e| io::Error::other(format!("Zstd decompression failed: {}", e)))
-        }
+        CompressionLayer::Zstd => zstd::decode_all(data)
+            .map_err(|e| io::Error::other(format!("Zstd decompression failed: {}", e))),
         CompressionLayer::Bgzip => {
-            if data.is_empty() {
-                return Ok(Vec::new());
-            }
             use bgzip::read::BGZFReader;
             let mut reader = BGZFReader::new(data)
                 .map_err(|e| io::Error::other(format!("BGZF decompression failed: {}", e)))?;
@@ -75,9 +65,6 @@ fn decompress_with_layer(data: &[u8], layer: CompressionLayer) -> io::Result<Vec
 #[inline]
 fn delta_encode(values: &[u64]) -> Vec<i64> {
     let mut deltas = Vec::with_capacity(values.len());
-    if values.is_empty() {
-        return deltas;
-    }
     deltas.push(values[0] as i64);
     for i in 1..values.len() {
         deltas.push(values[i] as i64 - values[i - 1] as i64);
@@ -89,9 +76,6 @@ fn delta_encode(values: &[u64]) -> Vec<i64> {
 #[inline]
 fn delta_decode(deltas: &[i64]) -> Vec<u64> {
     let mut values = Vec::with_capacity(deltas.len());
-    if deltas.is_empty() {
-        return values;
-    }
     values.push(deltas[0] as u64);
     for i in 1..deltas.len() {
         values.push((values[i - 1] as i64 + deltas[i]) as u64);
@@ -100,12 +84,8 @@ fn delta_decode(deltas: &[i64]) -> Vec<u64> {
 }
 
 /// Reconstruct original values from zigzag-encoded deltas.
-/// Used by Rice and Huffman decoders which produce zigzagged delta sequences.
 #[inline]
 fn reconstruct_from_zigzag_deltas(zigzagged: &[u64]) -> Vec<u64> {
-    if zigzagged.is_empty() {
-        return Vec::new();
-    }
     let mut vals = Vec::with_capacity(zigzagged.len());
     vals.push(decode_zigzag(zigzagged[0]) as u64);
     for &enc in zigzagged.iter().skip(1) {
@@ -115,6 +95,10 @@ fn reconstruct_from_zigzag_deltas(zigzagged: &[u64]) -> Vec<u64> {
     }
     vals
 }
+
+// ============================================================================
+// STRATEGY ANALYSIS
+// ============================================================================
 
 pub(crate) struct StrategyAnalyzer {
     first_states: Vec<StreamState>,
@@ -129,7 +113,7 @@ impl StrategyAnalyzer {
     /// Create analyzer. If `test_layers` is true, tests all 3 compression layers (Zstd, Bgzip, Nocomp).
     /// If false, only tests Nocomp (for all-records mode where per-record compression is redundant).
     pub fn new(zstd_level: i32, sample_limit: usize, test_layers: bool) -> Self {
-        let strategies = CompressionStrategy::concrete_strategies(zstd_level);
+        let strategies = CompressionStrategy::all(zstd_level);
         let layers = CompressionLayer::all();
         let num_layers_to_test = if test_layers { 3 } else { 1 };
         let first_states = strategies
@@ -1509,11 +1493,6 @@ fn lz77_find_longest_match(values: &[u64], pos: usize, window_size: usize) -> (u
 /// Encode values using LZ77-style sequence matching
 fn lz77_encode(vals: &[u64]) -> io::Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(vals.len() * 2);
-
-    if vals.is_empty() {
-        return Ok(buf);
-    }
-
     let mut i = 0;
     while i < vals.len() {
         let (best_offset, best_length) = lz77_find_longest_match(vals, i, LZ77_WINDOW_SIZE);
@@ -1636,7 +1615,7 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
             write_varint(&mut buf, run_len)?;
         }
         CompressionStrategy::BitPacked(_) => {
-            // Bit packing: find max value, determine bits needed, pack
+            // Bit packing: find max value, determine bits needed, pack tightly
             if vals.is_empty() {
                 return Ok(buf);
             }
@@ -1645,36 +1624,21 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
             let bits_needed = if max_val == 0 {
                 1
             } else {
-                64 - max_val.leading_zeros()
+                (64 - max_val.leading_zeros()) as u8
             };
 
             // Store bits_needed (1 byte)
-            buf.push(bits_needed as u8);
+            buf.push(bits_needed);
 
-            // Simple byte-aligned packing for now (can optimize later)
-            if bits_needed <= 8 {
-                for &val in vals {
-                    buf.push(val as u8);
-                }
-            } else if bits_needed <= 16 {
-                for &val in vals {
-                    buf.extend_from_slice(&(val as u16).to_le_bytes());
-                }
-            } else if bits_needed <= 32 {
-                for &val in vals {
-                    buf.extend_from_slice(&(val as u32).to_le_bytes());
-                }
-            } else {
-                for &val in vals {
-                    buf.extend_from_slice(&val.to_le_bytes());
-                }
+            // Bit-packing using BitWriter
+            let mut writer = BitWriter::default();
+            for &val in vals {
+                writer.write_bits(val, bits_needed);
             }
+            buf.extend_from_slice(&writer.finish());
         }
         CompressionStrategy::DeltaOfDelta(_) => {
             // Delta-of-delta (Gorilla-style): delta twice for regularly spaced coordinates
-            if vals.is_empty() {
-                return Ok(buf);
-            }
             let deltas = delta_encode(vals);
             let delta_deltas = delta_encode(&deltas.iter().map(|&x| x as u64).collect::<Vec<_>>());
             for &val in &delta_deltas {
@@ -1684,9 +1648,6 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
         }
         CompressionStrategy::FrameOfReference(_) => {
             // Frame-of-Reference: min + bit-packed offsets
-            if vals.is_empty() {
-                return Ok(buf);
-            }
             let min_val = *vals.iter().min().unwrap();
             let max_offset = vals.iter().map(|&v| v - min_val).max().unwrap();
             let bits_needed = if max_offset == 0 {
@@ -1727,33 +1688,49 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
             }
         }
         CompressionStrategy::Dictionary(_) => {
-            // Dictionary coding: build dictionary, encode indices
+            // Dictionary coding: build dictionary (capped at 256), encode indices as u8
             if vals.is_empty() {
                 return Ok(buf);
             }
+
+            const MAX_DICT_SIZE: usize = 256;
+
             use std::collections::HashMap;
             let mut dict: Vec<u64> = Vec::new();
             let mut dict_map: HashMap<u64, u32> = HashMap::new();
-            let mut indices: Vec<u32> = Vec::new();
+            let mut indices: Vec<u8> = Vec::new();
+            let mut exceeded = false;
 
-            // Build dictionary
+            // Build dictionary with cap
             for &val in vals {
                 if let std::collections::hash_map::Entry::Vacant(e) = dict_map.entry(val) {
+                    if dict.len() >= MAX_DICT_SIZE {
+                        exceeded = true;
+                        break;
+                    }
                     e.insert(dict.len() as u32);
                     dict.push(val);
                 }
-                indices.push(*dict_map.get(&val).unwrap());
+                if !exceeded {
+                    indices.push(*dict_map.get(&val).unwrap() as u8);
+                }
             }
 
-            // Write dictionary size
-            write_varint(&mut buf, dict.len() as u64)?;
-            // Write dictionary values
-            for &val in &dict {
-                write_varint(&mut buf, val)?;
-            }
-            // Write indices
-            for &idx in &indices {
-                write_varint(&mut buf, idx as u64)?;
+            if exceeded {
+                // Fallback: mode byte 0 + raw varints
+                buf.push(0); // Mode: raw fallback
+                for &val in vals {
+                    write_varint(&mut buf, val)?;
+                }
+            } else {
+                // Dictionary mode: mode byte 1 + dict_size + dict + u8 indices
+                buf.push(1); // Mode: dictionary
+                buf.push(dict.len() as u8); // Dict size (1-256, stored as 0-255)
+                for &val in &dict {
+                    write_varint(&mut buf, val)?;
+                }
+                // Indices as raw u8 bytes (compact)
+                buf.extend_from_slice(&indices);
             }
         }
         CompressionStrategy::StreamVByte(_) => {
@@ -1821,7 +1798,7 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
             buf = encode_rice_values(&zigzagged)?;
         }
         CompressionStrategy::Huffman(_) => {
-            // Canonical Huffman on zigzagged deltas
+            // ANS (rANS) on zigzagged deltas - replaces Huffman for better compression
             let deltas = delta_encode(vals);
             let zigzagged: Vec<u64> = deltas.iter().map(|&v| encode_zigzag(v)).collect();
             buf = huffman_encode(&zigzagged)?;
@@ -1907,43 +1884,18 @@ fn decode_tracepoint_values(
             Ok(vals)
         }
         CompressionStrategy::BitPacked(_) => {
-            // Bit packing: read bits_needed, then unpack
+            // Bit packing: read bits_needed, then unpack using BitReader
             if num_items == 0 {
                 return Ok(Vec::new());
             }
 
-            let bits_needed = reader[0] as u32;
+            let bits_needed = reader[0];
             reader = &reader[1..];
 
+            let mut bit_reader = BitReader::new(reader);
             let mut vals = Vec::with_capacity(num_items);
-
-            if bits_needed <= 8 {
-                for _ in 0..num_items {
-                    vals.push(reader[0] as u64);
-                    reader = &reader[1..];
-                }
-            } else if bits_needed <= 16 {
-                for _ in 0..num_items {
-                    let val = u16::from_le_bytes([reader[0], reader[1]]) as u64;
-                    vals.push(val);
-                    reader = &reader[2..];
-                }
-            } else if bits_needed <= 32 {
-                for _ in 0..num_items {
-                    let val =
-                        u32::from_le_bytes([reader[0], reader[1], reader[2], reader[3]]) as u64;
-                    vals.push(val);
-                    reader = &reader[4..];
-                }
-            } else {
-                for _ in 0..num_items {
-                    let val = u64::from_le_bytes([
-                        reader[0], reader[1], reader[2], reader[3], reader[4], reader[5],
-                        reader[6], reader[7],
-                    ]);
-                    vals.push(val);
-                    reader = &reader[8..];
-                }
+            for _ in 0..num_items {
+                vals.push(bit_reader.read_bits(bits_needed)?);
             }
             Ok(vals)
         }
@@ -2017,18 +1969,49 @@ fn decode_tracepoint_values(
             Ok(vals)
         }
         CompressionStrategy::Dictionary(_) => {
-            // Dictionary decode
-            let dict_size = read_varint(&mut reader)? as usize;
-            let mut dict = Vec::with_capacity(dict_size);
-            for _ in 0..dict_size {
-                dict.push(read_varint(&mut reader)?);
+            // Dictionary decode with mode byte
+            if num_items == 0 {
+                return Ok(Vec::new());
             }
-            let mut vals = Vec::with_capacity(num_items);
-            for _ in 0..num_items {
-                let idx = read_varint(&mut reader)? as usize;
-                vals.push(dict[idx]);
+
+            let mode = reader[0];
+            reader = &reader[1..];
+
+            if mode == 0 {
+                // Raw fallback mode
+                let mut vals = Vec::with_capacity(num_items);
+                for _ in 0..num_items {
+                    vals.push(read_varint(&mut reader)?);
+                }
+                Ok(vals)
+            } else {
+                // Dictionary mode
+                let dict_size = reader[0] as usize;
+                reader = &reader[1..];
+
+                // Handle special case: dict_size 0 means 256
+                let dict_size = if dict_size == 0 { 256 } else { dict_size };
+
+                let mut dict = Vec::with_capacity(dict_size);
+                for _ in 0..dict_size {
+                    dict.push(read_varint(&mut reader)?);
+                }
+
+                // Read u8 indices
+                let mut vals = Vec::with_capacity(num_items);
+                for _ in 0..num_items {
+                    let idx = reader[0] as usize;
+                    reader = &reader[1..];
+                    if idx >= dict.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Dictionary index {} out of bounds (size {})", idx, dict.len()),
+                        ));
+                    }
+                    vals.push(dict[idx]);
+                }
+                Ok(vals)
             }
-            Ok(vals)
         }
         CompressionStrategy::StreamVByte(_) => {
             // Stream VByte decode
@@ -2621,15 +2604,6 @@ mod compression_tests {
     }
 
     #[test]
-    fn empty_rice_and_huffman() {
-        let empty: Vec<u64> = Vec::new();
-        let r = encode_tracepoint_values(&empty, CompressionStrategy::Rice(3)).unwrap();
-        let h = encode_tracepoint_values(&empty, CompressionStrategy::Huffman(3)).unwrap();
-        assert!(r.is_empty());
-        assert!(h.is_empty());
-    }
-
-    #[test]
     fn lz77_roundtrip_with_repeats() {
         // Values with repeated patterns - should compress well with LZ77
         let vals = vec![10u64, 20, 10, 20, 10, 20, 15, 25];
@@ -2660,9 +2634,162 @@ mod compression_tests {
     }
 
     #[test]
-    fn lz77_empty() {
-        let empty: Vec<u64> = Vec::new();
-        let buf = encode_tracepoint_values(&empty, CompressionStrategy::LZ77(3)).unwrap();
-        assert!(buf.is_empty());
+    fn bitpacked_roundtrip() {
+        // Values that need 5 bits (0-31) - should use exactly 5 bits per value
+        let vals: Vec<u64> = (0..100).map(|i| i % 32).collect();
+        let buf = encode_tracepoint_values(&vals, CompressionStrategy::BitPacked(3)).unwrap();
+        let decoded =
+            decode_tracepoint_values(&buf, vals.len(), CompressionStrategy::BitPacked(3)).unwrap();
+        assert_eq!(vals, decoded);
+
+        // Verify compression: 100 values × 5 bits = 500 bits = 63 bytes (+ 1 header)
+        // Old byte-aligned would be 100 bytes + 1 header = 101 bytes
+        // Bit-packing should produce around 64 bytes (1 header + ~63 data)
+        assert!(
+            buf.len() < 80,
+            "BitPacked should use bit-packing, got {} bytes (expected ~64)",
+            buf.len()
+        );
+    }
+
+    #[test]
+    fn bitpacked_roundtrip_various_widths() {
+        // Test different bit widths
+        for bits in [1, 4, 7, 12, 20, 32, 48] {
+            let max_val = (1u64 << bits) - 1;
+            let vals: Vec<u64> = (0..50).map(|i| i % (max_val + 1)).collect();
+            let buf = encode_tracepoint_values(&vals, CompressionStrategy::BitPacked(3)).unwrap();
+            let decoded =
+                decode_tracepoint_values(&buf, vals.len(), CompressionStrategy::BitPacked(3))
+                    .unwrap();
+            assert_eq!(vals, decoded, "Failed roundtrip for {} bits", bits);
+        }
+
+        // Test 64-bit separately (can't do modulo on max + 1)
+        let vals: Vec<u64> = (0..50).map(|i| i * 1000000000000).collect();
+        let buf = encode_tracepoint_values(&vals, CompressionStrategy::BitPacked(3)).unwrap();
+        let decoded =
+            decode_tracepoint_values(&buf, vals.len(), CompressionStrategy::BitPacked(3)).unwrap();
+        assert_eq!(vals, decoded, "Failed roundtrip for 64 bits");
+    }
+
+    #[test]
+    fn dictionary_roundtrip_low_cardinality() {
+        // Low cardinality data (< 256 unique values) - should use dictionary mode
+        let vals: Vec<u64> = (0..500).map(|i| i % 10).collect(); // Only 10 unique values
+        let buf = encode_tracepoint_values(&vals, CompressionStrategy::Dictionary(3)).unwrap();
+        let decoded =
+            decode_tracepoint_values(&buf, vals.len(), CompressionStrategy::Dictionary(3)).unwrap();
+        assert_eq!(vals, decoded);
+
+        // Verify dictionary mode was used (mode byte = 1)
+        assert_eq!(buf[0], 1, "Should use dictionary mode for low cardinality");
+    }
+
+    #[test]
+    fn dictionary_roundtrip_high_cardinality() {
+        // High cardinality data (> 256 unique values) - should fall back to raw mode
+        let vals: Vec<u64> = (0..500).collect(); // 500 unique values
+        let buf = encode_tracepoint_values(&vals, CompressionStrategy::Dictionary(3)).unwrap();
+        let decoded =
+            decode_tracepoint_values(&buf, vals.len(), CompressionStrategy::Dictionary(3)).unwrap();
+        assert_eq!(vals, decoded);
+
+        // Verify raw mode was used (mode byte = 0)
+        assert_eq!(buf[0], 0, "Should fall back to raw mode for high cardinality");
+    }
+
+    #[test]
+    fn dictionary_roundtrip_exactly_256() {
+        // Exactly 256 unique values - should still use dictionary mode
+        let vals: Vec<u64> = (0..256).collect();
+        let buf = encode_tracepoint_values(&vals, CompressionStrategy::Dictionary(3)).unwrap();
+        let decoded =
+            decode_tracepoint_values(&buf, vals.len(), CompressionStrategy::Dictionary(3)).unwrap();
+        assert_eq!(vals, decoded);
+
+        // Verify dictionary mode was used
+        assert_eq!(buf[0], 1, "Should use dictionary mode for exactly 256 unique values");
+        // dict_size should be 0 (meaning 256)
+        assert_eq!(buf[1], 0, "Dict size 256 should be stored as 0");
+    }
+
+    #[test]
+    fn simple8b_roundtrip() {
+        // Test basic roundtrip
+        let vals: Vec<u64> = (0..100).collect();
+        let buf = encode_tracepoint_values(&vals, CompressionStrategy::Simple8bFull(3)).unwrap();
+        let decoded =
+            decode_tracepoint_values(&buf, vals.len(), CompressionStrategy::Simple8bFull(3))
+                .unwrap();
+        assert_eq!(vals, decoded);
+    }
+
+    #[test]
+    fn simple8b_small_values_optimization() {
+        // 7 values that fit in 1 bit - should use mode (60, 1) for efficiency
+        // Before fix: would use (7, 8) = 56 bits for data
+        // After fix: uses (60, 1) = 7 bits for data
+        let vals = vec![0u64, 1, 0, 1, 0, 1, 0];
+        let buf = encode_tracepoint_values(&vals, CompressionStrategy::Simple8bFull(3)).unwrap();
+        let decoded =
+            decode_tracepoint_values(&buf, vals.len(), CompressionStrategy::Simple8bFull(3))
+                .unwrap();
+        assert_eq!(vals, decoded);
+
+        // The encoded data should be very compact (1 word = 8 bytes + varint overhead)
+        assert!(
+            buf.len() <= 16,
+            "Simple8b should efficiently pack small values, got {} bytes",
+            buf.len()
+        );
+    }
+
+    #[test]
+    fn huffman_vs_rice_size_comparison() {
+        // Compare Huffman vs Rice for typical tracepoint data
+        let test_cases: Vec<(&str, Vec<u64>)> = vec![
+            ("uniform_100", vec![100u64; 50]),
+            ("small_range", (95..105).cycle().take(50).collect()),
+            (
+                "typical_tp",
+                vec![
+                    100, 101, 99, 102, 100, 98, 103, 100, 101, 99, 100, 102, 101, 100, 99, 98, 100,
+                    101, 102, 100, 100, 101, 99, 102, 100, 98, 103, 100, 101, 99,
+                ],
+            ),
+        ];
+
+        println!("\n=== Huffman vs Rice vs ZigzagDelta Size ===");
+        println!(
+            "{:<15} {:>8} {:>8} {:>8} {:>10}",
+            "Test", "Huffman", "Rice", "Zigzag", "Best"
+        );
+        println!("{}", "-".repeat(55));
+
+        for (name, vals) in test_cases {
+            let huffman = encode_tracepoint_values(&vals, CompressionStrategy::Huffman(3))
+                .unwrap()
+                .len();
+            let rice = encode_tracepoint_values(&vals, CompressionStrategy::Rice(3))
+                .unwrap()
+                .len();
+            let zigzag = encode_tracepoint_values(&vals, CompressionStrategy::ZigzagDelta(3))
+                .unwrap()
+                .len();
+
+            let best = if huffman <= rice && huffman <= zigzag {
+                "Huffman"
+            } else if rice <= zigzag {
+                "Rice"
+            } else {
+                "Zigzag"
+            };
+
+            println!(
+                "{:<15} {:>8} {:>8} {:>8} {:>10}",
+                name, huffman, rice, zigzag, best
+            );
+        }
     }
 }

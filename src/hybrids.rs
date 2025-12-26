@@ -417,8 +417,11 @@ pub fn encode_simple8b_full(vals: &[u64]) -> io::Result<Vec<u64>> {
 
         let mut best_selector = 15u64; // Default: uncompressed
 
+        // Find optimal mode: pick the one with most values packed (lowest bits per value)
+        // We CAN use modes where count > remaining since the decoder tracks num_items
         for (selector, (count, bits)) in modes.iter().enumerate() {
-            if *count > remaining {
+            let usable_count = (*count).min(remaining);
+            if usable_count == 0 {
                 continue;
             }
 
@@ -427,11 +430,11 @@ pub fn encode_simple8b_full(vals: &[u64]) -> io::Result<Vec<u64>> {
             } else {
                 (1u64 << bits) - 1
             };
-            let can_pack = vals[i..i + count].iter().all(|&v| v <= max_val);
+            let can_pack = vals[i..i + usable_count].iter().all(|&v| v <= max_val);
 
             if can_pack {
                 best_selector = selector as u64;
-                break;
+                break; // First valid mode has highest count (modes sorted by count desc)
             }
         }
 

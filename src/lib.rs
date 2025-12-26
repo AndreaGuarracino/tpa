@@ -312,7 +312,7 @@ fn compress_per_record(
     index.save(&idx_path)?;
 
     info!(
-        "Converted {} records ({} unique sequence names) with strategies {} / {}",
+        "Converted {} records ({} unique sequence names) with strategies {} / {} [per-record mode]",
         record_count,
         string_table.len(),
         chosen_first,
@@ -456,7 +456,7 @@ fn decompress_per_record(input_path: &str, output_path: &str) -> io::Result<()> 
 
     let (first_strategy, second_strategy) = header.strategies()?;
     info!(
-        "Reading {} records ({} unique sequence names) [{} / {}]",
+        "Reading {} records ({} unique sequence names) [{} / {}] [per-record mode]",
         header.num_records, header.num_strings, first_strategy, second_strategy
     );
 
@@ -502,7 +502,7 @@ fn decompress_all_records(input_path: &str, output_path: &str) -> io::Result<()>
     }
 
     writer.flush()?;
-    info!("Converted {} records", num_records);
+    info!("Decompressed {} records", num_records);
     Ok(())
 }
 
@@ -566,16 +566,15 @@ fn parse_paf(
         parse_tracepoints(tp_data, tp_type)?
     } else if let Some(cigar_str) = cigar {
         // Convert CIGAR to tracepoints
-
         match tp_type {
             TracepointType::Standard => {
                 let tps = cigar_to_tracepoints(cigar_str, max_complexity, complexity_metric);
                 TracepointData::Standard(tps)
             }
             TracepointType::Mixed => {
-                let mixed =
+                let tps =
                     cigar_to_mixed_tracepoints(cigar_str, max_complexity, complexity_metric);
-                TracepointData::Mixed(mixed)
+                TracepointData::Mixed(tps)
             }
             TracepointType::Variable => {
                 let tps =
@@ -626,38 +625,8 @@ fn parse_paf(
     })
 }
 
-fn parse_usize_value(value: &str, err_msg: &'static str) -> io::Result<usize> {
-    value
-        .parse::<usize>()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, err_msg))
-}
-
-fn invalid_tracepoint_format(part: &str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("Invalid mixed tracepoint format: '{}'", part),
-    )
-}
-
-fn parse_tracepoint_pair(part: &str, strict: bool) -> io::Result<(usize, usize)> {
-    let mut coords = part.split(',');
-    let first = coords
-        .next()
-        .ok_or_else(|| invalid_tracepoint_format(part))?;
-    let second = coords
-        .next()
-        .ok_or_else(|| invalid_tracepoint_format(part))?;
-    if strict && coords.next().is_some() {
-        return Err(invalid_tracepoint_format(part));
-    }
-
-    Ok((
-        parse_usize_value(first, "Invalid first value")?,
-        parse_usize_value(second, "Invalid second value")?,
-    ))
-}
-
-fn parse_tracepoints(tp_str: &str, tp_type: TracepointType) -> io::Result<TracepointData> {
+/// Parse a tracepoint string (tp:Z: field value) into TracepointData
+pub fn parse_tracepoints(tp_str: &str, tp_type: TracepointType) -> io::Result<TracepointData> {
     match tp_type {
         TracepointType::Standard | TracepointType::Fastga => {
             let mut tps = Vec::new();
@@ -719,4 +688,35 @@ fn parse_tracepoints(tp_str: &str, tp_type: TracepointType) -> io::Result<Tracep
             Ok(TracepointData::Variable(tps))
         }
     }
+}
+
+fn parse_tracepoint_pair(part: &str, strict: bool) -> io::Result<(usize, usize)> {
+    let mut coords = part.split(',');
+    let first = coords
+        .next()
+        .ok_or_else(|| invalid_tracepoint_format(part))?;
+    let second = coords
+        .next()
+        .ok_or_else(|| invalid_tracepoint_format(part))?;
+    if strict && coords.next().is_some() {
+        return Err(invalid_tracepoint_format(part));
+    }
+
+    Ok((
+        parse_usize_value(first, "Invalid first value")?,
+        parse_usize_value(second, "Invalid second value")?,
+    ))
+}
+
+fn parse_usize_value(value: &str, err_msg: &'static str) -> io::Result<usize> {
+    value
+        .parse::<usize>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, err_msg))
+}
+
+fn invalid_tracepoint_format(part: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("Invalid mixed tracepoint format: '{}'", part),
+    )
 }

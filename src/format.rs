@@ -327,8 +327,8 @@ pub enum CompressionStrategy {
 }
 
 impl CompressionStrategy {
-    /// Return every concrete strategy variant (excludes meta-strategies such as Automatic)
-    pub fn concrete_strategies(level: i32) -> Vec<Self> {
+    /// Return all encoding strategies (excludes Automatic meta-strategy)
+    pub fn all(level: i32) -> Vec<Self> {
         vec![
             CompressionStrategy::Raw(level),
             CompressionStrategy::ZigzagDelta(level),
