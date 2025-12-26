@@ -428,26 +428,7 @@ fn encode_second_stream(
         CompressionStrategy::TwoDimDelta(_) => {
             encode_2d_delta_second_values(first_vals, second_vals)
         }
-        CompressionStrategy::HybridRLE(_) => {
-            let mut buf = Vec::with_capacity(second_vals.len() * 2);
-            if !second_vals.is_empty() {
-                let mut run_val = second_vals[0];
-                let mut run_len = 1u64;
-                for &val in &second_vals[1..] {
-                    if val == run_val {
-                        run_len += 1;
-                    } else {
-                        write_varint(&mut buf, run_val)?;
-                        write_varint(&mut buf, run_len)?;
-                        run_val = val;
-                        run_len = 1;
-                    }
-                }
-                write_varint(&mut buf, run_val)?;
-                write_varint(&mut buf, run_len)?;
-            }
-            Ok(buf)
-        }
+        CompressionStrategy::HybridRLE(_) => encode_rle_values(second_vals),
         _ => encode_tracepoint_values(second_vals, *strategy),
     }
 }
@@ -1367,28 +1348,7 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
             }
         }
         CompressionStrategy::RunLength(_) => {
-            // RLE: encode (value, run_length) pairs
-            if vals.is_empty() {
-                return Ok(buf);
-            }
-
-            let mut run_val = vals[0];
-            let mut run_len = 1u64;
-
-            for &val in &vals[1..] {
-                if val == run_val {
-                    run_len += 1;
-                } else {
-                    // Write (value, length) pair
-                    write_varint(&mut buf, run_val)?;
-                    write_varint(&mut buf, run_len)?;
-                    run_val = val;
-                    run_len = 1;
-                }
-            }
-            // Write final run
-            write_varint(&mut buf, run_val)?;
-            write_varint(&mut buf, run_len)?;
+            return encode_rle_values(vals);
         }
         CompressionStrategy::BitPacked(_) => {
             // Bit packing: find max value, determine bits needed, pack tightly
@@ -1589,6 +1549,29 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
                 "Automatic strategy must be resolved before encoding",
             ));
         }
+    }
+    Ok(buf)
+}
+
+/// Encode values using RLE (value, run_length) pairs
+#[inline]
+fn encode_rle_values(vals: &[u64]) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(vals.len() * 2);
+    if !vals.is_empty() {
+        let mut run_val = vals[0];
+        let mut run_len = 1u64;
+        for &val in &vals[1..] {
+            if val == run_val {
+                run_len += 1;
+            } else {
+                write_varint(&mut buf, run_val)?;
+                write_varint(&mut buf, run_len)?;
+                run_val = val;
+                run_len = 1;
+            }
+        }
+        write_varint(&mut buf, run_val)?;
+        write_varint(&mut buf, run_len)?;
     }
     Ok(buf)
 }
@@ -2195,27 +2178,7 @@ impl AlignmentRecord {
                     CompressionStrategy::TwoDimDelta(_) => {
                         encode_2d_delta_second_values(&first_vals, &second_vals)?
                     }
-                    CompressionStrategy::HybridRLE(_) => {
-                        // Encode target with RLE (value, run_len)
-                        let mut buf = Vec::with_capacity(second_vals.len() * 2);
-                        if !second_vals.is_empty() {
-                            let mut run_val = second_vals[0];
-                            let mut run_len = 1u64;
-                            for &val in &second_vals[1..] {
-                                if val == run_val {
-                                    run_len += 1;
-                                } else {
-                                    write_varint(&mut buf, run_val)?;
-                                    write_varint(&mut buf, run_len)?;
-                                    run_val = val;
-                                    run_len = 1;
-                                }
-                            }
-                            write_varint(&mut buf, run_val)?;
-                            write_varint(&mut buf, run_len)?;
-                        }
-                        buf
-                    }
+                    CompressionStrategy::HybridRLE(_) => encode_rle_values(&second_vals)?,
                     _ => encode_tracepoint_values(&second_vals, second_strategy)?,
                 };
 

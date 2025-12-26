@@ -474,7 +474,7 @@ impl CompressionStrategy {
 
     /// Convert to strategy code for file header
     /// Strategy codes: 0-17 (18 strategies)
-    fn to_code(&self) -> io::Result<u8> {
+    fn to_code(self) -> io::Result<u8> {
         match self {
             CompressionStrategy::Automatic(_, _) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
