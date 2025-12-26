@@ -141,7 +141,7 @@ pub fn paf_to_tpa(
 
     // Choose strategy (automatic or explicit)
     let (chosen_first, chosen_second, first_layer, second_layer) = match analyzer {
-        Some(analyzer) => analyzer.select_best()?,
+        Some(analyzer) => analyzer.select_best(),
         None => (
             config.first_strategy,
             config.second_strategy,
