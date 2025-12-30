@@ -44,9 +44,10 @@ def main():
             'compression_memory_mb', 'tpa_size_bytes', 'ratio_orig_to_tp',
             'ratio_tp_to_tpa', 'ratio_orig_to_tpa', 'decompression_runtime_sec',
             'decompression_memory_mb', 'verification_passed',
-            'seek_positions_tested', 'seek_iterations_per_position', 'seek_total_tests',
+            'seek_positions_tested', 'seek_iterations_per_position',
             'seek_mode_a_avg_us', 'seek_mode_a_stddev_us', 'seek_mode_b_avg_us',
-            'seek_mode_b_stddev_us', 'seek_decode_ratio', 'seek_valid_ratio'
+            'seek_mode_b_stddev_us', 'seek_decode_ratio', 'seek_valid_ratio',
+            'file_open_time_us'
         ]
         df = pd.read_csv(
             tsv_path,

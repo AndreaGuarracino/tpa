@@ -115,7 +115,7 @@ fn main() {
             args[0]
         );
         eprintln!("\ntp_type: standard, fastga, variable, or mixed");
-        eprintln!("Output:  avg_us stddev_us decode_ratio valid_ratio");
+        eprintln!("Output:  open_avg_us seek_avg_us decode_ratio valid_ratio");
         std::process::exit(1);
     }
 
@@ -125,6 +125,18 @@ fn main() {
     let iterations_per_pos: usize = args[4].parse().unwrap();
     let tp_type = &args[5];
     let reference_paf = &args[6];
+
+    // Measure full open time (10 warmup + 100 measured iterations)
+    for _ in 0..10 {
+        let _ = TpaReader::new(tpa_path).unwrap();
+    }
+    let mut open_sum_us = 0f64;
+    for _ in 0..100 {
+        let start = Instant::now();
+        let _ = TpaReader::new(tpa_path).unwrap();
+        open_sum_us += start.elapsed().as_micros() as f64;
+    }
+    let open_avg_us = open_sum_us / 100.0;
 
     let mut reader = TpaReader::new(tpa_path).unwrap();
     let reference = parse_reference(reference_paf, num_records as usize, tp_type);
@@ -139,7 +151,6 @@ fn main() {
     let positions: Vec<u64> = positions.into_iter().collect();
 
     let mut sum_us = 0u128;
-    let mut sum_sq_us = 0u128;
     let mut decode_count = 0usize;
     let mut valid_count = 0usize;
     let total_tests = num_positions * iterations_per_pos;
@@ -155,9 +166,7 @@ fn main() {
             let start = Instant::now();
             match reader.get_tracepoints(pos) {
                 Ok((tp, _, _)) => {
-                    let time_us = start.elapsed().as_micros();
-                    sum_us += time_us;
-                    sum_sq_us += time_us * time_us;
+                    sum_us += start.elapsed().as_micros();
                     decode_count += 1;
 
                     // Validate against reference
@@ -187,14 +196,12 @@ fn main() {
         }
     }
 
-    let avg_us = sum_us as f64 / total_tests as f64;
-    let variance = (sum_sq_us as f64 / total_tests as f64) - (avg_us * avg_us);
-    let stddev_us = variance.sqrt();
+    let seek_avg_us = sum_us as f64 / total_tests as f64;
     let decode_ratio = decode_count as f64 / total_tests as f64;
     let valid_ratio = valid_count as f64 / total_tests as f64;
 
     println!(
-        "{:.2} {:.2} {:.4} {:.4}",
-        avg_us, stddev_us, decode_ratio, valid_ratio
+        "{:.2} {:.2} {:.2} {:.2}",
+        open_avg_us, seek_avg_us, decode_ratio, valid_ratio
     );
 }

@@ -72,10 +72,8 @@ pub struct TpaReader {
 }
 
 impl TpaReader {
-    /// Create a TPA reader with index (builds index if .tpa.idx doesn't exist)
-    /// Automatically detects compression mode based on header's all_records flag:
-    /// - true → all-records mode (header/string table plain, records BGZIP-compressed)
-    /// - false → per-record compression mode
+    /// Full open: reads header, loads/builds index, prepares string table.
+    /// Automatically detects compression mode based on header's all_records flag.
     pub fn new(tpa_path: &str) -> io::Result<Self> {
         let mut file = File::open(tpa_path)?;
         let header = TpaHeader::read(&mut file)?;
@@ -85,6 +83,24 @@ impl TpaReader {
         } else {
             Self::open_per_record_mode(tpa_path, file, header)
         }
+    }
+
+    /// Shallow open: reads header only, no index or string table.
+    /// Use with standalone `read_*_tracepoints_at_offset()` functions when you have external offsets.
+    pub fn new_shallow(tpa_path: &str) -> io::Result<Self> {
+        let mut file = File::open(tpa_path)?;
+        let header = TpaHeader::read(&mut file)?;
+
+        Ok(Self {
+            file: Some(file),
+            bgzf_reader: None,
+            index: TpaIndex::empty(),
+            header,
+            string_table: StringTable::new(),
+            string_table_pos: 0,
+            tpa_path: None,
+            bgzf_section_start: 0,
+        })
     }
 
     /// Open a per-record compressed TPA file

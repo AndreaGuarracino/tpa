@@ -10,7 +10,7 @@
 //!
 //! Usage: seek_bench_bgzip_paf <file.tp.paf.gz> <num_records> <num_positions> <iterations> <tp_type> <reference.paf>
 //!
-//! Output: avg_us stddev_us decode_ratio valid_ratio
+//! Output: avg_us stddev_us decode_ratio valid_ratio open_time_us
 //!   - decode_ratio: fraction of seeks that successfully parsed tracepoints
 //!   - valid_ratio: fraction of decoded tracepoints that matched reference
 
@@ -260,7 +260,7 @@ fn main() {
             args[0]
         );
         eprintln!("\ntp_type: standard, fastga, variable, or mixed");
-        eprintln!("Output:  avg_us stddev_us decode_ratio valid_ratio");
+        eprintln!("Output:  open_avg_us seek_avg_us decode_ratio valid_ratio");
         std::process::exit(1);
     }
 
@@ -271,13 +271,25 @@ fn main() {
     let tp_type = &args[5];
     let reference_paf = &args[6];
 
+    // Measure file open time (10 warmup + 100 measured iterations)
+    for _ in 0..10 {
+        let _ = bgzf::io::Reader::new(File::open(bgzip_path).expect("open"));
+    }
+    let mut open_sum_us = 0f64;
+    for _ in 0..100 {
+        let start = Instant::now();
+        let _reader = bgzf::io::Reader::new(File::open(bgzip_path).expect("open"));
+        open_sum_us += start.elapsed().as_micros() as f64;
+    }
+    let open_time_us = open_sum_us / 100.0;
+
     // Build index of virtual positions
     let vpos_index = build_virtual_position_index(bgzip_path, num_records);
     let actual_records = vpos_index.len();
 
     if actual_records == 0 {
         eprintln!("No tracepoint records found in {}", bgzip_path);
-        println!("0 0 0 0");
+        println!("{:.2} 0 0 0", open_time_us);
         return;
     }
 
@@ -299,7 +311,6 @@ fn main() {
     let mut reader = bgzf::io::Reader::new(file);
 
     let mut sum_us = 0u128;
-    let mut sum_sq_us = 0u128;
     let mut decode_count = 0usize;
     let mut valid_count = 0usize;
     let total_tests = positions.len() * iterations_per_pos;
@@ -369,9 +380,7 @@ fn main() {
                 };
 
             if decoded {
-                let time_us = start.elapsed().as_micros();
-                sum_us += time_us;
-                sum_sq_us += time_us * time_us;
+                sum_us += start.elapsed().as_micros();
                 decode_count += 1;
 
                 if is_valid {
@@ -386,12 +395,6 @@ fn main() {
     } else {
         0.0
     };
-    let variance = if total_tests > 0 {
-        (sum_sq_us as f64 / total_tests as f64) - (avg_us * avg_us)
-    } else {
-        0.0
-    };
-    let stddev_us = variance.max(0.0).sqrt();
     let decode_ratio = if total_tests > 0 {
         decode_count as f64 / total_tests as f64
     } else {
@@ -404,7 +407,7 @@ fn main() {
     };
 
     println!(
-        "{:.2} {:.2} {:.4} {:.4}",
-        avg_us, stddev_us, decode_ratio, valid_ratio
+        "{:.2} {:.2} {:.2} {:.2}",
+        open_time_us, avg_us, decode_ratio, valid_ratio
     );
 }

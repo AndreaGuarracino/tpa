@@ -8,9 +8,10 @@
 //!
 //! Usage: seek_bench_direct <file.tpa> <num_records> <num_positions> <iterations> <tp_type> <reference.paf>
 //!
-//! Output: avg_us stddev_us decode_ratio valid_ratio
+//! Output: avg_us stddev_us decode_ratio valid_ratio shallow_open_us
 //!   - decode_ratio: fraction of read_*_tracepoints_at_offset() calls that succeeded
 //!   - valid_ratio: fraction of decoded tracepoints that matched reference
+//!   - shallow_open_us: average time to open file in shallow mode (header only)
 
 use std::collections::HashSet;
 use std::env;
@@ -123,7 +124,7 @@ fn main() {
             args[0]
         );
         eprintln!("\ntp_type: standard, variable, or mixed");
-        eprintln!("Output:  avg_us stddev_us decode_ratio valid_ratio");
+        eprintln!("Output:  open_avg_us seek_avg_us decode_ratio valid_ratio");
         std::process::exit(1);
     }
 
@@ -134,13 +135,9 @@ fn main() {
     let tp_type = &args[5];
     let reference_paf = &args[6];
 
-    // Open TpaReader to get strategies, layers, offsets, and detect mode
+    // Step 1: Full open to get offsets from index (requires index)
     let mut reader = TpaReader::new(tpa_path).unwrap();
-    let (first_strategy, second_strategy) = reader.header().strategies().unwrap();
-    let first_layer = reader.header().first_layer();
-    let second_layer = reader.header().second_layer();
     let is_bgzip = reader.is_all_records_mode();
-    let _bgzf_section_start = reader.bgzf_section_start();
     let reference = parse_reference(reference_paf, num_records as usize, tp_type);
 
     // Generate deterministic pseudo-random positions
@@ -158,11 +155,37 @@ fn main() {
         .map(|&pos| reader.get_tracepoint_offset(pos).unwrap())
         .collect();
 
-    // Drop reader - from here we use only standalone functions
+    // Drop full reader
+    drop(reader);
+
+    // Step 2: Shallow open to get strategies/layers (tests shallow mode)
+    // Measure shallow open time (10 warmup + 100 measured iterations)
+    // Includes strategy/layer extraction since they're needed for seeks
+    for _ in 0..10 {
+        let reader = TpaReader::new_shallow(tpa_path).unwrap();
+        let _ = reader.header().strategies().unwrap();
+        let _ = reader.header().first_layer();
+        let _ = reader.header().second_layer();
+    }
+    let mut shallow_open_sum_us = 0f64;
+    for _ in 0..100 {
+        let start = Instant::now();
+        let reader = TpaReader::new_shallow(tpa_path).unwrap();
+        let _ = reader.header().strategies().unwrap();
+        let _ = reader.header().first_layer();
+        let _ = reader.header().second_layer();
+        shallow_open_sum_us += start.elapsed().as_micros() as f64;
+    }
+    let shallow_open_us = shallow_open_sum_us / 100.0;
+
+    // Get strategies/layers from shallow reader (for actual seeks below)
+    let reader = TpaReader::new_shallow(tpa_path).unwrap();
+    let (first_strategy, second_strategy) = reader.header().strategies().unwrap();
+    let first_layer = reader.header().first_layer();
+    let second_layer = reader.header().second_layer();
     drop(reader);
 
     let mut sum_us = 0u128;
-    let mut sum_sq_us = 0u128;
     let mut decode_count = 0usize;
     let mut valid_count = 0usize;
     let total_tests = num_positions * iterations_per_pos;
@@ -285,9 +308,7 @@ fn main() {
                 };
 
                 if decoded {
-                    let time_us = start.elapsed().as_micros();
-                    sum_us += time_us;
-                    sum_sq_us += time_us * time_us;
+                    sum_us += start.elapsed().as_micros();
                     decode_count += 1;
 
                     if is_valid {
@@ -412,9 +433,7 @@ fn main() {
                 };
 
                 if decoded {
-                    let time_us = start.elapsed().as_micros();
-                    sum_us += time_us;
-                    sum_sq_us += time_us * time_us;
+                    sum_us += start.elapsed().as_micros();
                     decode_count += 1;
 
                     if is_valid {
@@ -425,14 +444,12 @@ fn main() {
         }
     }
 
-    let avg_us = sum_us as f64 / total_tests as f64;
-    let variance = (sum_sq_us as f64 / total_tests as f64) - (avg_us * avg_us);
-    let stddev_us = variance.sqrt();
+    let seek_avg_us = sum_us as f64 / total_tests as f64;
     let decode_ratio = decode_count as f64 / total_tests as f64;
     let valid_ratio = valid_count as f64 / total_tests as f64;
 
     println!(
-        "{:.2} {:.2} {:.4} {:.4}",
-        avg_us, stddev_us, decode_ratio, valid_ratio
+        "{:.2} {:.2} {:.2} {:.2}",
+        shallow_open_us, seek_avg_us, decode_ratio, valid_ratio
     );
 }

@@ -353,21 +353,24 @@ impl CompressionStrategy {
 
     /// Parse strategy from string with compression layer
     /// Formats:
-    ///   - Single: "strategy", "strategy,level", "strategy-bgzip", "strategy-nocomp"
+    ///   - Single: "strategy", "strategy,level", "strategy-zstd", "strategy-bgzip", "strategy-nocomp"
     ///   - Automatic: "automatic", "automatic,level", "automatic,level,sample_size"
     pub fn from_str_with_layer(s: &str) -> Result<(Self, CompressionLayer), String> {
         let parts: Vec<&str> = s.split(',').collect();
         let mut strategy_name = parts[0].to_lowercase();
 
-        // Check for suffix: -bgzip or -nocomp
-        let layer = if strategy_name.ends_with("-bgzip") {
+        // Check for suffix: -zstd, -bgzip, or -nocomp
+        let layer = if strategy_name.ends_with("-zstd") {
+            strategy_name = strategy_name.trim_end_matches("-zstd").to_string();
+            CompressionLayer::Zstd
+        } else if strategy_name.ends_with("-bgzip") {
             strategy_name = strategy_name.trim_end_matches("-bgzip").to_string();
             CompressionLayer::Bgzip
         } else if strategy_name.ends_with("-nocomp") {
             strategy_name = strategy_name.trim_end_matches("-nocomp").to_string();
             CompressionLayer::Nocomp // No compression - store raw encoded data
         } else {
-            CompressionLayer::Zstd
+            CompressionLayer::Zstd // Default to Zstd if no suffix
         };
 
         let default_level = if layer == CompressionLayer::Nocomp {
@@ -722,6 +725,11 @@ impl TpaHeader {
     /// Get max complexity
     pub fn max_complexity(&self) -> u32 {
         self.max_complexity
+    }
+
+    /// Get compression layers (first, second)
+    pub fn layers(&self) -> (CompressionLayer, CompressionLayer) {
+        (self.first_layer, self.second_layer)
     }
 
     /// Compression layer for first values

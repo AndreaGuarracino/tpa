@@ -47,6 +47,15 @@ impl TpaIndex {
     const INDEX_MAGIC: &'static [u8; 4] = b"TPAI";
     const INDEX_VERSION: u8 = 2;
 
+    /// Create an empty index (for shallow mode when index isn't needed)
+    pub fn empty() -> Self {
+        Self {
+            index_type: IndexType::RawOffset,
+            positions: Vec::new(),
+            bgzf_section_start: 0,
+        }
+    }
+
     /// Create a new index with raw byte offsets (classic per-record mode)
     pub fn new_raw(offsets: Vec<u64>) -> Self {
         Self {
