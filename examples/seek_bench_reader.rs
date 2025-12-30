@@ -114,7 +114,7 @@ fn main() {
             "Usage: {} <file.tpa> <num_records> <num_positions> <iterations> <tp_type> <reference.paf>",
             args[0]
         );
-        eprintln!("\ntp_type: standard, variable, or mixed");
+        eprintln!("\ntp_type: standard, fastga, variable, or mixed");
         eprintln!("Output:  avg_us stddev_us decode_ratio valid_ratio");
         std::process::exit(1);
     }

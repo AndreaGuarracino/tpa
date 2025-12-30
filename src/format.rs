@@ -1152,6 +1152,14 @@ pub fn parse_tag(field: &str) -> Option<Tag> {
     if parts.len() != 3 || parts[0].len() < 2 || parts[1].is_empty() {
         return None;
     }
+    // SAM/BAM tags must be exactly 2 characters - warn and skip non-standard tags
+    if parts[0].len() != 2 {
+        log::warn!(
+            "Skipping non-standard tag '{}' (name must be exactly 2 characters)",
+            field
+        );
+        return None;
+    }
     let key = [parts[0].as_bytes()[0], parts[0].as_bytes()[1]];
     let tag_type = parts[1].as_bytes()[0];
     let value = match tag_type {

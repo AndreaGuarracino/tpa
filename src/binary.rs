@@ -6,7 +6,6 @@ use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use tracepoints::{MixedRepresentation, TracepointData, TracepointType};
 
-use crate::check_not_empty_tps;
 use crate::format::*;
 use crate::utils::*;
 
@@ -140,8 +139,6 @@ impl StrategyAnalyzer {
         if self.sample_limit > 0 && self.processed_records >= self.sample_limit {
             return Ok(());
         }
-
-        check_not_empty_tps(&record.tracepoints)?;
 
         match &record.tracepoints {
             TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
@@ -2166,7 +2163,6 @@ impl CompactRecord {
         first_layer: CompressionLayer,
         second_layer: CompressionLayer,
     ) -> io::Result<()> {
-        check_not_empty_tps(&self.tracepoints)?;
         match &self.tracepoints {
             TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
                 write_varint(writer, tps.len() as u64)?;

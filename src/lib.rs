@@ -310,16 +310,6 @@ pub fn format_tracepoints(data: &TracepointData) -> String {
 // Helpers
 // ============================================================================
 
-pub(crate) fn check_not_empty_tps(data: &TracepointData) -> io::Result<()> {
-    if data.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Encountered record without tracepoints",
-        ));
-    }
-    Ok(())
-}
-
 /// Per-record compression mode: each record uses strategy encoding + optional compression layers
 ///
 /// Format: [Header] [StringTable] [Record1] [Record2] ... [RecordN] [Footer]
@@ -713,8 +703,6 @@ fn parse_paf(
             "PAF line has neither tp:Z: (tracepoints) nor cg:Z: (CIGAR) tag",
         ));
     };
-
-    check_not_empty_tps(&tracepoints)?;
 
     Ok(CompactRecord {
         query_name_id,

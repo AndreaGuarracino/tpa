@@ -160,12 +160,12 @@ while [ $# -gt 0 ]; do
             if $PARSING_TYPES; then
                 # Validate type
                 case "$1" in
-                    standard|variable|mixed)
+                    standard|variable|mixed|fastga)
                         TP_TYPES+=("$1")
                         ;;
                     *)
                         echo "Error: Invalid tracepoint type '$1'"
-                        echo "Valid types: standard, variable, mixed"
+                        echo "Valid types: standard, variable, mixed, fastga"
                         exit 1
                         ;;
                 esac

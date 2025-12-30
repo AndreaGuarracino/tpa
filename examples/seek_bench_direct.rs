@@ -177,7 +177,7 @@ fn main() {
             // Warmup (3 iterations)
             for _ in 0..3 {
                 match tp_type.as_str() {
-                    "standard" => {
+                    "standard" | "fastga" => {
                         let _ = read_standard_tracepoints_at_vpos(
                             &mut bgzf_reader,
                             vpos,
@@ -215,7 +215,7 @@ fn main() {
             for _ in 0..iterations_per_pos {
                 let start = Instant::now();
                 let (decoded, is_valid) = match tp_type.as_str() {
-                    "standard" => {
+                    "standard" | "fastga" => {
                         match read_standard_tracepoints_at_vpos(
                             &mut bgzf_reader,
                             vpos,
@@ -304,7 +304,7 @@ fn main() {
             // Warmup (3 iterations)
             for _ in 0..3 {
                 match tp_type.as_str() {
-                    "standard" => {
+                    "standard" | "fastga" => {
                         let _ = read_standard_tracepoints_at_offset_with_strategies(
                             &mut file,
                             offset,
@@ -342,7 +342,7 @@ fn main() {
             for _ in 0..iterations_per_pos {
                 let start = Instant::now();
                 let (decoded, is_valid) = match tp_type.as_str() {
-                    "standard" => {
+                    "standard" | "fastga" => {
                         match read_standard_tracepoints_at_offset_with_strategies(
                             &mut file,
                             offset,

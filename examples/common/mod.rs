@@ -19,7 +19,7 @@ pub enum Reference {
 /// # Arguments
 /// * `path` - Path to the PAF file
 /// * `limit` - Maximum number of records to parse
-/// * `tp_type` - Tracepoint type: "standard", "variable", or "mixed"
+/// * `tp_type` - Tracepoint type: "standard", "fastga", "variable", or "mixed"
 pub fn parse_reference(path: &str, limit: usize, tp_type: &str) -> Reference {
     let file = File::open(path).expect("reference PAF open failed");
     let reader = BufReader::new(file);
