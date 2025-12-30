@@ -1,6 +1,6 @@
 use crate::binary::{read_record, read_tracepoints, read_tracepoints_at_offset};
 use crate::format::{
-    AlignmentRecord, CompressionLayer, CompressionStrategy, StringTable, TpaHeader,
+    CompactRecord, CompressionLayer, CompressionStrategy, StringTable, TpaHeader,
 };
 use crate::index::{build_index_all_records, build_index_per_record, IndexType, TpaIndex};
 use crate::utils::read_varint;
@@ -23,6 +23,15 @@ fn err_out_of_bounds(record_id: u64) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
         format!("Record id {} out of bounds", record_id),
+    )
+}
+
+/// Helper: create "unknown name id" error
+#[inline]
+fn err_unknown_name_id(kind: &str, id: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("Unknown {} name id: {}", kind, id),
     )
 }
 
@@ -256,8 +265,8 @@ impl TpaReader {
         &self.string_table
     }
 
-    /// Get full alignment record by ID - O(1) random access
-    pub fn get_alignment_record(&mut self, record_id: u64) -> io::Result<AlignmentRecord> {
+    /// Get compact record by ID - O(1) random access (internal, uses string IDs)
+    pub fn get_compact_record(&mut self, record_id: u64) -> io::Result<CompactRecord> {
         let position = self
             .index
             .get_position(record_id)
@@ -293,8 +302,8 @@ impl TpaReader {
         }
     }
 
-    /// Get alignment record by file offset/virtual position (for impg compatibility)
-    pub fn get_alignment_record_at_offset(&mut self, position: u64) -> io::Result<AlignmentRecord> {
+    /// Get compact record by file offset/virtual position (for impg compatibility)
+    pub fn get_compact_record_at_offset(&mut self, position: u64) -> io::Result<CompactRecord> {
         let (first_strategy, second_strategy) = self.header.strategies()?;
 
         if let Some(ref mut bgzf) = self.bgzf_reader {
@@ -358,7 +367,7 @@ impl TpaReader {
         }
     }
 
-    /// Get tracepoints by tracepoint offset/virtual position
+    /// Get tracepoints by tracepoint offset/virtual position (for impg compatibility)
     /// Seeks directly to tracepoint data within a record
     pub fn get_tracepoints_at_offset(
         &mut self,
@@ -401,12 +410,62 @@ impl TpaReader {
         Ok((tracepoints, complexity_metric, max_complexity))
     }
 
-    /// Iterator over all records (sequential access)
-    pub fn iter_records(&mut self) -> RecordIterator<'_> {
+    /// Iterator over all compact records (sequential access, returns CompactRecord with IDs)
+    pub fn iter_compact_records(&mut self) -> RecordIterator<'_> {
         RecordIterator {
             reader: self,
             current_id: 0,
         }
+    }
+
+    /// Get a fully alignment record
+    pub fn get_record(&mut self, record_id: u64) -> io::Result<AlignmentRecord> {
+        // Ensure string table is loaded
+        self.load_string_table()?;
+
+        // Get the compact record (with string IDs)
+        let record = self.get_compact_record(record_id)?;
+
+        // Resolve names from string table
+        let (query_name, query_len) = self
+            .string_table
+            .get_name_and_len(record.query_name_id)
+            .ok_or_else(|| err_unknown_name_id("query", record.query_name_id))?;
+
+        let (target_name, target_len) = self
+            .string_table
+            .get_name_and_len(record.target_name_id)
+            .ok_or_else(|| err_unknown_name_id("target", record.target_name_id))?;
+
+        Ok(AlignmentRecord {
+            query_name: query_name.to_string(),
+            query_len,
+            query_start: record.query_start,
+            query_end: record.query_end,
+            strand: record.strand,
+            target_name: target_name.to_string(),
+            target_len,
+            target_start: record.target_start,
+            target_end: record.target_end,
+            residue_matches: record.residue_matches,
+            alignment_block_len: record.alignment_block_len,
+            mapping_quality: record.mapping_quality,
+            tracepoints: record.tracepoints,
+            tags: record.tags,
+        })
+    }
+
+    /// Iterator over all records (sequential access with resolved names)
+    ///
+    /// Each record contains actual sequence names (not IDs).
+    /// Useful for parallel processing with CIGAR reconstruction.
+    pub fn iter_records(&mut self) -> io::Result<AlignmentRecordIterator<'_>> {
+        // Ensure string table is loaded before creating iterator
+        self.load_string_table()?;
+        Ok(AlignmentRecordIterator {
+            reader: self,
+            current_id: 0,
+        })
     }
 }
 
@@ -595,6 +654,67 @@ pub struct RecordIterator<'a> {
 }
 
 impl<'a> Iterator for RecordIterator<'a> {
+    type Item = io::Result<CompactRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_id >= self.reader.len() as u64 {
+            return None;
+        }
+
+        let result = self.reader.get_compact_record(self.current_id);
+        self.current_id += 1;
+        Some(result)
+    }
+}
+
+// ============================================================================
+// ALIGNMENT RECORD
+// ============================================================================
+
+use crate::format::Tag;
+
+/// A fully decoded alignment record with resolved sequence names
+///
+/// Unlike `CompactRecord` which uses string table IDs, it contains sequence names.
+#[derive(Debug)]
+pub struct AlignmentRecord {
+    /// Query sequence name
+    pub query_name: String,
+    /// Query sequence length
+    pub query_len: u64,
+    /// Query start position (0-based)
+    pub query_start: u64,
+    /// Query end position
+    pub query_end: u64,
+    /// Strand ('+' or '-')
+    pub strand: char,
+    /// Target sequence name
+    pub target_name: String,
+    /// Target sequence length
+    pub target_len: u64,
+    /// Target start position (0-based)
+    pub target_start: u64,
+    /// Target end position
+    pub target_end: u64,
+    /// Number of residue matches
+    pub residue_matches: u64,
+    /// Alignment block length
+    pub alignment_block_len: u64,
+    /// Mapping quality (0-255)
+    pub mapping_quality: u8,
+    /// Tracepoint data (decoded, not string)
+    pub tracepoints: TracepointData,
+    /// Optional PAF tags
+    pub tags: Vec<Tag>,
+}
+
+/// Iterator over alignment records with resolved names
+pub struct AlignmentRecordIterator<'a> {
+    reader: &'a mut TpaReader,
+    current_id: u64,
+}
+
+impl<'a> Iterator for AlignmentRecordIterator<'a> {
     type Item = io::Result<AlignmentRecord>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -602,7 +722,7 @@ impl<'a> Iterator for RecordIterator<'a> {
             return None;
         }
 
-        let result = self.reader.get_alignment_record(self.current_id);
+        let result = self.reader.get_record(self.current_id);
         self.current_id += 1;
         Some(result)
     }

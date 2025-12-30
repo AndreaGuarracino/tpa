@@ -144,7 +144,7 @@ fn main() -> io::Result<()> {
     let mut writer = io::BufWriter::new(stdout.lock());
 
     for record_id in 0..header.num_records() {
-        let record = reader.get_alignment_record(record_id)?;
+        let record = reader.get_compact_record(record_id)?;
 
         let query_name = string_table
             .get(record.query_name_id)

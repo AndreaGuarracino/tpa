@@ -136,7 +136,7 @@ impl StrategyAnalyzer {
         }
     }
 
-    pub fn analyze_record(&mut self, record: &AlignmentRecord) -> io::Result<()> {
+    pub fn analyze_record(&mut self, record: &CompactRecord) -> io::Result<()> {
         if self.sample_limit > 0 && self.processed_records >= self.sample_limit {
             return Ok(());
         }
@@ -439,7 +439,7 @@ fn encode_second_stream(
 
 pub fn write_paf_line_with_tracepoints<W: Write>(
     writer: &mut W,
-    record: &AlignmentRecord,
+    record: &CompactRecord,
     string_table: &StringTable,
 ) -> io::Result<()> {
     let query_name = string_table
@@ -537,7 +537,7 @@ pub(crate) fn read_record<R: Read>(
     tp_type: TracepointType,
     first_layer: CompressionLayer,
     second_layer: CompressionLayer,
-) -> io::Result<AlignmentRecord> {
+) -> io::Result<CompactRecord> {
     let query_name_id = read_varint(reader)?;
     let query_start = read_varint(reader)?;
     let query_end = read_varint(reader)?;
@@ -568,7 +568,7 @@ pub(crate) fn read_record<R: Read>(
         tags.push(Tag::read(reader)?);
     }
 
-    Ok(AlignmentRecord {
+    Ok(CompactRecord {
         query_name_id,
         query_start,
         query_end,
@@ -2125,7 +2125,7 @@ pub(crate) fn decode_mixed_tracepoints<R: Read>(
 // ALIGNMENT RECORD I/O
 // ============================================================================
 
-impl AlignmentRecord {
+impl CompactRecord {
     pub(crate) fn write<W: Write>(
         &self,
         writer: &mut W,

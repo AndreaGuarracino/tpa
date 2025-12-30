@@ -1001,6 +1001,12 @@ impl StringTable {
         self.lengths.get(id as usize).copied()
     }
 
+    pub fn get_name_and_len(&self, id: u64) -> Option<(&str, u64)> {
+        let name = self.strings.get(id as usize)?;
+        let len = self.lengths.get(id as usize)?;
+        Some((name.as_str(), *len))
+    }
+
     pub fn len(&self) -> usize {
         self.strings.len()
     }
@@ -1056,7 +1062,7 @@ impl StringTable {
     }
 }
 
-pub struct AlignmentRecord {
+pub struct CompactRecord {
     pub query_name_id: u64,
     pub query_start: u64,
     pub query_end: u64,
@@ -1071,6 +1077,7 @@ pub struct AlignmentRecord {
     pub tags: Vec<Tag>,
 }
 
+#[derive(Debug)]
 pub struct Tag {
     pub key: [u8; 2],
     pub tag_type: u8,

@@ -69,7 +69,7 @@ let mut reader = TpaReader::new("alignments.tpa")?;
 println!("Total records: {}", reader.len());
 
 // Jump to any record instantly
-let record = reader.get_alignment_record(1000)?;
+let record = reader.get_compact_record(1000)?;
 let (tracepoints, _, _) = reader.get_tracepoints(1000)?;
 
 match &tracepoints {

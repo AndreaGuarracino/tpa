@@ -7,6 +7,7 @@
 //! - Footer: Crash-safety marker with record/string counts
 
 mod binary;
+mod cigar;
 mod format;
 mod hybrids;
 mod index;
@@ -26,22 +27,31 @@ use tracepoints::{
 };
 
 pub use format::{
-    AlignmentRecord, CompressionConfig, CompressionLayer, CompressionStrategy, StringTable, Tag,
-    TagValue, TpaHeader, TPA_MAGIC,
+    CompressionConfig, CompressionLayer, CompressionStrategy, StringTable, Tag, TagValue,
+    TpaHeader, TPA_MAGIC,
 };
 pub use tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 
 use crate::binary::read_header;
-use crate::format::{parse_tag, TpaFooter};
+use crate::format::{parse_tag, CompactRecord, TpaFooter};
 use crate::utils::{parse_u8, parse_usize};
 
 pub use index::{build_index_all_records, build_index_per_record, TpaIndex};
 pub use reader::{
     read_mixed_tracepoints_at_offset, read_mixed_tracepoints_at_vpos,
     read_standard_tracepoints_at_offset_with_strategies, read_standard_tracepoints_at_vpos,
-    read_variable_tracepoints_at_offset, read_variable_tracepoints_at_vpos, RecordIterator,
-    TpaReader,
+    read_variable_tracepoints_at_offset, read_variable_tracepoints_at_vpos, AlignmentRecord,
+    AlignmentRecordIterator, RecordIterator, TpaReader,
 };
+
+// Re-export cigar module types and functions
+pub use cigar::{
+    calculate_alignment_score, reconstruct_cigar, reconstruct_cigar_with_aligner,
+    reconstruct_cigar_with_heuristic, CigarReconstructError, CigarStats,
+};
+
+// Re-export aligner type for reconstruct_cigar_with_aligner API
+pub use lib_wfa2::affine_wavefront::AffineWavefronts;
 
 // Re-export noodles bgzf for BGZF mode standalone access
 pub use noodles::bgzf;
@@ -97,7 +107,7 @@ pub fn paf_to_tpa(
     };
 
     let parse_record =
-        |line: &str, line_num: usize, table: &mut StringTable| -> Option<AlignmentRecord> {
+        |line: &str, line_num: usize, table: &mut StringTable| -> Option<CompactRecord> {
             match parse_paf(
                 line,
                 table,
@@ -196,6 +206,103 @@ pub fn tpa_to_paf(input_path: &str, output_path: &str) -> io::Result<()> {
         decompress_all_records(input_path, output_path)
     } else {
         decompress_per_record(input_path, output_path)
+    }
+}
+
+/// Parse a tracepoint string (tp:Z: field value) into TracepointData
+pub fn parse_tracepoints(tp_str: &str, tp_type: TracepointType) -> io::Result<TracepointData> {
+    match tp_type {
+        TracepointType::Standard | TracepointType::Fastga => {
+            let mut tps = Vec::new();
+            for part in tp_str.split(';') {
+                let pair = parse_tracepoint_pair(part, true)?;
+                tps.push(pair);
+            }
+
+            Ok(match tp_type {
+                TracepointType::Standard => TracepointData::Standard(tps),
+                TracepointType::Fastga => TracepointData::Fastga(tps),
+                _ => unreachable!(),
+            })
+        }
+        TracepointType::Mixed => {
+            let mut items = Vec::new();
+
+            for part in tp_str.split(';') {
+                if part.contains(',') {
+                    let (first, second) = parse_tracepoint_pair(part, true)?;
+                    items.push(MixedRepresentation::Tracepoint(first, second));
+                } else {
+                    let op = part.chars().last().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Mixed tracepoint entry missing operation",
+                        )
+                    })?;
+                    let len_str = part.strip_suffix(op).map(str::trim).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Invalid mixed tracepoint: '{}'", part),
+                        )
+                    })?;
+                    if len_str.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Mixed tracepoint entry missing length",
+                        ));
+                    }
+                    let len = parse_usize_value(len_str, "Invalid CIGAR length")?;
+                    items.push(MixedRepresentation::CigarOp(len, op));
+                }
+            }
+
+            Ok(TracepointData::Mixed(items))
+        }
+        TracepointType::Variable => {
+            let mut tps = Vec::new();
+            for part in tp_str.split(';') {
+                if part.contains(',') {
+                    let (first, second) = parse_tracepoint_pair(part, true)?;
+                    tps.push((first, Some(second)));
+                } else {
+                    let first = parse_usize_value(part, "Invalid first value")?;
+                    tps.push((first, None));
+                }
+            }
+            Ok(TracepointData::Variable(tps))
+        }
+    }
+}
+
+/// Format tracepoints as a string (inverse of parse_tracepoints)
+///
+/// Handles all TracepointData variants:
+/// - Standard/Fastga: "a1,b1;a2,b2;..."
+/// - Mixed: "a,b;10I;c,d;5D;..."
+/// - Variable: "a1,b1;a2;a3,b3;..." (second value optional)
+pub fn format_tracepoints(data: &TracepointData) -> String {
+    match data {
+        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => tps
+            .iter()
+            .map(|(a, b)| format!("{},{}", a, b))
+            .collect::<Vec<String>>()
+            .join(";"),
+        TracepointData::Mixed(items) => items
+            .iter()
+            .map(|tp| match tp {
+                MixedRepresentation::Tracepoint(a, b) => format!("{},{}", a, b),
+                MixedRepresentation::CigarOp(len, op) => format!("{}{}", len, op),
+            })
+            .collect::<Vec<String>>()
+            .join(";"),
+        TracepointData::Variable(tps) => tps
+            .iter()
+            .map(|(a, b_opt)| match b_opt {
+                Some(b) => format!("{},{}", a, b),
+                None => format!("{}", a),
+            })
+            .collect::<Vec<String>>()
+            .join(";"),
     }
 }
 
@@ -497,7 +604,7 @@ fn decompress_all_records(input_path: &str, output_path: &str) -> io::Result<()>
 
     // Write record
     for record_id in 0..num_records {
-        let record = reader.get_alignment_record(record_id)?;
+        let record = reader.get_compact_record(record_id)?;
         write_paf_line_with_tracepoints(&mut writer, &record, &string_table)?;
     }
 
@@ -512,7 +619,7 @@ fn parse_paf(
     tp_type: TracepointType,
     max_complexity: u32,
     complexity_metric: ComplexityMetric,
-) -> io::Result<AlignmentRecord> {
+) -> io::Result<CompactRecord> {
     let fields: Vec<&str> = line.split('\t').collect();
     if fields.len() < 12 {
         return Err(io::Error::new(
@@ -609,7 +716,7 @@ fn parse_paf(
 
     check_not_empty_tps(&tracepoints)?;
 
-    Ok(AlignmentRecord {
+    Ok(CompactRecord {
         query_name_id,
         query_start,
         query_end,
@@ -623,71 +730,6 @@ fn parse_paf(
         tracepoints,
         tags,
     })
-}
-
-/// Parse a tracepoint string (tp:Z: field value) into TracepointData
-pub fn parse_tracepoints(tp_str: &str, tp_type: TracepointType) -> io::Result<TracepointData> {
-    match tp_type {
-        TracepointType::Standard | TracepointType::Fastga => {
-            let mut tps = Vec::new();
-            for part in tp_str.split(';') {
-                let pair = parse_tracepoint_pair(part, true)?;
-                tps.push(pair);
-            }
-
-            Ok(match tp_type {
-                TracepointType::Standard => TracepointData::Standard(tps),
-                TracepointType::Fastga => TracepointData::Fastga(tps),
-                _ => unreachable!(),
-            })
-        }
-        TracepointType::Mixed => {
-            let mut items = Vec::new();
-
-            for part in tp_str.split(';') {
-                if part.contains(',') {
-                    let (first, second) = parse_tracepoint_pair(part, true)?;
-                    items.push(MixedRepresentation::Tracepoint(first, second));
-                } else {
-                    let op = part.chars().last().ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Mixed tracepoint entry missing operation",
-                        )
-                    })?;
-                    let len_str = part.strip_suffix(op).map(str::trim).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("Invalid mixed tracepoint: '{}'", part),
-                        )
-                    })?;
-                    if len_str.is_empty() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Mixed tracepoint entry missing length",
-                        ));
-                    }
-                    let len = parse_usize_value(len_str, "Invalid CIGAR length")?;
-                    items.push(MixedRepresentation::CigarOp(len, op));
-                }
-            }
-
-            Ok(TracepointData::Mixed(items))
-        }
-        TracepointType::Variable => {
-            let mut tps = Vec::new();
-            for part in tp_str.split(';') {
-                if part.contains(',') {
-                    let (first, second) = parse_tracepoint_pair(part, true)?;
-                    tps.push((first, Some(second)));
-                } else {
-                    let first = parse_usize_value(part, "Invalid first value")?;
-                    tps.push((first, None));
-                }
-            }
-            Ok(TracepointData::Variable(tps))
-        }
-    }
 }
 
 fn parse_tracepoint_pair(part: &str, strict: bool) -> io::Result<(usize, usize)> {
