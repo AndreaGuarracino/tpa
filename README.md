@@ -1,34 +1,45 @@
-# lib_bpaf
+# tpa
 
-Binary format for genomic sequence alignments with tracepoints.
+TracePoint Alignment (TPA) format - binary format for efficient storage and random access of sequence alignments with tracepoints.
 
 ## Features
 
 - **O(1) random access**: External index for instant record lookup
 - **Fast varint compression**:
-  - **Automatic (default)**: Samples data to choose between raw or delta+zigzag encoding
+  - **Automatic (default)**: Samples records and tests every concrete strategy × compression layer per stream (18×3 per stream), then locks in the best first/second pair; configurable sample size (default 10000, 0 = entire file)
   - **ZigzagDelta**: Delta + zigzag transform + varint + zstd
   - **Raw**: Plain varints + zstd
+  - **Rice / Huffman**: Block-local entropy coding over zigzag deltas, byte-aligned for random seeks
 - **Tracepoint support**: Standard, Mixed, Variable, and FastGA representations
 - **String deduplication**: Shared sequence name table
 - **Byte-aligned encoding**: Enables extremely fast tracepoint extraction
+- **Crash-safety footer**: Files carry a footer written at close; missing footers are rejected on read
 
 ## Format
 
 ```
-[Header] → [StringTable] → [Records]
+[Header] → [StringTable] → [Records] → [Footer]
 ```
 
 ### Header (metadata + strategy)
-- Magic: `BPAF` (4 bytes)
+- Magic: `TPA\0` (4 bytes)
 - Version: `1` (1 byte)
-- Strategy: `0-1` (1 byte) - 0=Raw, 1=ZigzagDelta (Automatic resolves to one of these)
+- Strategy bytes (2): bits 7–6 = layer (`0=Zstd, 1=Bgzip, 2=Nocomp`), bits 5–0 = strategy code (`0-17`)
 - Record count: varint
 - String count: varint
 - Tracepoint type: `1` byte
 - Complexity metric: `1` byte
 - Max complexity / spacing: varint
 - Distance parameters: serialized to match `lib_wfa2::Distance`
+
+### Footer (written on close)
+- Magic: `TPA\0` (4 bytes)
+- Version: `1` (1 byte)
+- Record count: varint
+- String count: varint
+- Footer length: `u32` little-endian trailer
+
+Readers validate header/footer agreement and fail fast if the footer is missing or truncated.
 
 ### Records (per alignment)
 - **PAF fields**: varints for positions, 1-byte strand/quality
@@ -43,7 +54,7 @@ Binary format for genomic sequence alignments with tracepoints.
 
 ```toml
 [dependencies]
-lib_bpaf = { git = "https://github.com/AndreaGuarracino/lib_bpaf" }
+tpa = { git = "https://github.com/AndreaGuarracino/tpa" }
 ```
 
 ## Quick Start
@@ -51,14 +62,14 @@ lib_bpaf = { git = "https://github.com/AndreaGuarracino/lib_bpaf" }
 ### Read with random access
 
 ```rust
-use lib_bpaf::{BpafReader, TracepointType};
+use tpa::{TpaReader, TracepointType};
 
 // Open with index for O(1) record access
-let mut reader = BpafReader::open("alignments.bpaf")?;
+let mut reader = TpaReader::new("alignments.tpa")?;
 println!("Total records: {}", reader.len());
 
 // Jump to any record instantly
-let record = reader.get_alignment_record(1000)?;
+let record = reader.get_compact_record(1000)?;
 let (tracepoints, _, _) = reader.get_tracepoints(1000)?;
 
 match &tracepoints {
@@ -74,23 +85,47 @@ match &tracepoints {
 For maximum speed when you have pre-computed offsets:
 
 ```rust
-use lib_bpaf::{read_standard_tracepoints_at_offset,
+use tpa::{read_standard_tracepoints_at_offset_with_strategies,
                read_variable_tracepoints_at_offset,
                read_mixed_tracepoints_at_offset,
-               CompressionStrategy};
+               CompressionStrategy, CompressionLayer};
 use std::fs::File;
 
 // Open file once (reuse for multiple seeks)
-let mut file = File::open("alignments.bpaf")?;
+let mut file = File::open("alignments.tpa")?;
 
-// Pre-computed offsets and strategy from index/header
+// Pre-computed offsets, strategy, and layer from index/header
 let offset = 123456;
-let strategy = CompressionStrategy::ZigzagDelta(3);
+let first_strategy = CompressionStrategy::ZigzagDelta(3);
+let second_strategy = CompressionStrategy::ZigzagDelta(3);
+let first_layer = CompressionLayer::Zstd; // or read from TpaafHeader
+let second_layer = CompressionLayer::Zstd;
 
-// Direct tracepoint decoding - no BpafReader overhead
-let standard_tps = read_standard_tracepoints_at_offset(&mut file, offset, strategy)?;
-let variable_tps = read_variable_tracepoints_at_offset(&mut file, offset)?;
-let mixed_tps = read_mixed_tracepoints_at_offset(&mut file, offset)?;
+// Direct tracepoint decoding - no TpaReader overhead
+let standard_tps = read_standard_tracepoints_at_offset_with_strategies(
+    &mut file,
+    offset,
+    first_strategy,
+    second_strategy,
+    first_layer,
+    second_layer,
+)?;
+let variable_tps = read_variable_tracepoints_at_offset(
+    &mut file,
+    offset,
+    first_strategy.clone(),
+    second_strategy.clone(),
+    first_layer,
+    second_layer,
+)?;
+let mixed_tps = read_mixed_tracepoints_at_offset(
+    &mut file,
+    offset,
+    first_strategy,
+    second_strategy,
+    first_layer,
+    second_layer,
+)?;
 ```
 
 **Use when**:
@@ -110,42 +145,66 @@ for record in reader.iter_records() {
 ### Compression
 
 ```rust
-use lib_bpaf::{compress_paf_with_tracepoints, CompressionStrategy};
+use tpa::{paf_to_tpa, CompressionConfig, CompressionStrategy, CompressionLayer};
 
-// Automatic (default): Analyzes data to choose delta vs raw + varint + zstd
-// - Samples first 1000 records to determine optimal encoding
-// - Handles all tracepoint types automatically
-// - Enables O(1) random tracepoint access
-compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::Automatic(3))?;
+// Automatic (default): samples 10000 records to find best strategy
+paf_to_tpa("alignments.paf", "alignments.tpa", CompressionConfig::new())?;
 
-// ZigzagDelta: Delta + zigzag transform (both values) + varint + zstd
-// - Always uses delta encoding for tracepoints
-// - Works well when values are monotonic or slowly changing
-// - Enables O(1) random tracepoint access
-compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::ZigzagDelta(3))?;
+// Automatic with custom sample size (500 records)
+paf_to_tpa(
+    "alignments.paf",
+    "alignments.tpa",
+    CompressionConfig::new().strategy(CompressionStrategy::Automatic(3, 500)),
+)?;
 
-// Raw: No delta, direct varints + zstd compression
-// - Ideal when deltas are noisy or large
-// - Also enables O(1) random tracepoint access
-compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::Raw(3))?;
+// Automatic with entire file analysis (sample_size = 0)
+paf_to_tpa(
+    "alignments.paf",
+    "alignments.tpa",
+    CompressionConfig::new().strategy(CompressionStrategy::Automatic(3, 0)),
+)?;
+
+// ZigzagDelta: Delta + zigzag transform + varint + zstd
+paf_to_tpa(
+    "alignments.paf",
+    "alignments.tpa",
+    CompressionConfig::new().strategy(CompressionStrategy::ZigzagDelta(3)),
+)?;
+
+// Dual strategy: different strategies for first/second values
+paf_to_tpa(
+    "alignments.paf",
+    "alignments.tpa",
+    CompressionConfig::new()
+        .dual_strategy(CompressionStrategy::Raw(3), CompressionStrategy::TwoDimDelta(3)),
+)?;
+
+// From CIGAR input (converts to tracepoints)
+paf_to_tpa(
+    "alignments.paf",
+    "alignments.tpa",
+    CompressionConfig::new().from_cigar(),
+)?;
 ```
 
 **Strategy guide:**
-- **Automatic (default)**: Best for most use cases, analyzes data to choose Raw or ZigzagDelta
-- **ZigzagDelta**: Use when tracepoint values are mostly increasing (better delta compression)
-- **Raw**: Use when tracepoint values jump frequently and delta encoding increases entropy
+- **Automatic (default)**: Best for most use cases. Parameters: `(level, sample_size)` where sample_size=10000 is default, 0 = analyze entire file
+- **ZigzagDelta**: Use when tracepoint values are mostly increasing
+- **TwoDimDelta**: Best for CIGAR-derived alignments (exploits query/target correlation)
+- **Raw**: Use when tracepoint values jump frequently
+- **Rice/Huffman**: Entropy coding for skewed distributions
 
 ### Index management
 
 ```rust
-use lib_bpaf::{build_index, BpafIndex};
+use tpa::{build_index, TpaIndex};
 
 // Build index for random access
-let index = build_index("alignments.bpaf")?;
-index.save("alignments.bpaf.idx")?;
+let index = build_index("alignments.tpa")?;
+index.save("alignments.tpa.idx")?;
 
 // Load existing index
-let index = BpafIndex::load("alignments.bpaf.idx")?;
+let index = TpaIndex::load("alignments.tpa.idx")?;
 ```
 
 ## Examples
@@ -155,20 +214,20 @@ let index = BpafIndex::load("alignments.bpaf.idx")?;
 cargo build --release --examples
 
 # Show first 5 records
-./target/release/examples/seek_demo alignments.bpaf
+./target/release/examples/seek_demo alignments.tpa
 
 # O(1) random access demo
-./target/release/examples/seek_demo alignments.bpaf 0 100 500 1000
+./target/release/examples/seek_demo alignments.tpa 0 100 500 1000
 
 # Offset-based access demo
-./target/release/examples/offset_demo alignments.bpaf
+./target/release/examples/offset_demo alignments.tpa
 ```
 
 ## Index Format
 
-`.bpaf.idx` file structure:
+`.tpa.idx` file structure:
 ```
-Magic:     BPAI (4 bytes)
+Magic:     TPAI (4 bytes)
 Version:   1 (1 byte)
 Count:     varint (number of records)
 Offsets:   varint[] (byte positions)

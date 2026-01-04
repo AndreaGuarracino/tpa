@@ -5,6 +5,18 @@ use flate2::read::MultiGzDecoder;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 
+#[inline]
+fn write_i32_le<W: Write>(writer: &mut W, value: i32) -> io::Result<()> {
+    writer.write_all(&value.to_le_bytes())
+}
+
+#[inline]
+fn read_i32_le<R: Read>(reader: &mut R) -> io::Result<i32> {
+    let mut buf = [0u8; 4];
+    reader.read_exact(&mut buf)?;
+    Ok(i32::from_le_bytes(buf))
+}
+
 // ============================================================================
 // VARINT ENCODING (LEB128)
 // ============================================================================
@@ -64,16 +76,43 @@ pub fn read_varint<R: Read>(reader: &mut R) -> io::Result<u64> {
 /// using LEB128 variable-length encoding (7 bits per byte + continuation bit).
 #[inline]
 pub fn varint_size(value: u64) -> u64 {
-    if value < (1 << 7) { 1 }
-    else if value < (1 << 14) { 2 }
-    else if value < (1 << 21) { 3 }
-    else if value < (1 << 28) { 4 }
-    else if value < (1 << 35) { 5 }
-    else if value < (1 << 42) { 6 }
-    else if value < (1 << 49) { 7 }
-    else if value < (1 << 56) { 8 }
-    else if value < (1 << 63) { 9 }
-    else { 10 }
+    if value < (1 << 7) {
+        1
+    } else if value < (1 << 14) {
+        2
+    } else if value < (1 << 21) {
+        3
+    } else if value < (1 << 28) {
+        4
+    } else if value < (1 << 35) {
+        5
+    } else if value < (1 << 42) {
+        6
+    } else if value < (1 << 49) {
+        7
+    } else if value < (1 << 56) {
+        8
+    } else if value < (1 << 63) {
+        9
+    } else {
+        10
+    }
+}
+
+// ============================================================================
+// ZIGZAG ENCODING
+// ============================================================================
+
+/// Zigzag encode a signed value to unsigned
+#[inline]
+pub fn encode_zigzag(val: i64) -> u64 {
+    ((val << 1) ^ (val >> 63)) as u64
+}
+
+/// Zigzag decode an unsigned value to signed
+#[inline]
+pub fn decode_zigzag(zigzag: u64) -> i64 {
+    ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64)
 }
 
 // ============================================================================
@@ -90,9 +129,9 @@ pub(crate) fn write_distance<W: Write>(writer: &mut W, distance: &Distance) -> i
             gap_opening,
             gap_extension,
         } => {
-            writer.write_all(&mismatch.to_le_bytes())?;
-            writer.write_all(&gap_opening.to_le_bytes())?;
-            writer.write_all(&gap_extension.to_le_bytes())?;
+            write_i32_le(writer, *mismatch)?;
+            write_i32_le(writer, *gap_opening)?;
+            write_i32_le(writer, *gap_extension)?;
         }
         Distance::GapAffine2p {
             mismatch,
@@ -101,11 +140,11 @@ pub(crate) fn write_distance<W: Write>(writer: &mut W, distance: &Distance) -> i
             gap_opening2,
             gap_extension2,
         } => {
-            writer.write_all(&mismatch.to_le_bytes())?;
-            writer.write_all(&gap_opening1.to_le_bytes())?;
-            writer.write_all(&gap_extension1.to_le_bytes())?;
-            writer.write_all(&gap_opening2.to_le_bytes())?;
-            writer.write_all(&gap_extension2.to_le_bytes())?;
+            write_i32_le(writer, *mismatch)?;
+            write_i32_le(writer, *gap_opening1)?;
+            write_i32_le(writer, *gap_extension1)?;
+            write_i32_le(writer, *gap_opening2)?;
+            write_i32_le(writer, *gap_extension2)?;
         }
     }
     Ok(())
@@ -125,13 +164,9 @@ pub(crate) fn read_distance<R: Read>(reader: &mut R) -> io::Result<Distance> {
             gap_opening,
             gap_extension,
         } => {
-            let mut buf = [0u8; 4];
-            reader.read_exact(&mut buf)?;
-            *mismatch = i32::from_le_bytes(buf);
-            reader.read_exact(&mut buf)?;
-            *gap_opening = i32::from_le_bytes(buf);
-            reader.read_exact(&mut buf)?;
-            *gap_extension = i32::from_le_bytes(buf);
+            *mismatch = read_i32_le(reader)?;
+            *gap_opening = read_i32_le(reader)?;
+            *gap_extension = read_i32_le(reader)?;
         }
         Distance::GapAffine2p {
             mismatch,
@@ -140,20 +175,38 @@ pub(crate) fn read_distance<R: Read>(reader: &mut R) -> io::Result<Distance> {
             gap_opening2,
             gap_extension2,
         } => {
-            let mut buf = [0u8; 4];
-            reader.read_exact(&mut buf)?;
-            *mismatch = i32::from_le_bytes(buf);
-            reader.read_exact(&mut buf)?;
-            *gap_opening1 = i32::from_le_bytes(buf);
-            reader.read_exact(&mut buf)?;
-            *gap_extension1 = i32::from_le_bytes(buf);
-            reader.read_exact(&mut buf)?;
-            *gap_opening2 = i32::from_le_bytes(buf);
-            reader.read_exact(&mut buf)?;
-            *gap_extension2 = i32::from_le_bytes(buf);
+            *mismatch = read_i32_le(reader)?;
+            *gap_opening1 = read_i32_le(reader)?;
+            *gap_extension1 = read_i32_le(reader)?;
+            *gap_opening2 = read_i32_le(reader)?;
+            *gap_extension2 = read_i32_le(reader)?;
         }
     }
     Ok(distance)
+}
+
+// ============================================================================
+// BITMAP ENCODING
+// ============================================================================
+
+/// Pack booleans into bitmap bytes (little-endian bit order)
+#[inline]
+pub(crate) fn pack_bitmap(bits: &[bool]) -> Vec<u8> {
+    let mut bytes = vec![0u8; bits.len().div_ceil(8)];
+    for (i, &bit) in bits.iter().enumerate() {
+        if bit {
+            bytes[i / 8] |= 1 << (i % 8);
+        }
+    }
+    bytes
+}
+
+/// Unpack bitmap bytes into booleans (little-endian bit order)
+#[inline]
+pub(crate) fn unpack_bitmap(bytes: &[u8], count: usize) -> Vec<bool> {
+    (0..count)
+        .map(|i| (bytes[i / 8] >> (i % 8)) & 1 == 1)
+        .collect()
 }
 
 // ============================================================================

@@ -1,9 +1,0 @@
-# Compiled test binaries
-verify_tracepoints
-compression_test
-seek_test
-
-# Test output files
-*.bpaf
-*.bpaf.idx
-*.paf.decomp
