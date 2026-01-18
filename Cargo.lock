@@ -264,7 +264,7 @@ dependencies = [
 [[package]]
 name = "lib_wfa2"
 version = "0.1.0"
-source = "git+https://github.com/AndreaGuarracino/lib_wfa2?rev=63936c6f26cd5a1d19354a880cd788f868e6443c#63936c6f26cd5a1d19354a880cd788f868e6443c"
+source = "git+https://github.com/AndreaGuarracino/lib_wfa2?rev=82e145b222b3503069e54d275bdb272e6d2a96c9#82e145b222b3503069e54d275bdb272e6d2a96c9"
 
 [[package]]
 name = "libc"
@@ -535,7 +535,7 @@ dependencies = [
 [[package]]
 name = "tracepoints"
 version = "0.1.0"
-source = "git+https://github.com/AndreaGuarracino/tracepoints?rev=a3747072e8038dbb67091343e5e1da5a63463e7f#a3747072e8038dbb67091343e5e1da5a63463e7f"
+source = "git+https://github.com/AndreaGuarracino/tracepoints?rev=2babb27559d0005c534b1702748e929977d3dd3a#2babb27559d0005c534b1702748e929977d3dd3a"
 dependencies = [
  "lib_wfa2",
 ]
