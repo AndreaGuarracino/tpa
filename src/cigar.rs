@@ -342,34 +342,13 @@ fn reconstruct_cigar_with_aligner_impl(
 ) -> String {
     match tp {
         TracepointData::Standard(tps) => tracepoints_to_cigar_with_aligner(
-            tps,
-            query_seq,
-            target_seq,
-            0,
-            0,
-            metric,
-            aligner,
-            max_value,
+            tps, query_seq, target_seq, 0, 0, metric, aligner, max_value,
         ),
         TracepointData::Mixed(items) => mixed_tracepoints_to_cigar_with_aligner(
-            items,
-            query_seq,
-            target_seq,
-            0,
-            0,
-            metric,
-            aligner,
-            max_value,
+            items, query_seq, target_seq, 0, 0, metric, aligner, max_value,
         ),
         TracepointData::Variable(tps) => variable_tracepoints_to_cigar_with_aligner(
-            tps,
-            query_seq,
-            target_seq,
-            0,
-            0,
-            metric,
-            aligner,
-            max_value,
+            tps, query_seq, target_seq, 0, 0, metric, aligner, max_value,
         ),
         TracepointData::Fastga(tps) => {
             // FastGA ignores aligner/max_value - uses its own algorithm
