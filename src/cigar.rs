@@ -5,9 +5,9 @@ use lib_wfa2::affine_wavefront::AffineWavefronts;
 use std::error::Error;
 use std::fmt;
 use tracepoints::{
-    mixed_tracepoints_to_cigar, mixed_tracepoints_to_cigar_with_aligner, tracepoints_to_cigar,
-    tracepoints_to_cigar_fastga, tracepoints_to_cigar_with_aligner, variable_tracepoints_to_cigar,
-    variable_tracepoints_to_cigar_with_aligner, ComplexityMetric, TracepointData,
+    mixed_tracepoints_to_cigar_with_aligner, tracepoints_to_cigar_fastga,
+    tracepoints_to_cigar_with_aligner, variable_tracepoints_to_cigar_with_aligner,
+    ComplexityMetric, TracepointData,
 };
 
 /// Error type for CIGAR reconstruction operations
@@ -217,28 +217,19 @@ pub fn reconstruct_cigar(
     spacing: u32,
     complement: bool,
 ) -> String {
-    match tp {
-        TracepointData::Standard(tps) => {
-            tracepoints_to_cigar(tps, query_seq, target_seq, 0, 0, metric, distance)
-        }
-        TracepointData::Mixed(items) => {
-            mixed_tracepoints_to_cigar(items, query_seq, target_seq, 0, 0, metric, distance)
-        }
-        TracepointData::Variable(tps) => {
-            variable_tracepoints_to_cigar(tps, query_seq, target_seq, 0, 0, metric, distance)
-        }
-        TracepointData::Fastga(tps) => {
-            tracepoints_to_cigar_fastga(
-                tps,
-                spacing,
-                query_seq,
-                target_seq,
-                query_offset,
-                target_offset,
-                complement,
-            )
-        }
-    }
+    let mut aligner = distance.create_aligner(None, None);
+    reconstruct_cigar_with_aligner_impl(
+        tp,
+        query_seq,
+        target_seq,
+        query_offset,
+        target_offset,
+        metric,
+        spacing,
+        complement,
+        &mut aligner,
+        None,
+    )
 }
 
 /// Reconstruct a CIGAR string using heuristic mode (WFA2 realignment with band)
@@ -276,7 +267,7 @@ pub fn reconstruct_cigar_with_heuristic(
         return Err(CigarReconstructError::HeuristicNotSupportedForFastGA);
     }
 
-    let mut aligner = distance.create_aligner(None);
+    let mut aligner = distance.create_aligner(None, None);
     Ok(reconstruct_cigar_with_aligner_impl(
         tp,
         query_seq,
@@ -287,8 +278,7 @@ pub fn reconstruct_cigar_with_heuristic(
         spacing,
         complement,
         &mut aligner,
-        true,
-        max_complexity,
+        Some(max_complexity),
     ))
 }
 
@@ -307,11 +297,10 @@ pub fn reconstruct_cigar_with_heuristic(
 /// * `spacing` - Trace spacing (only used for FastGA tracepoints)
 /// * `complement` - Whether the alignment is on reverse complement strand
 /// * `aligner` - Mutable reference to a WFA2 aligner
-/// * `apply_heuristic` - Whether to apply the band heuristic
-/// * `max_complexity` - Maximum complexity value for band heuristic
+/// * `max_value` - Optional max complexity value for banded alignment heuristic
 ///
 /// # Note
-/// For FastGA tracepoints, the aligner and heuristic parameters are ignored.
+/// For FastGA tracepoints, the aligner and max_value parameters are ignored.
 pub fn reconstruct_cigar_with_aligner(
     tp: &TracepointData,
     query_seq: &[u8],
@@ -322,8 +311,7 @@ pub fn reconstruct_cigar_with_aligner(
     spacing: u32,
     complement: bool,
     aligner: &mut AffineWavefronts,
-    apply_heuristic: bool,
-    max_complexity: u32,
+    max_value: Option<u32>,
 ) -> String {
     reconstruct_cigar_with_aligner_impl(
         tp,
@@ -335,8 +323,7 @@ pub fn reconstruct_cigar_with_aligner(
         spacing,
         complement,
         aligner,
-        apply_heuristic,
-        max_complexity,
+        max_value,
     )
 }
 
@@ -351,45 +338,20 @@ fn reconstruct_cigar_with_aligner_impl(
     spacing: u32,
     complement: bool,
     aligner: &mut AffineWavefronts,
-    apply_heuristic: bool,
-    max_complexity: u32,
+    max_value: Option<u32>,
 ) -> String {
     match tp {
         TracepointData::Standard(tps) => tracepoints_to_cigar_with_aligner(
-            tps,
-            query_seq,
-            target_seq,
-            0,
-            0,
-            metric,
-            aligner,
-            apply_heuristic,
-            max_complexity,
+            tps, query_seq, target_seq, 0, 0, metric, aligner, max_value,
         ),
         TracepointData::Mixed(items) => mixed_tracepoints_to_cigar_with_aligner(
-            items,
-            query_seq,
-            target_seq,
-            0,
-            0,
-            metric,
-            aligner,
-            apply_heuristic,
-            max_complexity,
+            items, query_seq, target_seq, 0, 0, metric, aligner, max_value,
         ),
         TracepointData::Variable(tps) => variable_tracepoints_to_cigar_with_aligner(
-            tps,
-            query_seq,
-            target_seq,
-            0,
-            0,
-            metric,
-            aligner,
-            apply_heuristic,
-            max_complexity,
+            tps, query_seq, target_seq, 0, 0, metric, aligner, max_value,
         ),
         TracepointData::Fastga(tps) => {
-            // FastGA ignores aligner/heuristic - uses its own algorithm
+            // FastGA ignores aligner/max_value - uses its own algorithm
             tracepoints_to_cigar_fastga(
                 tps,
                 spacing,

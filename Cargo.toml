@@ -13,10 +13,11 @@ log = "0.4"
 flate2 = "1.1"
 env_logger = "0.11"
 bgzip = "0.3"
-tracepoints = { git = "https://github.com/AndreaGuarracino/tracepoints" }
-lib_wfa2 = { git = "https://github.com/AndreaGuarracino/lib_wfa2" }
 rayon = "1.11"
 noodles = { version = "0.100.0", features = ["bgzf"] }
+
+lib_wfa2 = { git = "https://github.com/AndreaGuarracino/lib_wfa2", rev = "0fe1ebfb7a364226f3d8d7b84b703611168435c6" }
+tracepoints = { git = "https://github.com/AndreaGuarracino/tracepoints", rev = "3d9eba70b098807f3a168771ef419e84a26b0b8f" }
 
 [dev-dependencies]
 rand = "0.8"

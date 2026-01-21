@@ -33,9 +33,7 @@ fn compress_with_layer(data: &[u8], layer: CompressionLayer, level: i32) -> io::
             } // BGZFWriter flushes on drop
             Ok(compressed)
         }
-        CompressionLayer::Nocomp => {
-            Ok(data.to_vec())
-        }
+        CompressionLayer::Nocomp => Ok(data.to_vec()),
     }
 }
 
@@ -1761,7 +1759,11 @@ fn decode_tracepoint_values(
                     if idx >= dict.len() {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("Dictionary index {} out of bounds (size {})", idx, dict.len()),
+                            format!(
+                                "Dictionary index {} out of bounds (size {})",
+                                idx,
+                                dict.len()
+                            ),
                         ));
                     }
                     vals.push(dict[idx]);
@@ -2431,7 +2433,10 @@ mod compression_tests {
         assert_eq!(vals, decoded);
 
         // Verify raw mode was used (mode byte = 0)
-        assert_eq!(buf[0], 0, "Should fall back to raw mode for high cardinality");
+        assert_eq!(
+            buf[0], 0,
+            "Should fall back to raw mode for high cardinality"
+        );
     }
 
     #[test]
@@ -2444,7 +2449,10 @@ mod compression_tests {
         assert_eq!(vals, decoded);
 
         // Verify dictionary mode was used
-        assert_eq!(buf[0], 1, "Should use dictionary mode for exactly 256 unique values");
+        assert_eq!(
+            buf[0], 1,
+            "Should use dictionary mode for exactly 256 unique values"
+        );
         // dict_size should be 0 (meaning 256)
         assert_eq!(buf[1], 0, "Dict size 256 should be stored as 0");
     }

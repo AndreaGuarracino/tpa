@@ -1,7 +1,5 @@
 use crate::binary::{read_record, read_tracepoints, read_tracepoints_at_offset};
-use crate::format::{
-    CompactRecord, CompressionLayer, CompressionStrategy, StringTable, TpaHeader,
-};
+use crate::format::{CompactRecord, CompressionLayer, CompressionStrategy, StringTable, TpaHeader};
 use crate::index::{build_index_all_records, build_index_per_record, IndexType, TpaIndex};
 use crate::utils::read_varint;
 use log::{debug, info};
@@ -448,10 +446,10 @@ impl TpaReader {
             .get_name_and_len(record.query_name_id)
             .ok_or_else(|| err_unknown_name_id("query", record.query_name_id))?;
 
-        let (target_name, target_len) = self
-            .string_table
-            .get_name_and_len(record.target_name_id)
-            .ok_or_else(|| err_unknown_name_id("target", record.target_name_id))?;
+        let (target_name, target_len) =
+            self.string_table
+                .get_name_and_len(record.target_name_id)
+                .ok_or_else(|| err_unknown_name_id("target", record.target_name_id))?;
 
         Ok(AlignmentRecord {
             query_name: query_name.to_string(),
