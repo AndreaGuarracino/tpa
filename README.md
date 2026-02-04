@@ -6,7 +6,8 @@ TracePoint Alignment (TPA) format - binary format for efficient storage and rand
 
 - **O(1) random access**: External index for instant record lookup
 - **Fast varint compression**:
-  - **Automatic (default)**: Samples records and tests every concrete strategy × compression layer per stream (18×3 per stream), then locks in the best first/second pair; configurable sample size (default 10000, 0 = entire file)
+  - **Automatic (default)**: Instant lookup-based strategy selection from tracepoint type and complexity metric — no sampling overhead
+  - **Benchmark**: Exhaustive testing of every strategy × compression layer per stream (18×3 per stream), selects optimal first/second pair; configurable sample size (default 10000, 0 = entire file)
   - **ZigzagDelta**: Delta + zigzag transform + varint + zstd
   - **Raw**: Plain varints + zstd
   - **Rice / Huffman**: Block-local entropy coding over zigzag deltas, byte-aligned for random seeks
@@ -24,9 +25,10 @@ TracePoint Alignment (TPA) format - binary format for efficient storage and rand
 ### Header (metadata + strategy)
 - Magic: `TPA\0` (4 bytes)
 - Version: `1` (1 byte)
-- Strategy bytes (2): bits 7–6 = layer (`0=Zstd, 1=Bgzip, 2=Nocomp`), bits 5–0 = strategy code (`0-17`)
 - Record count: varint
 - String count: varint
+- First strategy+layer: packed byte — bits 7–6 = layer (`0=Zstd, 1=Bgzip, 2=Nocomp`), bits 5–0 = strategy code (`0-17`)
+- Second strategy+layer: packed byte (same format)
 - Tracepoint type: `1` byte
 - Complexity metric: `1` byte
 - Max complexity / spacing: varint
@@ -98,7 +100,7 @@ let mut file = File::open("alignments.tpa")?;
 let offset = 123456;
 let first_strategy = CompressionStrategy::ZigzagDelta(3);
 let second_strategy = CompressionStrategy::ZigzagDelta(3);
-let first_layer = CompressionLayer::Zstd; // or read from TpaafHeader
+let first_layer = CompressionLayer::Zstd; // or read from TpaHeader
 let second_layer = CompressionLayer::Zstd;
 
 // Direct tracepoint decoding - no TpaReader overhead
@@ -147,21 +149,21 @@ for record in reader.iter_records() {
 ```rust
 use tpa::{paf_to_tpa, CompressionConfig, CompressionStrategy, CompressionLayer};
 
-// Automatic (default): samples 10000 records to find best strategy
+// Automatic (default): lookup-based strategy selection
 paf_to_tpa("alignments.paf", "alignments.tpa", CompressionConfig::new())?;
 
-// Automatic with custom sample size (500 records)
+// Benchmark: exhaustive testing with 500-record sample
 paf_to_tpa(
     "alignments.paf",
     "alignments.tpa",
-    CompressionConfig::new().strategy(CompressionStrategy::Automatic(3, 500)),
+    CompressionConfig::new().strategy(CompressionStrategy::Benchmark(3, 500)),
 )?;
 
-// Automatic with entire file analysis (sample_size = 0)
+// Benchmark with entire file analysis (sample_size = 0)
 paf_to_tpa(
     "alignments.paf",
     "alignments.tpa",
-    CompressionConfig::new().strategy(CompressionStrategy::Automatic(3, 0)),
+    CompressionConfig::new().strategy(CompressionStrategy::Benchmark(3, 0)),
 )?;
 
 // ZigzagDelta: Delta + zigzag transform + varint + zstd
@@ -188,7 +190,8 @@ paf_to_tpa(
 ```
 
 **Strategy guide:**
-- **Automatic (default)**: Best for most use cases. Parameters: `(level, sample_size)` where sample_size=10000 is default, 0 = analyze entire file
+- **Automatic (default)**: Selection based on tracepoint type and complexity metric. Parameter: `(level)`. Best for most use cases
+- **Benchmark**: Exhaustive testing of all strategy×layer combinations. Parameters: `(level, sample_size)` where sample_size=10000 is default, 0 = analyze entire file
 - **ZigzagDelta**: Use when tracepoint values are mostly increasing
 - **TwoDimDelta**: Best for CIGAR-derived alignments (exploits query/target correlation)
 - **Raw**: Use when tracepoint values jump frequently
