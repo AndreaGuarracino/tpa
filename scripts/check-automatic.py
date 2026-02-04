@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Check whether 'automatic' mode selected the winning strategy pair per dataset.
+Check whether 'automatic' or 'benchmark' mode selected the winning strategy pair per dataset.
 
 Usage:
     ./test/check-automatic.py [all_results.tsv]
@@ -58,7 +58,10 @@ def main():
             engine="python",
             index_col=False,
         )
-    df['is_auto'] = df['compression_strategy'].str.startswith('automatic')
+    df['is_auto'] = (
+        df['compression_strategy'].str.startswith('automatic')
+        | df['compression_strategy'].str.startswith('benchmark')
+    )
     has_layer_cols = all(col in df.columns for col in ('layer_first', 'layer_second'))
 
     metrics = ["ratio"]  # ratio best
@@ -86,7 +89,7 @@ def main():
                 f" ({metric}={best['ratio_tp_to_tpa']:.3f}; seek={best['seek_mode_b_avg_us']:.2f} μs)"
             )
             if autos.empty:
-                print("  no automatic rows")
+                print("  no automatic/benchmark rows")
                 continue
 
             for auto_name, group in autos.groupby('compression_strategy'):

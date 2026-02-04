@@ -24,7 +24,7 @@ set -e
 # OPTIONAL:
 #   --metrics    - Space-separated list of complexity metrics (default: edit-distance)
 #                  Note: Ignored for fastga tracepoint type
-#   --auto ROWS  - Only test automatic mode with ROWS sample size (0 = full file)
+#   --auto ROWS  - Only test benchmark mode with ROWS sample size (0 = full file)
 #
 # EXAMPLES:
 #   # Create a file list
@@ -44,11 +44,11 @@ set -e
 #   CIGZIP=/path/to/cigzip/target/release/cigzip ./run_all_tests.sh 100 /tmp/results 4 \
 #       --files files.txt --types standard --metrics edit-distance diagonal-distance
 #
-#   # Test automatic mode only (10000-record sampling)
+#   # Test benchmark mode only (10000-record sampling)
 #   CIGZIP_DIR=/path/to/cigzip ./run_all_tests.sh 1000 /tmp/auto 4 \
 #       --files files.txt --types standard --auto 10000
 #
-#   # Test automatic mode with full file analysis
+#   # Test benchmark mode with full file analysis
 #   CIGZIP_DIR=/path/to/cigzip ./run_all_tests.sh 0 /tmp/full 4 \
 #       --files files.txt --types standard --auto 0
 #
@@ -93,7 +93,7 @@ usage() {
     echo ""
     echo "Optional flags:"
     echo "  --metrics    - Space-separated: edit-distance (default), diagonal-distance"
-    echo "  --auto ROWS  - Only test automatic mode with ROWS sample size (0=full file)"
+    echo "  --auto ROWS  - Only test benchmark mode with ROWS sample size (0=full file)"
     echo ""
     echo "Tracepoint types:"
     echo "  standard  - Standard tracepoints (pairs of values)"
@@ -272,12 +272,12 @@ echo "  Tracepoint types: ${TP_TYPES[*]}"
 echo "  Complexity metrics: ${COMPLEXITY_METRICS[*]}"
 if [ -n "$AUTO_ROWS" ]; then
     if [ "$AUTO_ROWS" -eq 0 ]; then
-        echo "  Automatic mode:   full file analysis"
+        echo "  Benchmark mode:   full file analysis"
     else
-        echo "  Automatic mode:   ${AUTO_ROWS}-record sampling"
+        echo "  Benchmark mode:   ${AUTO_ROWS}-record sampling"
     fi
 else
-    echo "  Automatic mode:   disabled (testing all strategies)"
+    echo "  Benchmark mode:   disabled (testing all strategies)"
 fi
 echo "  Master TSV:       $MASTER_TSV"
 echo ""

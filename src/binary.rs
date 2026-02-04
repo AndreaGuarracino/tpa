@@ -4,7 +4,7 @@ use log::info;
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
-use tracepoints::{MixedRepresentation, TracepointData, TracepointType};
+use tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 
 use crate::format::*;
 use crate::utils::*;
@@ -292,7 +292,7 @@ impl StrategyAnalyzer {
             .unwrap();
 
         info!(
-            "Automatic: {} [{}] → {} [{}]",
+            "Benchmark: {} [{}] → {} [{}]",
             first_best.0,
             first_best.1.as_str(),
             second_best.0,
@@ -300,6 +300,55 @@ impl StrategyAnalyzer {
         );
 
         (first_best.0, second_best.0, first_best.1, second_best.1)
+    }
+}
+
+/// Automatic strategy selection based on tracepoint type and complexity metric.
+///
+/// Returns (first_strategy, first_layer, second_strategy, second_layer).
+/// The choices follow from structural properties of each segmentation algorithm:
+/// - Edit-distance: right-skewed segment lengths → Rice coding for first stream
+/// - Diagonal-distance: fewer segments per record → Raw varint (Rice overhead too high)
+/// - Fastga (FL-TP): small edit distances → Simple-8b for first stream
+/// - Second stream: query/target advances are correlated → TwoDimDelta (except FL-TP)
+pub(crate) fn automatic_select(
+    tp_type: TracepointType,
+    complexity_metric: ComplexityMetric,
+    level: i32,
+) -> (
+    CompressionStrategy,
+    CompressionStrategy,
+    CompressionLayer,
+    CompressionLayer,
+) {
+    let nocomp = CompressionLayer::Nocomp;
+    match tp_type {
+        TracepointType::Standard => match complexity_metric {
+            ComplexityMetric::DiagonalDistance => (
+                CompressionStrategy::Raw(level),
+                CompressionStrategy::TwoDimDelta(level),
+                nocomp,
+                nocomp,
+            ),
+            ComplexityMetric::EditDistance => (
+                CompressionStrategy::Rice(level),
+                CompressionStrategy::TwoDimDelta(level),
+                nocomp,
+                nocomp,
+            ),
+        },
+        TracepointType::Fastga => (
+            CompressionStrategy::Simple8bFull(level),
+            CompressionStrategy::Raw(level),
+            nocomp,
+            nocomp,
+        ),
+        TracepointType::Variable | TracepointType::Mixed => (
+            CompressionStrategy::ZigzagDelta(level),
+            CompressionStrategy::TwoDimDelta(level),
+            nocomp,
+            nocomp,
+        ),
     }
 }
 
@@ -330,7 +379,7 @@ fn strategy_to_rank(strategy: &CompressionStrategy) -> u8 {
         CompressionStrategy::Cascaded(_) => 15,
         CompressionStrategy::SelectiveRLE(_) => 16,
         CompressionStrategy::LZ77(_) => 17,
-        CompressionStrategy::Automatic(_, _) => 255,
+        CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _) => 255,
     }
 }
 
@@ -402,10 +451,12 @@ fn process_stream_states<F>(
 
 fn encode_first_stream(values: &[u64], strategy: &CompressionStrategy) -> io::Result<Vec<u8>> {
     match strategy {
-        CompressionStrategy::Automatic(_, _) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Automatic strategy must be resolved before encoding",
-        )),
+        CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _) => {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Automatic/Benchmark must be resolved before encoding",
+            ))
+        }
         _ => encode_tracepoint_values(values, *strategy),
     }
 }
@@ -416,10 +467,12 @@ fn encode_second_stream(
     strategy: &CompressionStrategy,
 ) -> io::Result<Vec<u8>> {
     match strategy {
-        CompressionStrategy::Automatic(_, _) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Automatic strategy must be resolved before encoding",
-        )),
+        CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _) => {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Automatic/Benchmark must be resolved before encoding",
+            ))
+        }
         CompressionStrategy::TwoDimDelta(_) => {
             encode_2d_delta_second_values(first_vals, second_vals)
         }
@@ -1538,10 +1591,10 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
             // LZ77-style sequence matching: find repeated sequences
             buf = lz77_encode(vals)?;
         }
-        CompressionStrategy::Automatic(_, _) => {
+        CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Automatic strategy must be resolved before encoding",
+                "Automatic/Benchmark must be resolved before encoding",
             ));
         }
     }
@@ -1849,10 +1902,12 @@ fn decode_tracepoint_values(
             // LZ77-style sequence matching decode
             lz77_decode(buf, num_items)
         }
-        CompressionStrategy::Automatic(_, _) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Automatic strategy must be resolved before decoding",
-        )),
+        CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _) => {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Automatic/Benchmark must be resolved before decoding",
+            ))
+        }
     }
 }
 
@@ -1962,10 +2017,10 @@ pub(crate) fn decode_standard_tracepoints<R: Read>(
             }
             vals
         }
-        CompressionStrategy::Automatic(_, _) => {
+        CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Automatic strategy must be resolved before decoding",
+                "Automatic/Benchmark must be resolved before decoding",
             ))
         }
         other => decode_tracepoint_values(&second_buf, num_items, other)?,

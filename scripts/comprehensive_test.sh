@@ -148,7 +148,7 @@ if [ -z "$INPUT_PAF" ] || [ ! -f "$INPUT_PAF" ]; then
     echo "Test Modes:"
     echo "  single (default) - Test each strategy symmetrically (first==second)"
     echo "  dual             - Test all strategy combinations (no automatic)"
-    echo "  auto:ROWS        - Test automatic,3,N (auto-selects best dual encoding)"
+    echo "  auto:ROWS        - Test benchmark,3,N (brute-force best dual encoding)"
     echo ""
     echo "Complexity Metrics (comma-separated):"
     echo "  edit-distance     - Edit distance metric (default)"
@@ -817,12 +817,12 @@ for CONFIG in "${ENCODING_CONFIGS[@]}"; do
     elif [[ "$TEST_MODE" == auto:* ]]; then
         # Extract sample size from TEST_MODE (format: auto:ROWS)
         AUTO_SAMPLE_SIZE="${TEST_MODE#auto:}"
-        AUTO_STRATEGY="automatic,3,${AUTO_SAMPLE_SIZE}"
+        AUTO_STRATEGY="benchmark,3,${AUTO_SAMPLE_SIZE}"
 
         if [ "$AUTO_SAMPLE_SIZE" -eq 0 ]; then
-            echo "Testing automatic mode with full file analysis..."
+            echo "Testing benchmark mode with full file analysis..."
         else
-            echo "Testing automatic mode with ${AUTO_SAMPLE_SIZE}-record sampling..."
+            echo "Testing benchmark mode with ${AUTO_SAMPLE_SIZE}-record sampling..."
         fi
 
         echo ""
@@ -842,7 +842,7 @@ for CONFIG in "${ENCODING_CONFIGS[@]}"; do
         # Output TSV row for the automatic run (per-record mode)
         output_tsv_row "$CONFIG" "$AUTO_STRATEGY" "$AUTO_STRATEGY" 0
         echo ""
-        echo "Completed automatic strategy test (per-record mode)"
+        echo "Completed benchmark strategy test (per-record mode)"
 
         # Test all-records mode (--all-records flag, header/string table plain, records BGZIP-compressed)
         echo ""

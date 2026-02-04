@@ -59,7 +59,9 @@ pub use noodles::bgzf;
 // Re-export utility functions for external tools
 pub use utils::{read_varint, varint_size};
 
-use crate::binary::{decompress_varint, write_paf_line_with_tracepoints, StrategyAnalyzer};
+use crate::binary::{
+    automatic_select, decompress_varint, write_paf_line_with_tracepoints, StrategyAnalyzer,
+};
 
 use crate::utils::open_paf_reader;
 
@@ -96,11 +98,17 @@ pub fn paf_to_tpa(
     let mut string_table = StringTable::new();
     let mut record_count = 0u64;
 
+    // Check if either strategy uses Automatic (lookup) mode
+    let uses_automatic = matches!(
+        (&config.first_strategy, &config.second_strategy),
+        (CompressionStrategy::Automatic(_), _) | (_, CompressionStrategy::Automatic(_))
+    );
+
     // For all-records mode, we skip layer testing since layers are not used
     let test_layers = !config.all_records;
     let mut analyzer = match (&config.first_strategy, &config.second_strategy) {
-        (CompressionStrategy::Automatic(level, sample_size), _)
-        | (_, CompressionStrategy::Automatic(level, sample_size)) => {
+        (CompressionStrategy::Benchmark(level, sample_size), _)
+        | (_, CompressionStrategy::Benchmark(level, sample_size)) => {
             Some(StrategyAnalyzer::new(*level, *sample_size, test_layers))
         }
         _ => None,
@@ -149,15 +157,26 @@ pub fn paf_to_tpa(
         ));
     }
 
-    // Choose strategy (automatic or explicit)
-    let (chosen_first, chosen_second, first_layer, second_layer) = match analyzer {
-        Some(analyzer) => analyzer.select_best(),
-        None => (
-            config.first_strategy,
-            config.second_strategy,
-            config.first_layer,
-            config.second_layer,
-        ),
+    // Choose strategy: Automatic (lookup), Benchmark (brute-force), or explicit
+    let (chosen_first, chosen_second, first_layer, second_layer) = if uses_automatic {
+        let level = config.first_strategy.zstd_level();
+        let result =
+            automatic_select(config.tp_type, config.complexity_metric, level);
+        info!(
+            "Automatic: {} [{}] → {} [{}]",
+            result.0, result.2.as_str(), result.1, result.3.as_str()
+        );
+        result
+    } else {
+        match analyzer {
+            Some(analyzer) => analyzer.select_best(),
+            None => (
+                config.first_strategy,
+                config.second_strategy,
+                config.first_layer,
+                config.second_layer,
+            ),
+        }
     };
 
     // Pass 2: Write Header → StringTable → Records → Footer
