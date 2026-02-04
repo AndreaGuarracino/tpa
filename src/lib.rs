@@ -157,7 +157,7 @@ pub fn paf_to_tpa(
         ));
     }
 
-    // Choose strategy: Automatic (lookup), Benchmark (brute-force), or explicit
+    // Choose strategy: Automatic, Benchmark, or explicit
     let (chosen_first, chosen_second, first_layer, second_layer) = if uses_automatic {
         let level = config.first_strategy.zstd_level();
         let result =

@@ -18,7 +18,7 @@ set -e # Exit on error
 # TEST MODES:
 #   single    - Test each strategy symmetrically (first==second) [default]
 #   dual      - Test all first×second strategy combinations
-#   auto:N    - Only test automatic,3,N meta-strategy (auto-selects best dual encoding)
+#   auto:N    - Only test benchmark,3,N (auto-selects best dual encoding)
 #
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -148,7 +148,7 @@ if [ -z "$INPUT_PAF" ] || [ ! -f "$INPUT_PAF" ]; then
     echo "Test Modes:"
     echo "  single (default) - Test each strategy symmetrically (first==second)"
     echo "  dual             - Test all strategy combinations (no automatic)"
-    echo "  auto:ROWS        - Test benchmark,3,N (brute-force best dual encoding)"
+    echo "  auto:ROWS        - Test benchmark,3,N (best dual encoding)"
     echo ""
     echo "Complexity Metrics (comma-separated):"
     echo "  edit-distance     - Edit distance metric (default)"
@@ -826,7 +826,7 @@ for CONFIG in "${ENCODING_CONFIGS[@]}"; do
         fi
 
         echo ""
-        echo "Testing ${AUTO_STRATEGY} meta-strategy (selects best per stream from $((${#BASE_STRATEGIES[@]} * ${#LAYER_SUFFIXES[@]})) combinations)..."
+        echo "Testing ${AUTO_STRATEGY} (selects best per stream from $((${#BASE_STRATEGIES[@]} * ${#LAYER_SUFFIXES[@]})) combinations)..."
         test_configuration "$CONFIG" "$AUTO_STRATEGY"
 
         # Extract the strategies that automatic mode selected from the TPA header

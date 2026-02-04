@@ -222,8 +222,8 @@ pub enum CompressionStrategy {
     /// - Parameter: zstd_level (used for concrete strategy construction)
     /// - No sampling needed; resolves instantly
     Automatic(i32),
-    /// Benchmark-based strategy selection (brute-force)
-    /// - Tests every concrete strategy × layer on sampled records
+    /// Benchmark-based strategy selection
+    /// - Tests every encoding strategy × layer on sampled records
     /// - Parameters: (zstd_level, sample_size) where 0 = entire file
     Benchmark(i32, usize),
     /// Raw encoding (no preprocessing) + Zstd
