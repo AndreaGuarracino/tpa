@@ -892,6 +892,102 @@ pub(crate) fn skip_record_sequential<R: Read>(
     Ok(())
 }
 
+/// Read record header fields (coordinates, strand, mapq) and skip tracepoints+tags.
+/// Advances the stream to the start of the next record. Only requires `Read` (no `Seek`),
+/// making it suitable for sequential streaming over both File and BGZF readers.
+pub(crate) fn read_record_metadata<R: Read>(
+    reader: &mut R,
+    tp_type: TracepointType,
+) -> io::Result<CompactRecord> {
+    // Helper to skip n bytes by reading into sink
+    fn skip_bytes<R: Read>(reader: &mut R, n: usize) -> io::Result<()> {
+        io::copy(&mut reader.take(n as u64), &mut io::sink())?;
+        Ok(())
+    }
+
+    // Helper to read length-prefixed block and skip its data
+    fn skip_block<R: Read>(reader: &mut R) -> io::Result<()> {
+        let len = read_varint(reader)? as usize;
+        skip_bytes(reader, len)
+    }
+
+    // READ header fields
+    let query_name_id = read_varint(reader)?;
+    let query_start = read_varint(reader)?;
+    let query_end = read_varint(reader)?;
+    let mut strand_buf = [0u8; 1];
+    reader.read_exact(&mut strand_buf)?;
+    let strand = strand_buf[0] as char;
+    let target_name_id = read_varint(reader)?;
+    let target_start = read_varint(reader)?;
+    let target_end = read_varint(reader)?;
+    let residue_matches = read_varint(reader)?;
+    let alignment_block_len = read_varint(reader)?;
+    let mut mapq_buf = [0u8; 1];
+    reader.read_exact(&mut mapq_buf)?;
+    let mapping_quality = mapq_buf[0];
+
+    // SKIP tracepoints (same logic as skip_record_sequential)
+    let _num_items = read_varint(reader)?;
+    match tp_type {
+        TracepointType::Standard | TracepointType::Fastga => {
+            skip_block(reader)?;
+            skip_block(reader)?;
+        }
+        TracepointType::Variable => {
+            skip_block(reader)?; // presence bitmap
+            skip_block(reader)?; // first values
+            skip_block(reader)?; // second values
+        }
+        TracepointType::Mixed => {
+            skip_block(reader)?; // type bitmap
+            skip_block(reader)?; // tp first values
+            skip_block(reader)?; // tp second values
+            skip_block(reader)?; // cigar lengths
+            skip_block(reader)?; // cigar ops
+        }
+    }
+
+    // SKIP tags
+    let num_tags = read_varint(reader)? as usize;
+    for _ in 0..num_tags {
+        skip_bytes(reader, 2)?; // key
+        let mut tag_type = [0u8; 1];
+        reader.read_exact(&mut tag_type)?;
+        match tag_type[0] {
+            b'i' | b'f' => skip_bytes(reader, 4)?,
+            b'Z' => {
+                let len = read_varint(reader)? as usize;
+                skip_bytes(reader, len)?;
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Invalid tag type: '{}' (byte: {})",
+                        tag_type[0] as char, tag_type[0]
+                    ),
+                ))
+            }
+        }
+    }
+
+    Ok(CompactRecord {
+        query_name_id,
+        query_start,
+        query_end,
+        strand,
+        target_name_id,
+        target_start,
+        target_end,
+        residue_matches,
+        alignment_block_len,
+        mapping_quality,
+        tracepoints: TracepointData::Standard(Vec::new()),
+        tags: Vec::new(),
+    })
+}
+
 // ============================================================================
 // BITSTREAM HELPERS
 // ============================================================================

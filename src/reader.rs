@@ -1,4 +1,4 @@
-use crate::binary::{read_record, read_tracepoints, read_tracepoints_at_offset};
+use crate::binary::{read_record, read_record_metadata, read_tracepoints, read_tracepoints_at_offset};
 use crate::format::{CompactRecord, CompressionLayer, CompressionStrategy, StringTable, TpaHeader};
 use crate::index::{build_index_all_records, build_index_per_record, IndexType, TpaIndex};
 use crate::utils::read_varint;
@@ -6,6 +6,7 @@ use log::{debug, info};
 use noodles::bgzf;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 
@@ -141,7 +142,7 @@ impl TpaReader {
             header,
             string_table,
             string_table_pos,
-            tpa_path: None, // Not needed for per-record mode
+            tpa_path: Some(tpa_path.to_string()),
             bgzf_section_start: 0,
         })
     }
@@ -204,7 +205,7 @@ impl TpaReader {
 
         // Create BGZF reader starting at records section
         file.seek(SeekFrom::Start(bgzf_start))?;
-        let buf_reader = BufReader::new(file);
+        let buf_reader = BufReader::with_capacity(131072, file);
         let bgzf_reader = bgzf::io::Reader::new(buf_reader);
 
         let string_table = StringTable::new();
@@ -430,6 +431,62 @@ impl TpaReader {
             reader: self,
             current_id: 0,
         }
+    }
+
+    /// Iterator over all record metadata (header fields only, skips tracepoints+tags).
+    /// Opens a fresh reader and reads sequentially — zero seeks during iteration.
+    /// For all-records mode with threads > 1, uses multithreaded BGZF decompression.
+    /// Much faster than iter_compact_records() when only coordinates are needed.
+    pub fn iter_record_metadata(&self, threads: usize) -> io::Result<StreamingMetadataIterator> {
+        let num_records = self.header.num_records();
+        let tp_type = self.header.tracepoint_type;
+
+        if num_records == 0 {
+            return Ok(StreamingMetadataIterator {
+                inner: StreamingReaderInner::Plain(BufReader::new(File::open("/dev/null")?)),
+                remaining: 0,
+                tp_type,
+            });
+        }
+
+        let tpa_path = self
+            .tpa_path
+            .as_deref()
+            .ok_or_else(|| io::Error::other("File path not available for streaming iterator"))?;
+
+        let inner = if self.is_all_records_mode() {
+            let mut file = File::open(tpa_path)?;
+            file.seek(SeekFrom::Start(self.bgzf_section_start))?;
+
+            if threads > 1 {
+                if let Some(nz) = NonZeroUsize::new(threads) {
+                    StreamingReaderInner::MultithreadedBgzf(
+                        bgzf::io::MultithreadedReader::with_worker_count(nz, file),
+                    )
+                } else {
+                    let buf_reader = BufReader::with_capacity(131072, file);
+                    StreamingReaderInner::Bgzf(bgzf::io::Reader::new(buf_reader))
+                }
+            } else {
+                let buf_reader = BufReader::with_capacity(131072, file);
+                StreamingReaderInner::Bgzf(bgzf::io::Reader::new(buf_reader))
+            }
+        } else {
+            // Per-record mode: plain file, seek to first record
+            let mut file = File::open(tpa_path)?;
+            let first_pos = self
+                .index
+                .get_position(0)
+                .ok_or_else(|| err_out_of_bounds(0))?;
+            file.seek(SeekFrom::Start(first_pos))?;
+            StreamingReaderInner::Plain(BufReader::with_capacity(131072, file))
+        };
+
+        Ok(StreamingMetadataIterator {
+            inner,
+            remaining: num_records,
+            tp_type,
+        })
     }
 
     /// Get a fully alignment record
@@ -678,6 +735,41 @@ impl<'a> Iterator for RecordIterator<'a> {
         let result = self.reader.get_compact_record(self.current_id);
         self.current_id += 1;
         Some(result)
+    }
+}
+
+/// Reader enum for streaming metadata iteration (owns its reader).
+enum StreamingReaderInner {
+    Plain(BufReader<File>),
+    Bgzf(bgzf::io::Reader<BufReader<File>>),
+    MultithreadedBgzf(bgzf::io::MultithreadedReader<File>),
+}
+
+impl Read for StreamingReaderInner {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            StreamingReaderInner::Plain(r) => r.read(buf),
+            StreamingReaderInner::Bgzf(r) => r.read(buf),
+            StreamingReaderInner::MultithreadedBgzf(r) => r.read(buf),
+        }
+    }
+}
+
+pub struct StreamingMetadataIterator {
+    inner: StreamingReaderInner,
+    remaining: u64,
+    tp_type: TracepointType,
+}
+
+impl Iterator for StreamingMetadataIterator {
+    type Item = io::Result<CompactRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        Some(read_record_metadata(&mut self.inner, self.tp_type))
     }
 }
 

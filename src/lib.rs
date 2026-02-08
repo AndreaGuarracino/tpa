@@ -41,7 +41,7 @@ pub use reader::{
     read_mixed_tracepoints_at_offset, read_mixed_tracepoints_at_vpos,
     read_standard_tracepoints_at_offset_with_strategies, read_standard_tracepoints_at_vpos,
     read_variable_tracepoints_at_offset, read_variable_tracepoints_at_vpos, AlignmentRecord,
-    AlignmentRecordIterator, RecordIterator, TpaReader,
+    AlignmentRecordIterator, StreamingMetadataIterator, RecordIterator, TpaReader,
 };
 
 // Re-export cigar module types and functions
