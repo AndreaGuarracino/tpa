@@ -5,13 +5,11 @@ TracePoint Alignment (TPA) format - binary format for efficient storage and rand
 ## Features
 
 - **O(1) random access**: External index for instant record lookup
-- **Fast varint compression**:
+- **Compression modes**:
   - **Automatic (default)**: Instant lookup-based strategy selection from tracepoint type and complexity metric — no sampling overhead
-  - **Benchmark**: Exhaustive testing of every strategy × compression layer per stream (18×3 per stream), selects optimal first/second pair; configurable sample size (default 10000, 0 = entire file)
-  - **ZigzagDelta**: Delta + zigzag transform + varint + zstd
-  - **Raw**: Plain varints + zstd
-  - **Rice / Huffman**: Block-local entropy coding over zigzag deltas, byte-aligned for random seeks
-- **Tracepoint support**: Standard, Mixed, Variable, and FastGA representations
+  - **Benchmark**: Exhaustive testing of all strategy × layer combinations on a sample; picks the smallest
+  - **Manual**: Specify an explicit strategy pair for first/second value streams
+- **Tracepoint support**: Standard and FastGA representations
 - **String deduplication**: Shared sequence name table
 - **Byte-aligned encoding**: Enables extremely fast tracepoint extraction
 - **BGZIP all-records mode**: Optional whole-file BGZIP wrapping for better cross-record compression
@@ -78,8 +76,7 @@ let (tracepoints, _, _) = reader.get_tracepoints(1000)?;
 match &tracepoints {
     TracepointData::Standard(tps) => println!("{} tracepoints", tps.len()),
     TracepointData::Fastga(tps) => println!("{} FastGA traces", tps.len()),
-    TracepointData::Variable(tps) => println!("{} variable segments", tps.len()),
-    TracepointData::Mixed(items) => println!("{} mixed items", items.len()),
+    _ => {}
 }
 ```
 
@@ -103,7 +100,7 @@ let tps = read_standard_tracepoints_at_offset_with_strategies(
     CompressionLayer::Zstd,
     CompressionLayer::Zstd,
 )?;
-// Also available: read_variable_tracepoints_at_offset, read_mixed_tracepoints_at_offset
+// Also available: read_standard_tracepoints_at_offset (without strategy parameters)
 ```
 
 Use when you have pre-computed offsets from the index and need tracepoints in tight loops.
@@ -180,10 +177,10 @@ paf_to_tpa(
 ### Index management
 
 ```rust
-use tpa::{build_index, TpaIndex};
+use tpa::{build_index_per_record, TpaIndex};
 
 // Build index for random access
-let index = build_index("alignments.tpa")?;
+let index = build_index_per_record("alignments.tpa")?;
 index.save("alignments.tpa.idx")?;
 
 // Load existing index
