@@ -2,32 +2,11 @@
 
 use crate::Distance;
 use lib_wfa2::affine_wavefront::AffineWavefronts;
-use std::error::Error;
-use std::fmt;
 use tracepoints::{
-    mixed_tracepoints_to_cigar_with_aligner, tracepoints_to_cigar_fastga,
+    mixed_tracepoints_to_cigar_with_aligner, tracepoints_to_cigar_fastga_with_aligner,
     tracepoints_to_cigar_with_aligner, variable_tracepoints_to_cigar_with_aligner,
     ComplexityMetric, TracepointData,
 };
-
-/// Error type for CIGAR reconstruction operations
-#[derive(Debug, Clone)]
-pub enum CigarReconstructError {
-    /// Heuristic mode is not supported for FastGA tracepoints
-    HeuristicNotSupportedForFastGA,
-}
-
-impl fmt::Display for CigarReconstructError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CigarReconstructError::HeuristicNotSupportedForFastGA => {
-                write!(f, "Heuristic mode is not supported for FastGA tracepoints")
-            }
-        }
-    }
-}
-
-impl Error for CigarReconstructError {}
 
 /// Statistics extracted from a CIGAR string
 ///
@@ -248,9 +227,6 @@ pub fn reconstruct_cigar(
 /// * `spacing` - Trace spacing (only used for FastGA tracepoints)
 /// * `complement` - Whether the alignment is on reverse complement strand
 /// * `max_complexity` - Maximum complexity value for band heuristic
-///
-/// # Errors
-/// Returns `CigarReconstructError::HeuristicNotSupportedForFastGA` if called with FastGA data
 pub fn reconstruct_cigar_with_heuristic(
     tp: &TracepointData,
     query_seq: &[u8],
@@ -262,13 +238,9 @@ pub fn reconstruct_cigar_with_heuristic(
     spacing: u32,
     complement: bool,
     max_complexity: u32,
-) -> Result<String, CigarReconstructError> {
-    if matches!(tp, TracepointData::Fastga(_)) {
-        return Err(CigarReconstructError::HeuristicNotSupportedForFastGA);
-    }
-
+) -> String {
     let mut aligner = distance.create_aligner(None, None);
-    Ok(reconstruct_cigar_with_aligner_impl(
+    reconstruct_cigar_with_aligner_impl(
         tp,
         query_seq,
         target_seq,
@@ -279,7 +251,7 @@ pub fn reconstruct_cigar_with_heuristic(
         complement,
         &mut aligner,
         Some(max_complexity),
-    ))
+    )
 }
 
 /// Reconstruct a CIGAR string using a caller-provided aligner
@@ -299,8 +271,6 @@ pub fn reconstruct_cigar_with_heuristic(
 /// * `aligner` - Mutable reference to a WFA2 aligner
 /// * `max_value` - Optional max complexity value for banded alignment heuristic
 ///
-/// # Note
-/// For FastGA tracepoints, the aligner and max_value parameters are ignored.
 pub fn reconstruct_cigar_with_aligner(
     tp: &TracepointData,
     query_seq: &[u8],
@@ -350,18 +320,17 @@ fn reconstruct_cigar_with_aligner_impl(
         TracepointData::Variable(tps) => variable_tracepoints_to_cigar_with_aligner(
             tps, query_seq, target_seq, 0, 0, metric, aligner, max_value,
         ),
-        TracepointData::Fastga(tps) => {
-            // FastGA ignores aligner/max_value - uses its own algorithm
-            tracepoints_to_cigar_fastga(
-                tps,
-                spacing,
-                query_seq,
-                target_seq,
-                query_offset,
-                target_offset,
-                complement,
-            )
-        }
+        TracepointData::Fastga(tps) => tracepoints_to_cigar_fastga_with_aligner(
+            tps,
+            spacing,
+            query_seq,
+            target_seq,
+            query_offset,
+            target_offset,
+            complement,
+            aligner,
+            max_value.is_some(),
+        ),
     }
 }
 
