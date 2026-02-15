@@ -47,7 +47,7 @@ pub use reader::{
 // Re-export cigar module types and functions
 pub use cigar::{
     calculate_alignment_score, reconstruct_cigar, reconstruct_cigar_with_aligner,
-    reconstruct_cigar_with_heuristic, CigarReconstructError, CigarStats,
+    reconstruct_cigar_with_heuristic, CigarStats,
 };
 
 // Re-export aligner type for reconstruct_cigar_with_aligner API
