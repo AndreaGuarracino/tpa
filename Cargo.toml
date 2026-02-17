@@ -2,7 +2,7 @@
 name = "tpa"
 version = "0.1.0"
 edition = "2021"
-authors = ["Andrea Guarracino <aguarra1@uthsc.edu>"]
+authors = ["Andrea Guarracino <aguarracino@tgen.org>"]
 description = "TracePoint Alignment (TPA) format for efficient storage and random access of sequence alignments with tracepoints"
 license = "MIT"
 repository = "https://github.com/AndreaGuarracino/tpa"
