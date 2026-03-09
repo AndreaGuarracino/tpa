@@ -1,4 +1,6 @@
-use crate::binary::{read_record, read_record_metadata, read_tracepoints, read_tracepoints_at_offset};
+use crate::binary::{
+    read_record, read_record_metadata, read_tracepoints, read_tracepoints_at_offset,
+};
 use crate::format::{CompactRecord, CompressionLayer, CompressionStrategy, StringTable, TpaHeader};
 use crate::index::{build_index_all_records, build_index_per_record, IndexType, TpaIndex};
 use crate::utils::read_varint;
@@ -81,6 +83,51 @@ impl TpaReader {
             Self::open_all_records_mode(tpa_path, file, header)
         } else {
             Self::open_per_record_mode(tpa_path, file, header)
+        }
+    }
+
+    /// Streaming open: reads header and string table, computes BGZF section start,
+    /// but does NOT build or load the per-record index.
+    /// Supports `iter_record_metadata()` and `string_table()` but NOT random access
+    /// (`get_compact_record()` will fail).
+    /// Use this when you only need to stream all records sequentially.
+    pub fn new_streaming(tpa_path: &str) -> io::Result<Self> {
+        let mut file = File::open(tpa_path)?;
+        let header = TpaHeader::read(&mut file)?;
+        let string_table_pos = file.stream_position()?;
+
+        // Read string table to advance past it
+        let string_table = StringTable::read(&mut file, header.num_strings())?;
+
+        if header.all_records() {
+            // BGZF section starts right after string table
+            let bgzf_section_start = file.stream_position()?;
+
+            Ok(Self {
+                file: None,
+                bgzf_reader: None, // No BGZF reader needed — iter_record_metadata opens its own
+                index: TpaIndex::empty(),
+                header,
+                string_table,
+                string_table_pos,
+                tpa_path: Some(tpa_path.to_string()),
+                bgzf_section_start,
+            })
+        } else {
+            // Per-record mode: first record position is current file position
+            let first_record_pos = file.stream_position()?;
+            let index = TpaIndex::new_raw(vec![first_record_pos]);
+
+            Ok(Self {
+                file: Some(file),
+                bgzf_reader: None,
+                index,
+                header,
+                string_table,
+                string_table_pos,
+                tpa_path: Some(tpa_path.to_string()),
+                bgzf_section_start: 0,
+            })
         }
     }
 
@@ -222,7 +269,12 @@ impl TpaReader {
         })
     }
 
-    /// Get number of records
+    /// Get number of records (from header, always available)
+    pub fn num_records(&self) -> usize {
+        self.header.num_records() as usize
+    }
+
+    /// Get number of records (from index — returns 0 if opened in streaming mode)
     pub fn len(&self) -> usize {
         self.index.len()
     }
@@ -239,7 +291,7 @@ impl TpaReader {
 
     /// Check if this reader is in all-records mode
     pub fn is_all_records_mode(&self) -> bool {
-        self.bgzf_reader.is_some()
+        self.header.all_records()
     }
 
     /// Get BGZF section start offset (0 for per-record mode)

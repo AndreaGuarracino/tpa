@@ -41,7 +41,7 @@ pub use reader::{
     read_mixed_tracepoints_at_offset, read_mixed_tracepoints_at_vpos,
     read_standard_tracepoints_at_offset_with_strategies, read_standard_tracepoints_at_vpos,
     read_variable_tracepoints_at_offset, read_variable_tracepoints_at_vpos, AlignmentRecord,
-    AlignmentRecordIterator, StreamingMetadataIterator, RecordIterator, TpaReader,
+    AlignmentRecordIterator, RecordIterator, StreamingMetadataIterator, TpaReader,
 };
 
 // Re-export cigar module types and functions
@@ -160,11 +160,13 @@ pub fn paf_to_tpa(
     // Choose strategy: Automatic, Benchmark, or explicit
     let (chosen_first, chosen_second, first_layer, second_layer) = if uses_automatic {
         let level = config.first_strategy.zstd_level();
-        let result =
-            automatic_select(config.tp_type, config.complexity_metric, level);
+        let result = automatic_select(config.tp_type, config.complexity_metric, level);
         info!(
             "Automatic: {} [{}] → {} [{}]",
-            result.0, result.2.as_str(), result.1, result.3.as_str()
+            result.0,
+            result.2.as_str(),
+            result.1,
+            result.3.as_str()
         );
         result
     } else {

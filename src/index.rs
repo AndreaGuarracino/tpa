@@ -1,4 +1,4 @@
-use crate::binary::{read_header, skip_record, skip_record_sequential};
+use crate::binary::{read_header, skip_record_sequential};
 use crate::format::StringTable;
 use crate::utils::{read_varint, write_varint};
 use log::info;
@@ -187,7 +187,22 @@ impl TpaIndex {
     }
 }
 
+/// Wrapper that counts bytes read through an inner reader.
+struct CountingReader<'a> {
+    inner: &'a mut dyn Read,
+    bytes_read: &'a mut u64,
+}
+
+impl<'a> Read for CountingReader<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        *self.bytes_read += n as u64;
+        Ok(n)
+    }
+}
+
 /// Build an index from a TPA file by scanning record offsets (per-record mode).
+/// Uses sequential read-only scanning (no seeks) for better BufReader performance.
 pub fn build_index_per_record(tpa_path: &str) -> io::Result<TpaIndex> {
     info!("Building index for {}", tpa_path);
 
@@ -197,10 +212,19 @@ pub fn build_index_per_record(tpa_path: &str) -> io::Result<TpaIndex> {
     let header = read_header(&mut reader)?;
     StringTable::read(&mut reader, header.num_strings)?;
 
+    // Use read-based scanning instead of seek-based to avoid BufReader buffer invalidation.
+    // skip_record_sequential() reads and discards bytes, keeping BufReader's buffer intact.
+    let start_pos = reader.stream_position()?;
+    let mut bytes_read = 0u64;
+    let mut counting = CountingReader {
+        inner: &mut reader,
+        bytes_read: &mut bytes_read,
+    };
+
     let mut offsets = Vec::with_capacity(header.num_records as usize);
     for _ in 0..header.num_records {
-        offsets.push(reader.stream_position()?);
-        skip_record(&mut reader, header.tracepoint_type)?;
+        offsets.push(start_pos + *counting.bytes_read);
+        skip_record_sequential(&mut counting, header.tracepoint_type)?;
     }
 
     info!("Index built: {} records", offsets.len());
@@ -208,7 +232,6 @@ pub fn build_index_per_record(tpa_path: &str) -> io::Result<TpaIndex> {
 }
 
 /// Build an index from an all-records mode TPA file by scanning BGZF virtual positions.
-/// This allows recovery if the .idx file is deleted.
 pub fn build_index_all_records(tpa_path: &str) -> io::Result<TpaIndex> {
     info!("Building index for all-records mode: {}", tpa_path);
 
@@ -231,6 +254,7 @@ pub fn build_index_all_records(tpa_path: &str) -> io::Result<TpaIndex> {
 
     // Create BGZF reader starting at records section
     file.seek(SeekFrom::Start(bgzf_section_start))?;
+
     let buf_reader = BufReader::with_capacity(131072, file);
     let mut bgzf_reader = bgzf::io::Reader::new(buf_reader);
 
