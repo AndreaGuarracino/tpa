@@ -1,4 +1,6 @@
-use crate::binary::{read_record, read_record_metadata, read_tracepoints, read_tracepoints_at_offset};
+use crate::binary::{
+    read_record, read_record_metadata, read_tracepoints, read_tracepoints_at_offset,
+};
 use crate::format::{CompactRecord, CompressionLayer, CompressionStrategy, StringTable, TpaHeader};
 use crate::index::{build_index_all_records, build_index_per_record, IndexType, TpaIndex};
 use crate::utils::read_varint;
