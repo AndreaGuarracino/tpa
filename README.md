@@ -110,7 +110,7 @@ Use when you have pre-computed offsets from the index and need tracepoints in ti
 ```rust
 for record in reader.iter_records()? {
     let record = record?;
-    println!("{} → {}", record.query_name_id, record.target_name_id);
+    println!("{} → {}", record.query_name, record.target_name);
 }
 ```
 
@@ -218,10 +218,12 @@ cargo build --release --examples
 
 `.tpa.idx` file structure:
 ```
-Magic:     TPAI (4 bytes)
-Version:   1 (1 byte)
-Count:     varint (number of records)
-Offsets:   varint[] (byte positions)
+Magic:          TPAI (4 bytes)
+Version:        2 (1 byte)
+IndexType:      1 byte (0 = raw byte offsets, 1 = BGZF virtual positions)
+BgzfSectStart:  u64 LE (BGZF section start offset; 0 for per-record mode)
+Count:          varint (number of records)
+Positions:      varint[] (per-record mode) or u64 LE[] (all-records mode)
 ```
 
 Index enables O(1) random access without file scanning.
