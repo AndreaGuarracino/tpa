@@ -1,55 +1,10 @@
 # tpa
 
-TracePoint Alignment (TPA) format - binary format for efficient storage and random access of sequence alignments with tracepoints.
+TracePoint Alignment (TPA) binary format for compact storage and O(1) random access of sequence alignments encoded with [tracepoints](https://github.com/AndreaGuarracino/tracepoints).
 
-## Features
+## Overview
 
-- **O(1) random access**: External index for instant record lookup
-- **Compression modes**:
-  - **Automatic (default)**: Instant lookup-based strategy selection from tracepoint type and complexity metric — no sampling overhead
-  - **Benchmark**: Exhaustive testing of all strategy × layer combinations on a sample; picks the smallest
-  - **Manual**: Specify an explicit strategy pair for first/second value streams
-- **Tracepoint support**: Standard and FastGA representations
-- **String deduplication**: Shared sequence name table
-- **Byte-aligned encoding**: Enables extremely fast tracepoint extraction
-- **BGZIP all-records mode**: Optional whole-file BGZIP wrapping for better cross-record compression
-- **Crash-safety footer**: Files carry a footer written at close; missing footers are rejected on read
-
-## Format
-
-```
-[Header] → [StringTable] → [Records] → [Footer]
-```
-
-### Header (metadata + strategy)
-- Magic: `TPA\0` (4 bytes)
-- Version: `1` (1 byte)
-- Record count: varint
-- String count: varint
-- First strategy+layer: packed byte — bits 7–6 = layer (`0=Zstd, 1=Bgzip, 2=Nocomp`), bits 5–0 = strategy code (`0-17`)
-- Second strategy+layer: packed byte (same format)
-- Tracepoint type: `1` byte
-- Complexity metric: `1` byte
-- Max complexity / spacing: varint
-- Distance parameters: serialized to match `lib_wfa2::Distance`
-
-### Footer (written on close)
-- Magic: `TPA\0` (4 bytes)
-- Version: `1` (1 byte)
-- Record count: varint
-- String count: varint
-- Footer length: `u32` little-endian trailer
-
-Readers validate header/footer agreement and fail fast if the footer is missing or truncated.
-
-### Records (per alignment)
-- **PAF fields**: varints for positions, 1-byte strand/quality
-- **Tracepoints**: Byte-aligned varint-encoded (first_values, second_values) pairs
-- **Tags**: Optional key-value pairs
-
-### String Table
-- Follows the header and stores deduplicated sequence names
-- Per string: name length (varint) + name bytes (UTF-8) + sequence length (varint)
+TPA stores tracepoint alignments as a binary file with an external index to allow O(1) random access. Use this library when you want to read or write `.tpa` files into your project.
 
 ## Installation
 
@@ -58,175 +13,82 @@ Readers validate header/footer agreement and fail fast if the footer is missing 
 tpa = { git = "https://github.com/AndreaGuarracino/tpa" }
 ```
 
-## Quick Start
+## Usage
 
-### Read with random access
+Read a `.tpa` file:
 
 ```rust
-use tpa::{TpaReader, TracepointData};
+use tpa::TpaReader;
 
-// Open with index for O(1) record access
-let mut reader = TpaReader::new("alignments.tpa")?;
-println!("Total records: {}", reader.len());
+fn main() -> std::io::Result<()> {
+    let mut reader = TpaReader::new("alignments.tpa")?; // opens via the .tpa.idx index
+    println!("{} alignments", reader.len());
 
-// Jump to any record instantly
-let record = reader.get_compact_record(1000)?;
-let (tracepoints, _, _) = reader.get_tracepoints(1000)?;
-
-match &tracepoints {
-    TracepointData::Standard(tps) => println!("{} tracepoints", tps.len()),
-    TracepointData::Fastga(tps) => println!("{} FastGA traces", tps.len()),
-    _ => {}
+    let _record = reader.get_record(1000)?;             // O(1) lookup, no full scan
+    for record in reader.iter_records()? {              // or iterate sequentially
+        let _record = record?;
+    }
+    Ok(())
 }
 ```
 
-### Fast tracepoint access
-
-For maximum speed when you have pre-computed offsets:
+Write a `.tpa` from a PAF file with tracepoints:
 
 ```rust
-use tpa::{read_standard_tracepoints_at_offset_with_strategies,
-               CompressionStrategy, CompressionLayer};
-use std::fs::File;
+use tpa::{paf_to_tpa, CompressionConfig};
 
-let mut file = File::open("alignments.tpa")?;
-
-// Strategies and layers from header; offset from index
-let tps = read_standard_tracepoints_at_offset_with_strategies(
-    &mut file,
-    123456, // byte offset from index
-    CompressionStrategy::ZigzagDelta(3),
-    CompressionStrategy::ZigzagDelta(3),
-    CompressionLayer::Zstd,
-    CompressionLayer::Zstd,
-)?;
-// Also available: read_standard_tracepoints_at_offset (without strategy parameters)
+paf_to_tpa("alignments.tp.paf", "alignments.tpa", CompressionConfig::new())?; // automatic strategy
 ```
 
-Use when you have pre-computed offsets from the index and need tracepoints in tight loops.
+See `examples/seek_demo.rs` and `examples/offset_demo.rs` for runnable demos.
 
-### Sequential iteration
+## Format
 
-```rust
-for record in reader.iter_records()? {
-    let record = record?;
-    println!("{} → {}", record.query_name, record.target_name);
-}
+```
+[Header] → [StringTable] → [Records] → [Footer]
 ```
 
-### Compression
+### Header
+- Magic: `TPA\0` (4 bytes)
+- Version: `1` (1 byte)
+- Record count: varint
+- String count: varint
+- First strategy+layer: packed byte, bits 7-6 = layer (`0=Zstd, 1=Bgzip, 2=Nocomp`), bits 5-0 = strategy code
+- Second strategy+layer: packed byte (same format)
+- Tracepoint type: 1 byte
+- Complexity metric: 1 byte
+- Max complexity / spacing: varint
+- Distance parameters: serialized to match `lib_wfa2::Distance`
+- All-records mode flag: 1 byte (`1` if the records section is wrapped in whole-file BGZIP, else `0`)
 
-```rust
-use tpa::{paf_to_tpa, CompressionConfig, CompressionStrategy, CompressionLayer};
+### String table
+Per string: name length (varint) + name bytes (UTF-8) + sequence length (varint).
 
-// Automatic (default): lookup-based strategy selection
-paf_to_tpa("alignments.paf", "alignments.tpa", CompressionConfig::new())?;
+### Records (per alignment)
+- PAF fields: varint name ids, coordinates, matching bases and block length; 1-byte strand and mapping quality
+- Tracepoints: a varint segment count, then two length-prefixed value streams, each encoded with the strategy and layer named in the header
+- Tags: optional key/value pairs (2-byte key, 1-byte type, then the value)
 
-// Benchmark: exhaustive testing with 500-record sample
-paf_to_tpa(
-    "alignments.paf",
-    "alignments.tpa",
-    CompressionConfig::new().strategy(CompressionStrategy::Benchmark(3, 500)),
-)?;
+### Footer
+Magic `TPA\0`, version, record count, string count, then a `u32` little-endian footer-length trailer. Readers validate the footer against the header and fail fast if it is missing or truncated.
 
-// Benchmark with entire file analysis (sample_size = 0)
-paf_to_tpa(
-    "alignments.paf",
-    "alignments.tpa",
-    CompressionConfig::new().strategy(CompressionStrategy::Benchmark(3, 0)),
-)?;
+## Index format
 
-// ZigzagDelta: Delta + zigzag transform + varint + zstd
-paf_to_tpa(
-    "alignments.paf",
-    "alignments.tpa",
-    CompressionConfig::new().strategy(CompressionStrategy::ZigzagDelta(3)),
-)?;
+`.tpa.idx`:
 
-// Dual strategy: different strategies for first/second values
-paf_to_tpa(
-    "alignments.paf",
-    "alignments.tpa",
-    CompressionConfig::new()
-        .dual_strategy(CompressionStrategy::Raw(3), CompressionStrategy::TwoDimDelta(3)),
-)?;
-
-// From CIGAR input (converts to tracepoints)
-paf_to_tpa(
-    "alignments.paf",
-    "alignments.tpa",
-    CompressionConfig::new().from_cigar(),
-)?;
-
-// BGZIP all-records mode (better compression, block-level random access)
-paf_to_tpa(
-    "alignments.paf",
-    "alignments.tpa",
-    CompressionConfig::new().all_records(),
-)?;
-```
-
-**Strategy guide:**
-- **Automatic (default)**: Selection based on tracepoint type and complexity metric. Parameter: `(level)`. Best for most use cases
-- **Benchmark**: Exhaustive testing of all strategy×layer combinations. Parameters: `(level, sample_size)` where sample_size=10000 is default, 0 = analyze entire file
-- **ZigzagDelta**: Use when tracepoint values are mostly increasing
-- **TwoDimDelta**: Best for CIGAR-derived alignments (exploits query/target correlation)
-- **Raw**: Use when tracepoint values jump frequently
-- **Rice/Huffman**: Entropy coding for skewed distributions
-
-### Index management
-
-```rust
-use tpa::{build_index_per_record, TpaIndex};
-
-// Build index for random access
-let index = build_index_per_record("alignments.tpa")?;
-index.save("alignments.tpa.idx")?;
-
-// Load existing index
-let index = TpaIndex::load("alignments.tpa.idx")?;
-```
-
-## CLI Tools
-
-```bash
-cargo build --release
-
-# Inspect TPA file structure (header, strategies, record count)
-./target/release/tpa-analyze file.tpa
-
-# Decompress TPA back to PAF
-./target/release/tpa-view file.tpa
-
-# Show selected strategies/layers
-./target/release/tpa-view --strategies file.tpa
-```
-
-## Examples
-
-```bash
-cargo build --release --examples
-
-# O(1) random access demo
-./target/release/examples/seek_demo alignments.tpa 0 100 500 1000
-
-# Offset-based access demo
-./target/release/examples/offset_demo alignments.tpa
-```
-
-## Index Format
-
-`.tpa.idx` file structure:
 ```
 Magic:          TPAI (4 bytes)
 Version:        2 (1 byte)
 IndexType:      1 byte (0 = raw byte offsets, 1 = BGZF virtual positions)
-BgzfSectStart:  u64 LE (BGZF section start offset; 0 for per-record mode)
+BgzfSectStart:  u64 LE (0 for per-record mode)
 Count:          varint (number of records)
 Positions:      varint[] (per-record mode) or u64 LE[] (all-records mode)
 ```
 
-Index enables O(1) random access without file scanning.
+## Related repositories
+
+- **[tracepoints](https://github.com/AndreaGuarracino/tracepoints)**: the core library implementing tracepoint sampling and reconstruction.
+- **[cigzip](https://github.com/AndreaGuarracino/cigzip)**: the command-line tool that writes and reads `.tpa` files.
 
 ## License
 
