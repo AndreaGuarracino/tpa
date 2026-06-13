@@ -374,7 +374,7 @@ impl CompressionStrategy {
             strategy_name = strategy_name.trim_end_matches("-nocomp").to_string();
             CompressionLayer::Nocomp // No compression - store raw encoded data
         } else {
-            CompressionLayer::Zstd // Default to Zstd if no suffix
+            CompressionLayer::Nocomp // Default to no layer if no suffix
         };
 
         let default_level = if layer == CompressionLayer::Nocomp {
