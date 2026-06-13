@@ -1215,9 +1215,7 @@ pub fn format_tag(tag: &Tag) -> String {
     let tag_type = tag.tag_type as char;
     match &tag.value {
         TagValue::Int(v) => format!("{}:{}:{}", key, tag_type, v),
-        // Use enough precision to round-trip f32 values correctly
-        // f32 has ~7 significant digits, so we use 8 to ensure round-trip
-        TagValue::Float(v) => format!("{}:{}:{:.8}", key, tag_type, v),
+        TagValue::Float(v) => format!("{}:{}:{}", key, tag_type, v),
         TagValue::String(s) => format!("{}:Z:{}", key, s),
     }
 }

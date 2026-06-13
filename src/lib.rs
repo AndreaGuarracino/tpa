@@ -23,7 +23,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write};
 pub use lib_wfa2::affine_wavefront::Distance;
 use tracepoints::{
     cigar_to_mixed_tracepoints, cigar_to_tracepoints, cigar_to_tracepoints_fastga,
-    cigar_to_variable_tracepoints,
+    cigar_to_tracepoints_fastga_no_diff, cigar_to_variable_tracepoints,
 };
 
 pub use format::{
@@ -246,6 +246,13 @@ pub fn parse_tracepoints(tp_str: &str, tp_type: TracepointType) -> io::Result<Tr
                 _ => unreachable!(),
             })
         }
+        TracepointType::FastgaNoDiff => {
+            let mut tps = Vec::new();
+            for part in tp_str.split(';') {
+                tps.push(parse_usize_value(part, "Invalid FastgaNoDiff value")?);
+            }
+            Ok(TracepointData::FastgaNoDiff(tps))
+        }
         TracepointType::Mixed => {
             let mut items = Vec::new();
 
@@ -306,6 +313,11 @@ pub fn format_tracepoints(data: &TracepointData) -> String {
         TracepointData::Standard(tps) | TracepointData::Fastga(tps) => tps
             .iter()
             .map(|(a, b)| format!("{},{}", a, b))
+            .collect::<Vec<String>>()
+            .join(";"),
+        TracepointData::FastgaNoDiff(tps) => tps
+            .iter()
+            .map(|v| v.to_string())
             .collect::<Vec<String>>()
             .join(";"),
         TracepointData::Mixed(items) => items
@@ -715,6 +727,23 @@ fn parse_paf(
                 let tps: Vec<(usize, usize)> =
                     segments.into_iter().flat_map(|(tps, _)| tps).collect();
                 TracepointData::Fastga(tps)
+            }
+            TracepointType::FastgaNoDiff => {
+                let complement = strand == '-';
+                let segments = cigar_to_tracepoints_fastga_no_diff(
+                    cigar_str,
+                    max_complexity,
+                    query_start as usize,
+                    query_end as usize,
+                    query_len as usize,
+                    target_start as usize,
+                    target_end as usize,
+                    target_len as usize,
+                    complement,
+                );
+                let tps: Vec<usize> =
+                    segments.into_iter().flat_map(|(tps, _)| tps).collect();
+                TracepointData::FastgaNoDiff(tps)
             }
         }
     } else {
