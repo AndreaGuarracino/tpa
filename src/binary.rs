@@ -309,7 +309,7 @@ impl StrategyAnalyzer {
 /// The choices follow from structural properties of each segmentation algorithm:
 /// - Edit-distance: right-skewed segment lengths → Rice coding for first stream
 /// - Diagonal-distance: fewer segments per record → Raw varint (Rice overhead too high)
-/// - Fastga (FL-TP): small edit distances → Simple-8b for first stream
+/// - Fastga (FL-TP): many segments per record amortizes Rice overhead
 /// - Second stream: query/target advances are correlated → TwoDimDelta (except FL-TP)
 pub(crate) fn automatic_select(
     tp_type: TracepointType,
@@ -338,8 +338,8 @@ pub(crate) fn automatic_select(
             ),
         },
         TracepointType::Fastga => (
-            CompressionStrategy::Simple8bFull(level),
-            CompressionStrategy::Raw(level),
+            CompressionStrategy::Rice(level),
+            CompressionStrategy::Rice(level),
             nocomp,
             nocomp,
         ),
