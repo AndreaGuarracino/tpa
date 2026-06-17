@@ -167,6 +167,19 @@ impl StrategyAnalyzer {
                     encode_second_stream,
                 );
             }
+            TracepointData::FastgaNoDiff(tps) => {
+                self.processed_records += 1;
+                self.processed_tracepoints += tps.len();
+                let vals: Vec<u64> = tps.iter().map(|&v| v as u64).collect();
+                process_stream_states(
+                    &mut self.first_states,
+                    &self.layers,
+                    &vals,
+                    &[],
+                    "First",
+                    |first, _second, strategy| encode_first_stream(first, strategy),
+                );
+            }
             TracepointData::Variable(tps) => {
                 self.processed_records += 1;
                 self.processed_tracepoints += tps.len();
@@ -337,7 +350,7 @@ pub(crate) fn automatic_select(
                 nocomp,
             ),
         },
-        TracepointType::Fastga => (
+        TracepointType::Fastga | TracepointType::FastgaNoDiff => (
             CompressionStrategy::Rice(level),
             CompressionStrategy::Rice(level),
             nocomp,
@@ -662,6 +675,17 @@ pub(crate) fn read_tracepoints<R: Read>(
                 _ => TracepointData::Fastga(tps),
             })
         }
+        TracepointType::FastgaNoDiff => {
+            // Single stream: [first_len][first_data]
+            let first_len = read_varint(reader)? as usize;
+            let mut first_compressed = vec![0u8; first_len];
+            reader.read_exact(&mut first_compressed)?;
+            let first_buf = decompress_with_layer(&first_compressed[..], first_layer)?;
+            let vals = decode_tracepoint_values(&first_buf, num_items, first_strategy)?;
+            Ok(TracepointData::FastgaNoDiff(
+                vals.into_iter().map(|v| v as usize).collect(),
+            ))
+        }
         TracepointType::Variable => {
             let tps = decode_variable_tracepoints(
                 reader,
@@ -797,6 +821,10 @@ fn skip_tracepoints<R: Read + Seek>(reader: &mut R, tp_type: TracepointType) -> 
             skip_block(reader)?;
             skip_block(reader)?;
         }
+        TracepointType::FastgaNoDiff => {
+            // Format: [first_len][first_data]
+            skip_block(reader)?;
+        }
         TracepointType::Variable => {
             // Format: [presence_bitmap_len][presence_bitmap][first_len][first_data][second_len][second_data]
             skip_block(reader)?; // presence bitmap
@@ -849,6 +877,9 @@ pub(crate) fn skip_record_sequential<R: Read>(
     match tp_type {
         TracepointType::Standard | TracepointType::Fastga => {
             skip_block(reader)?;
+            skip_block(reader)?;
+        }
+        TracepointType::FastgaNoDiff => {
             skip_block(reader)?;
         }
         TracepointType::Variable => {
@@ -932,6 +963,9 @@ pub(crate) fn read_record_metadata<R: Read>(
     match tp_type {
         TracepointType::Standard | TracepointType::Fastga => {
             skip_block(reader)?;
+            skip_block(reader)?;
+        }
+        TracepointType::FastgaNoDiff => {
             skip_block(reader)?;
         }
         TracepointType::Variable => {
@@ -2347,6 +2381,19 @@ impl CompactRecord {
                 writer.write_all(&first_compressed)?;
                 write_varint(writer, second_compressed.len() as u64)?;
                 writer.write_all(&second_compressed)?;
+            }
+            TracepointData::FastgaNoDiff(tps) => {
+                // Single stream: [num_items][first_len][first_data]
+                write_varint(writer, tps.len() as u64)?;
+                let vals: Vec<u64> = tps.iter().map(|&v| v as u64).collect();
+                let first_val_buf = encode_tracepoint_values(&vals, first_strategy)?;
+                let first_compressed = compress_with_layer(
+                    &first_val_buf[..],
+                    first_layer,
+                    first_strategy.zstd_level(),
+                )?;
+                write_varint(writer, first_compressed.len() as u64)?;
+                writer.write_all(&first_compressed)?;
             }
             TracepointData::Variable(tps) => {
                 write_varint(writer, tps.len() as u64)?;

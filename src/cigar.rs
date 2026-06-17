@@ -3,9 +3,9 @@
 use crate::Distance;
 use lib_wfa2::affine_wavefront::AffineWavefronts;
 use tracepoints::{
-    mixed_tracepoints_to_cigar_with_aligner, tracepoints_to_cigar_fastga_with_aligner,
-    tracepoints_to_cigar_with_aligner, variable_tracepoints_to_cigar_with_aligner,
-    ComplexityMetric, TracepointData,
+    mixed_tracepoints_to_cigar_with_aligner, tracepoints_to_cigar_fastga_nodiff_with_aligner,
+    tracepoints_to_cigar_fastga_with_aligner, tracepoints_to_cigar_with_aligner,
+    variable_tracepoints_to_cigar_with_aligner, ComplexityMetric, TracepointData,
 };
 
 /// Statistics extracted from a CIGAR string
@@ -330,6 +330,15 @@ fn reconstruct_cigar_with_aligner_impl(
             complement,
             aligner,
             max_value.is_some(),
+        ),
+        TracepointData::FastgaNoDiff(tps) => tracepoints_to_cigar_fastga_nodiff_with_aligner(
+            tps,
+            spacing,
+            query_seq,
+            target_seq,
+            query_offset,
+            complement,
+            aligner,
         ),
     }
 }
