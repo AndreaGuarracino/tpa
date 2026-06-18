@@ -212,6 +212,7 @@ fn profile_methods(reader: &mut TpaReader) -> std::io::Result<()> {
 fn tracepoint_len(tp: &TracepointData) -> usize {
     match tp {
         TracepointData::Standard(tps) | TracepointData::Fastga(tps) => tps.len(),
+        TracepointData::FastgaNoDiff(tps) => tps.len(),
         TracepointData::Variable(tps) => tps.len(),
         TracepointData::Mixed(items) => items.len(),
     }
