@@ -616,7 +616,7 @@ dependencies = [
 [[package]]
 name = "tracepoints"
 version = "0.1.0"
-source = "git+https://github.com/AndreaGuarracino/tracepoints?rev=3f1cbb1abcca754b793ea880deb8b8d335f2487a#3f1cbb1abcca754b793ea880deb8b8d335f2487a"
+source = "git+https://github.com/AndreaGuarracino/tracepoints?rev=802bbefab25be11fb4f3b68582308de48c26a62a#802bbefab25be11fb4f3b68582308de48c26a62a"
 dependencies = [
  "lib_wfa2",
 ]

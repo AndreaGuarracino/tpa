@@ -14,6 +14,7 @@ mod index;
 mod reader;
 mod utils;
 
+use rayon::prelude::*;
 use log::{info, warn};
 
 use std::fs::File;
@@ -83,6 +84,24 @@ pub fn is_tpa_file(path: &str) -> io::Result<bool> {
     }
 }
 
+// Pass-1 fast path (no analyzer): intern just the two names, skip the CIGAR->tracepoint
+// conversion. Same field order as parse_paf. Returns false on a malformed line.
+fn intern_names_only(line: &str, string_table: &mut StringTable) -> bool {
+    let fields: Vec<&str> = line.split('\t').collect();
+    if fields.len() < 12 {
+        return false;
+    }
+    let (Ok(query_len), Ok(target_len)) = (
+        parse_usize(fields[1], "query_len"),
+        parse_usize(fields[6], "target_len"),
+    ) else {
+        return false;
+    };
+    string_table.get_or_insert_id(fields[0], query_len);
+    string_table.get_or_insert_id(fields[5], target_len);
+    true
+}
+
 /// Convert a PAF file to TPA format
 pub fn paf_to_tpa(
     input_path: &str,
@@ -131,20 +150,39 @@ pub fn paf_to_tpa(
             }
         };
 
-    let input = open_paf_reader(input_path)?;
-    for (line_num, line_result) in input.lines().enumerate() {
-        let line = line_result?;
+    let mut input = open_paf_reader(input_path)?;
+    let mut buf: Vec<u8> = Vec::new(); // reused line buffer (avoid a String alloc per line)
+    let mut line_num = 0usize;
+    loop {
+        buf.clear();
+        if input.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
+        let cur = line_num;
+        line_num += 1;
+        while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
+            buf.pop();
+        }
+        let line = match std::str::from_utf8(&buf) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
         if line.trim().is_empty() || line.starts_with('#') {
             continue;
         }
 
-        let Some(record) = parse_record(&line, line_num, &mut string_table) else {
-            continue;
-        };
-
-        // Analyze record if automatic strategy is enabled
         if let Some(an) = analyzer.as_mut() {
+            // The analyzer needs the full record (its tracepoints), so do the full parse.
+            let Some(record) = parse_record(line, cur, &mut string_table) else {
+                continue;
+            };
             an.analyze_record(&record)?;
+        } else {
+            // No analyzer: pass 1 needs only names + count, so skip the conversion (done in pass 2).
+            if !intern_names_only(line, &mut string_table) {
+                warn!("Skipping malformed line {}", cur + 1);
+                continue;
+            }
         }
         record_count += 1;
     }
@@ -395,38 +433,64 @@ fn compress_per_record(
 
     // Write records with chosen strategy
     let mut writer = BufWriter::new(&mut output);
-    let input = open_paf_reader(input_path)?;
-    for (line_num, line_result) in input.lines().enumerate() {
-        let line = line_result?;
-        if line.trim().is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let record = match parse_paf(
-            &line,
-            string_table,
-            tp_type,
-            max_complexity,
-            complexity_metric,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("Skipping malformed line {}: {}", line_num + 1, e);
+    let mut input = open_paf_reader(input_path)?;
+    // read_until into a reused buffer instead of lines() (a String alloc per line); records are
+    // whole-chromosome-sized, so reuse avoids a big per-record allocation.
+    let mut buf: Vec<u8> = Vec::new();
+    let mut line_num = 0usize;
+    // Pass 1 filled the string table, so pass 2 only reads it. Per chunk: read raw lines serially,
+    // parse + pack each in PARALLEL (parse_paf_readonly takes &table), then write the buffers
+    // serially in order so the byte-offset index stays exact.
+    const CHUNK: usize = 1024;
+    let table: &StringTable = string_table;
+    let mut chunk: Vec<(usize, String)> = Vec::with_capacity(CHUNK);
+    let mut eof = false;
+    while !eof {
+        chunk.clear();
+        while chunk.len() < CHUNK {
+            buf.clear();
+            if input.read_until(b'\n', &mut buf)? == 0 {
+                eof = true;
+                break;
+            }
+            let cur = line_num;
+            line_num += 1;
+            while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
+                buf.pop();
+            }
+            let line = match std::str::from_utf8(&buf) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if line.trim().is_empty() || line.starts_with('#') {
                 continue;
             }
-        };
-
-        // Capture byte offset before writing record
-        byte_offsets.push(writer.stream_position()?);
-
-        // Write with chosen strategy and layer
-        record.write(
-            &mut writer,
-            chosen_first,
-            chosen_second,
-            first_layer,
-            second_layer,
-        )?;
+            chunk.push((cur, line.to_string()));
+        }
+        if chunk.is_empty() {
+            continue;
+        }
+        let packed: Vec<Option<Vec<u8>>> = chunk
+            .par_iter()
+            .map(|(cur, line)| {
+                match parse_paf_readonly(line, table, tp_type, max_complexity, complexity_metric) {
+                    Ok(r) => {
+                        let mut b = Vec::new();
+                        r.write(&mut b, chosen_first, chosen_second, first_layer, second_layer)
+                            .expect("writing a record to an in-memory buffer is infallible");
+                        Some(b)
+                    }
+                    Err(e) => {
+                        warn!("Skipping malformed line {}: {}", cur + 1, e);
+                        None
+                    }
+                }
+            })
+            .collect();
+        for b in packed.into_iter().flatten() {
+            byte_offsets.push(writer.stream_position()?);
+            writer.write_all(&b)?;
+        }
     }
     writer.flush()?;
     drop(writer);
@@ -643,6 +707,38 @@ fn parse_paf(
     max_complexity: u32,
     complexity_metric: ComplexityMetric,
 ) -> io::Result<CompactRecord> {
+    parse_paf_with(line, tp_type, max_complexity, complexity_metric, |s, len| {
+        Ok(string_table.get_or_insert_id(s, len))
+    })
+}
+
+// Read-only parse (names already interned in pass 1). Takes &StringTable, so it runs on many threads.
+fn parse_paf_readonly(
+    line: &str,
+    string_table: &StringTable,
+    tp_type: TracepointType,
+    max_complexity: u32,
+    complexity_metric: ComplexityMetric,
+) -> io::Result<CompactRecord> {
+    parse_paf_with(line, tp_type, max_complexity, complexity_metric, |s, _len| {
+        string_table.get_id(s).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("name '{}' not interned in pass 1", s),
+            )
+        })
+    })
+}
+
+// Shared parse body. `resolve(name, len) -> id` either interns (pass 1) or looks up (pass 2).
+// Called query first, then target.
+fn parse_paf_with<F: FnMut(&str, u64) -> io::Result<u64>>(
+    line: &str,
+    tp_type: TracepointType,
+    max_complexity: u32,
+    complexity_metric: ComplexityMetric,
+    mut resolve: F,
+) -> io::Result<CompactRecord> {
     let fields: Vec<&str> = line.split('\t').collect();
     if fields.len() < 12 {
         return Err(io::Error::new(
@@ -668,9 +764,9 @@ fn parse_paf(
     let alignment_block_len = parse_usize(fields[10], "alignment_block_len")?;
     let mapping_quality = parse_u8(fields[11], "mapping_quality")?;
 
-    // Get or create string IDs
-    let query_name_id = string_table.get_or_insert_id(query_name, query_len);
-    let target_name_id = string_table.get_or_insert_id(target_name, target_len);
+    // Resolve string IDs (insert in pass 1, read-only lookup in parallel pass 2)
+    let query_name_id = resolve(query_name, query_len as u64)?;
+    let target_name_id = resolve(target_name, target_len as u64)?;
 
     // Parse tags and extract alignment data (auto-detect CIGAR or tracepoints per row)
     let mut cigar = None;

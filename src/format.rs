@@ -1016,6 +1016,10 @@ impl StringTable {
         }
     }
 
+    pub fn get_id(&self, s: &str) -> Option<u64> {
+        self.index.get(s).copied()
+    }
+
     pub fn get(&self, id: u64) -> Option<&str> {
         self.strings.get(id as usize).map(|s| s.as_str())
     }
