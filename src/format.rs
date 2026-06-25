@@ -119,6 +119,8 @@ pub struct CompressionConfig {
     pub all_records: bool,
     /// BGZIP compression level for all-records mode (0-9)
     pub all_records_level: u32,
+    /// FASTGA contig table (scaffold -> sorted ACGT-run (start,end))
+    pub contig_table: Option<HashMap<String, Vec<(usize, usize)>>>,
 }
 
 impl Default for CompressionConfig {
@@ -134,6 +136,7 @@ impl Default for CompressionConfig {
             distance: Distance::Edit,
             all_records: false,
             all_records_level: 6,
+            contig_table: None,
         }
     }
 }
@@ -197,6 +200,12 @@ impl CompressionConfig {
     /// Set distance parameters
     pub fn distance(mut self, d: Distance) -> Self {
         self.distance = d;
+        self
+    }
+
+    /// Set the FASTGA contig table (enables contig-aware per-segment fastga compression)
+    pub fn contig_table(mut self, t: Option<HashMap<String, Vec<(usize, usize)>>>) -> Self {
+        self.contig_table = t;
         self
     }
 
@@ -327,6 +336,12 @@ pub enum CompressionStrategy {
     /// - Optimal for data with repeated subsequences
     /// - Configurable compression level (max 22, default: 3)
     LZ77(i32),
+    /// Elias-Fano coding of the per-segment values
+    /// - Prefix-sums the (non-negative) stream into a monotone sequence, then stores it
+    ///   in the quasi-succinct Elias-Fano layout (fixed low bits + unary high bits)
+    /// - Near-optimal for monotone sequences; ~n*ceil(log2(u/n)) + 2n bits
+    /// - Configurable compression level (max 22, default: 3)
+    EliasFano(i32),
 }
 
 impl CompressionStrategy {
@@ -351,6 +366,7 @@ impl CompressionStrategy {
             CompressionStrategy::Rice(level),
             CompressionStrategy::Huffman(level),
             CompressionStrategy::LZ77(level),
+            CompressionStrategy::EliasFano(level),
         ]
     }
 
@@ -450,6 +466,7 @@ impl CompressionStrategy {
             "rice" => Ok(CompressionStrategy::Rice(level)),
             "huffman" => Ok(CompressionStrategy::Huffman(level)),
             "lz77" => Ok(CompressionStrategy::LZ77(level)),
+            "elias-fano" | "ef" => Ok(CompressionStrategy::EliasFano(level)),
             _ => Err(format!(
                 "Unsupported compression strategy '{}'. Use --help to see all available strategies.",
                 name
@@ -480,6 +497,7 @@ impl CompressionStrategy {
             "rice",
             "huffman",
             "lz77",
+            "elias-fano",
         ]
     }
 
@@ -511,6 +529,7 @@ impl CompressionStrategy {
             CompressionStrategy::Rice(_) => Ok(15),
             CompressionStrategy::Huffman(_) => Ok(16),
             CompressionStrategy::LZ77(_) => Ok(17),
+            CompressionStrategy::EliasFano(_) => Ok(18),
         }
     }
 
@@ -536,6 +555,7 @@ impl CompressionStrategy {
             15 => Ok(CompressionStrategy::Rice(3)),
             16 => Ok(CompressionStrategy::Huffman(3)),
             17 => Ok(CompressionStrategy::LZ77(3)),
+            18 => Ok(CompressionStrategy::EliasFano(3)),
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("Unsupported compression strategy code: {}", code),
@@ -567,7 +587,8 @@ impl CompressionStrategy {
             | CompressionStrategy::SelectiveRLE(level)
             | CompressionStrategy::Rice(level)
             | CompressionStrategy::Huffman(level)
-            | CompressionStrategy::LZ77(level) => *level,
+            | CompressionStrategy::LZ77(level)
+            | CompressionStrategy::EliasFano(level) => *level,
         }
     }
 
@@ -594,6 +615,7 @@ impl CompressionStrategy {
             CompressionStrategy::Rice(_) => "Rice",
             CompressionStrategy::Huffman(_) => "Huffman",
             CompressionStrategy::LZ77(_) => "LZ77",
+            CompressionStrategy::EliasFano(_) => "EliasFano",
         }
     }
 }

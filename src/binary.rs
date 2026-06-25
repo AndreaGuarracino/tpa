@@ -392,6 +392,7 @@ fn strategy_to_rank(strategy: &CompressionStrategy) -> u8 {
         CompressionStrategy::Cascaded(_) => 15,
         CompressionStrategy::SelectiveRLE(_) => 16,
         CompressionStrategy::LZ77(_) => 17,
+        CompressionStrategy::EliasFano(_) => 18,
         CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _) => 255,
     }
 }
@@ -1193,6 +1194,82 @@ fn decode_rice_values(buf: &[u8], num_items: usize) -> io::Result<Vec<u64>> {
 }
 
 // ============================================================================
+// ELIAS-FANO CODING
+// ============================================================================
+//
+// Prefix-sums the stream into a monotone sequence, then stores it in the
+// quasi-succinct Elias-Fano layout: 1 header byte `l = floor(log2(u/n))`, then
+// n*l low bits, then n unary high-bit gaps (~ n*l + 2n bits). Decode recovers
+// the cumulative values and returns their successive differences.
+
+fn encode_eliasfano_values(values: &[u64]) -> io::Result<Vec<u8>> {
+    if values.is_empty() {
+        return Ok(Vec::new());
+    }
+    let n = values.len() as u64;
+    let mut cum = Vec::with_capacity(values.len());
+    let mut acc: u64 = 0;
+    for &v in values {
+        acc += v;
+        cum.push(acc);
+    }
+    // l = floor(log2(u/n)), u = max+1; number of low bits per value.
+    let un = (acc + 1) / n;
+    let l: u8 = if un < 1 {
+        0
+    } else {
+        (63 - un.leading_zeros()) as u8
+    };
+    let low_mask = if l == 0 { 0 } else { (1u64 << (l as u32)) - 1 };
+    let mut writer = BitWriter::default();
+    // Low bits: n * l bits, in order.
+    for &c in &cum {
+        writer.write_bits(c & low_mask, l);
+    }
+    // High bits: unary gaps between successive high parts (high[-1] = 0).
+    let mut prev_high: u64 = 0;
+    for &c in &cum {
+        let high = c >> (l as u32);
+        writer.write_unary(high - prev_high); // `gap` ones then a zero
+        prev_high = high;
+    }
+    let mut out = Vec::with_capacity(1 + values.len());
+    out.push(l);
+    out.extend_from_slice(&writer.finish());
+    Ok(out)
+}
+
+fn decode_eliasfano_values(buf: &[u8], num_items: usize) -> io::Result<Vec<u64>> {
+    if num_items == 0 {
+        return Ok(Vec::new());
+    }
+    if buf.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "missing Elias-Fano header",
+        ));
+    }
+    let l = buf[0];
+    let mut reader = BitReader::new(&buf[1..]);
+    // Low bits.
+    let mut lows = Vec::with_capacity(num_items);
+    for _ in 0..num_items {
+        lows.push(if l > 0 { reader.read_bits(l)? } else { 0 });
+    }
+    // High bits (unary gaps) -> cumulative sequence -> successive differences.
+    let mut out = Vec::with_capacity(num_items);
+    let mut high: u64 = 0;
+    let mut prev_cum: u64 = 0;
+    for low in lows {
+        high += reader.read_unary()?;
+        let c = (high << (l as u32)) | low;
+        out.push(c - prev_cum);
+        prev_cum = c;
+    }
+    Ok(out)
+}
+
+// ============================================================================
 // HUFFMAN CODING
 // ============================================================================
 
@@ -1721,6 +1798,10 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
             // LZ77-style sequence matching: find repeated sequences
             buf = lz77_encode(vals)?;
         }
+        CompressionStrategy::EliasFano(_) => {
+            // Elias-Fano on the prefix-summed (monotone) stream
+            buf = encode_eliasfano_values(vals)?;
+        }
         CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2032,6 +2113,7 @@ fn decode_tracepoint_values(
             // LZ77-style sequence matching decode
             lz77_decode(buf, num_items)
         }
+        CompressionStrategy::EliasFano(_) => decode_eliasfano_values(buf, num_items),
         CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _) => {
             Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2556,6 +2638,39 @@ mod compression_tests {
         let decoded =
             decode_tracepoint_values(&buf, vals.len(), CompressionStrategy::LZ77(3)).unwrap();
         assert_eq!(vals, decoded);
+    }
+
+    fn ef_roundtrip(vals: &[u64]) {
+        let buf = encode_tracepoint_values(vals, CompressionStrategy::EliasFano(3)).unwrap();
+        let decoded =
+            decode_tracepoint_values(&buf, vals.len(), CompressionStrategy::EliasFano(3)).unwrap();
+        assert_eq!(vals, &decoded[..], "EF round-trip mismatch");
+    }
+
+    #[test]
+    fn eliasfano_roundtrip_cases() {
+        ef_roundtrip(&[]); // empty
+        ef_roundtrip(&[0]); // single zero
+        ef_roundtrip(&[42]); // single nonzero
+        ef_roundtrip(&[5, 7, 9, 15, 15, 200, 210, 205, 300, 301]); // varied
+        ef_roundtrip(&[0, 0, 0, 0]); // all zeros (equal cumulative)
+        ef_roundtrip(&[1, 0, 2, 0, 3, 0]); // interleaved zeros (pure-indel segments)
+        ef_roundtrip(&[100, 100, 100, 100]); // dense, constant
+        ef_roundtrip(&[1, 1, 1, 1, 1, 1, 1, 1]); // dense unit steps
+        ef_roundtrip(&[0, 1_000_000, 5, 2_000_000]); // large gaps
+        ef_roundtrip(&[97, 103, 99, 101, 100, 98, 102, 100, 100]); // FL-TP-like diffs
+    }
+
+    #[test]
+    fn eliasfano_known_answer() {
+        // vals [0,2,3] -> cumulative [0,2,5], n=3, u=6, l=floor(log2(2))=1.
+        // low bits (1 each): 0,0,1 ; high gaps unary: 0 | 10 | 10 -> bitstream 00101010 = 0x2A.
+        // header byte l=1, then one data byte 0x2A.
+        let buf =
+            encode_tracepoint_values(&[0u64, 2, 3], CompressionStrategy::EliasFano(3)).unwrap();
+        assert_eq!(buf, vec![1u8, 0x2A]);
+        let decoded = decode_tracepoint_values(&buf, 3, CompressionStrategy::EliasFano(3)).unwrap();
+        assert_eq!(decoded, vec![0u64, 2, 3]);
     }
 
     #[test]
