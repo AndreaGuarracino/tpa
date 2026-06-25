@@ -232,9 +232,11 @@ pub enum CompressionStrategy {
     /// - No sampling needed; resolves instantly
     Automatic(i32),
     /// Benchmark-based strategy selection
-    /// - Tests every encoding strategy × layer on sampled records
-    /// - Parameters: (zstd_level, sample_size) where 0 = entire file
-    Benchmark(i32, usize),
+    /// - Tests every encoding strategy on sampled records
+    /// - Parameters: (zstd_level, sample_size, forced_layer) where 0 = entire file.
+    ///   forced_layer = None tests every layer too and picks the smallest (e.g. "benchmark");
+    ///   Some(layer) tests strategies but pins the compression layer (e.g. "benchmark-nocomp").
+    Benchmark(i32, usize, Option<CompressionLayer>),
     /// Raw encoding (no preprocessing) + Zstd
     /// - Optimal for low complexity data
     /// - Configurable compression level (max 22, default: 3)
@@ -379,7 +381,10 @@ impl CompressionStrategy {
         let parts: Vec<&str> = s.split(',').collect();
         let mut strategy_name = parts[0].to_lowercase();
 
-        // Check for suffix: -zstd, -bgzip, or -nocomp
+        // Check for suffix: -zstd, -bgzip, or -nocomp. `layer_explicit` tracks whether a suffix was
+        // actually given (vs the no-suffix default), so "benchmark" (test all layers) is distinct from
+        // "benchmark-nocomp" (pin the layer).
+        let mut layer_explicit = true;
         let layer = if strategy_name.ends_with("-zstd") {
             strategy_name = strategy_name.trim_end_matches("-zstd").to_string();
             CompressionLayer::Zstd
@@ -390,6 +395,7 @@ impl CompressionStrategy {
             strategy_name = strategy_name.trim_end_matches("-nocomp").to_string();
             CompressionLayer::Nocomp // No compression - store raw encoded data
         } else {
+            layer_explicit = false;
             CompressionLayer::Nocomp // Default to no layer if no suffix
         };
 
@@ -413,7 +419,8 @@ impl CompressionStrategy {
                 })?,
                 None => 10000, // Default sample size
             };
-            CompressionStrategy::Benchmark(compression_level, sample_size)
+            let forced_layer = if layer_explicit { Some(layer) } else { None };
+            CompressionStrategy::Benchmark(compression_level, sample_size, forced_layer)
         } else {
             Self::parse_single_strategy(&strategy_name, compression_level)?
         };
@@ -447,7 +454,7 @@ impl CompressionStrategy {
     fn parse_single_strategy(name: &str, level: i32) -> Result<CompressionStrategy, String> {
         match name {
             "automatic" => Ok(CompressionStrategy::Automatic(level)),
-            "benchmark" => Ok(CompressionStrategy::Benchmark(level, 10000)),
+            "benchmark" => Ok(CompressionStrategy::Benchmark(level, 10000, None)),
             "raw" => Ok(CompressionStrategy::Raw(level)),
             "zigzag-delta" => Ok(CompressionStrategy::ZigzagDelta(level)),
             "2d-delta" => Ok(CompressionStrategy::TwoDimDelta(level)),
@@ -505,7 +512,7 @@ impl CompressionStrategy {
     /// Strategy codes: 0-17 (18 concrete strategies)
     fn to_code(self) -> io::Result<u8> {
         match self {
-            CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _) => {
+            CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _, _) => {
                 Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "Automatic/Benchmark must be resolved before writing",
@@ -569,7 +576,7 @@ impl CompressionStrategy {
     pub fn zstd_level(&self) -> i32 {
         match self {
             CompressionStrategy::Automatic(level)
-            | CompressionStrategy::Benchmark(level, _)
+            | CompressionStrategy::Benchmark(level, _, _)
             | CompressionStrategy::Raw(level)
             | CompressionStrategy::ZigzagDelta(level)
             | CompressionStrategy::TwoDimDelta(level)
@@ -596,7 +603,7 @@ impl CompressionStrategy {
     pub fn display_name(&self) -> &'static str {
         match self {
             CompressionStrategy::Automatic(_) => "Automatic",
-            CompressionStrategy::Benchmark(_, _) => "Benchmark",
+            CompressionStrategy::Benchmark(_, _, _) => "Benchmark",
             CompressionStrategy::Raw(_) => "Raw",
             CompressionStrategy::ZigzagDelta(_) => "ZigzagDelta",
             CompressionStrategy::TwoDimDelta(_) => "TwoDimDelta",
@@ -636,7 +643,7 @@ impl std::fmt::Display for CompressionStrategy {
             CompressionStrategy::Automatic(level) => {
                 write!(f, "Automatic (level {})", level)
             }
-            CompressionStrategy::Benchmark(level, sample_size) => {
+            CompressionStrategy::Benchmark(level, sample_size, _) => {
                 if *sample_size == 0 {
                     write!(f, "Benchmark (level {}, all records)", level)
                 } else {

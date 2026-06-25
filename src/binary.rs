@@ -107,12 +107,21 @@ pub(crate) struct StrategyAnalyzer {
 }
 
 impl StrategyAnalyzer {
-    /// Create analyzer. If `test_layers` is true, tests all 3 compression layers (Zstd, Bgzip, Nocomp).
-    /// If false, only tests Nocomp (for all-records mode).
-    pub fn new(zstd_level: i32, sample_limit: usize, test_layers: bool) -> Self {
+    /// Create analyzer. With `forced_layer = Some(l)`, tests every strategy but pins the layer to `l`
+    /// (e.g. "benchmark-nocomp"). Otherwise, if `test_layers` is true tests all 3 layers and picks the
+    /// smallest; if false tests only the first layer (all-records mode).
+    pub fn new(
+        zstd_level: i32,
+        sample_limit: usize,
+        test_layers: bool,
+        forced_layer: Option<CompressionLayer>,
+    ) -> Self {
         let strategies = CompressionStrategy::all(zstd_level);
-        let layers = CompressionLayer::all();
-        let num_layers_to_test = if test_layers { 3 } else { 1 };
+        // When a layer is forced, test exactly that one layer (index 0, which select_best reads back).
+        let (layers, num_layers_to_test) = match forced_layer {
+            Some(l) => ([l; 3], 1),
+            None => (CompressionLayer::all(), if test_layers { 3 } else { 1 }),
+        };
         let first_states = strategies
             .iter()
             .cloned()
@@ -393,7 +402,7 @@ fn strategy_to_rank(strategy: &CompressionStrategy) -> u8 {
         CompressionStrategy::SelectiveRLE(_) => 16,
         CompressionStrategy::LZ77(_) => 17,
         CompressionStrategy::EliasFano(_) => 18,
-        CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _) => 255,
+        CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _, _) => 255,
     }
 }
 
@@ -465,7 +474,7 @@ fn process_stream_states<F>(
 
 fn encode_first_stream(values: &[u64], strategy: &CompressionStrategy) -> io::Result<Vec<u8>> {
     match strategy {
-        CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _) => {
+        CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _, _) => {
             Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Automatic/Benchmark must be resolved before encoding",
@@ -481,7 +490,7 @@ fn encode_second_stream(
     strategy: &CompressionStrategy,
 ) -> io::Result<Vec<u8>> {
     match strategy {
-        CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _) => {
+        CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _, _) => {
             Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Automatic/Benchmark must be resolved before encoding",
@@ -1802,7 +1811,7 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
             // Elias-Fano on the prefix-summed (monotone) stream
             buf = encode_eliasfano_values(vals)?;
         }
-        CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _) => {
+        CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _, _) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Automatic/Benchmark must be resolved before encoding",
@@ -2114,7 +2123,7 @@ fn decode_tracepoint_values(
             lz77_decode(buf, num_items)
         }
         CompressionStrategy::EliasFano(_) => decode_eliasfano_values(buf, num_items),
-        CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _) => {
+        CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _, _) => {
             Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Automatic/Benchmark must be resolved before decoding",
@@ -2229,7 +2238,7 @@ pub(crate) fn decode_standard_tracepoints<R: Read>(
             }
             vals
         }
-        CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _) => {
+        CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _, _) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Automatic/Benchmark must be resolved before decoding",

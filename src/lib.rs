@@ -128,9 +128,14 @@ pub fn paf_to_tpa(
     // For all-records mode, we skip layer testing since layers are not used
     let test_layers = !config.all_records;
     let mut analyzer = match (&config.first_strategy, &config.second_strategy) {
-        (CompressionStrategy::Benchmark(level, sample_size), _)
-        | (_, CompressionStrategy::Benchmark(level, sample_size)) => {
-            Some(StrategyAnalyzer::new(*level, *sample_size, test_layers))
+        (CompressionStrategy::Benchmark(level, sample_size, forced_layer), _)
+        | (_, CompressionStrategy::Benchmark(level, sample_size, forced_layer)) => {
+            Some(StrategyAnalyzer::new(
+                *level,
+                *sample_size,
+                test_layers,
+                *forced_layer,
+            ))
         }
         _ => None,
     };
