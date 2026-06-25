@@ -14,17 +14,19 @@ mod index;
 mod reader;
 mod utils;
 
-use rayon::prelude::*;
 use log::{info, warn};
+use rayon::prelude::*;
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write};
 
 // Re-export public types
 pub use lib_wfa2::affine_wavefront::Distance;
+use std::collections::HashMap;
 use tracepoints::{
     cigar_to_mixed_tracepoints, cigar_to_tracepoints, cigar_to_tracepoints_fastga,
-    cigar_to_tracepoints_fastga_nodiff, cigar_to_variable_tracepoints,
+    cigar_to_tracepoints_fastga_nodiff, cigar_to_tracepoints_fastga_with_contigs,
+    cigar_to_variable_tracepoints,
 };
 
 pub use format::{
@@ -133,14 +135,20 @@ pub fn paf_to_tpa(
         _ => None,
     };
 
+    let contig_table = config.contig_table.as_ref();
+    // Contig-aware fastga emits multiple records per input line, so pass 1 can't use the name-only
+    // fast path (it must convert to count the segments for the header record_count).
+    let multi_record = contig_table.is_some() && matches!(config.tp_type, TracepointType::Fastga);
+
     let parse_record =
-        |line: &str, line_num: usize, table: &mut StringTable| -> Option<CompactRecord> {
+        |line: &str, line_num: usize, table: &mut StringTable| -> Option<Vec<CompactRecord>> {
             match parse_paf(
                 line,
                 table,
                 config.tp_type,
                 config.max_complexity,
                 config.complexity_metric,
+                contig_table,
             ) {
                 Ok(r) => Some(r),
                 Err(e) => {
@@ -173,18 +181,27 @@ pub fn paf_to_tpa(
 
         if let Some(an) = analyzer.as_mut() {
             // The analyzer needs the full record (its tracepoints), so do the full parse.
-            let Some(record) = parse_record(line, cur, &mut string_table) else {
+            let Some(records) = parse_record(line, cur, &mut string_table) else {
                 continue;
             };
-            an.analyze_record(&record)?;
+            for record in &records {
+                an.analyze_record(record)?;
+            }
+            record_count += records.len() as u64;
+        } else if multi_record {
+            // Contig-aware fastga: full parse to count the per-segment records (also interns names).
+            let Some(records) = parse_record(line, cur, &mut string_table) else {
+                continue;
+            };
+            record_count += records.len() as u64;
         } else {
             // No analyzer: pass 1 needs only names + count, so skip the conversion (done in pass 2).
             if !intern_names_only(line, &mut string_table) {
                 warn!("Skipping malformed line {}", cur + 1);
                 continue;
             }
+            record_count += 1;
         }
-        record_count += 1;
     }
 
     // Verify file is not empty
@@ -234,6 +251,7 @@ pub fn paf_to_tpa(
             config.max_complexity,
             config.distance,
             config.all_records_level,
+            config.contig_table.as_ref(),
         )
     } else {
         // Per-record compression with layers
@@ -250,6 +268,7 @@ pub fn paf_to_tpa(
             config.complexity_metric,
             config.max_complexity,
             config.distance,
+            config.contig_table.as_ref(),
         )
     }
 }
@@ -346,13 +365,24 @@ pub fn parse_tracepoints(tp_str: &str, tp_type: TracepointType) -> io::Result<Tr
 /// - Standard/Fastga: "a1,b1;a2,b2;..."
 /// - Mixed: "a,b;10I;c,d;5D;..."
 /// - Variable: "a1,b1;a2;a3,b3;..." (second value optional)
+/// Format fastga/standard `(a,b)` tracepoints as `"a,b;a,b;..."` in a single allocation, from a
+/// slice. Avoids cloning the Vec into a `TracepointData` and the per-element `String` that
+/// `format_tracepoints` allocates. Hot in fastga encode (millions of tracepoints per file).
+pub fn format_ab_tracepoints(tps: &[(usize, usize)]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(tps.len() * 8);
+    for (i, (a, b)) in tps.iter().enumerate() {
+        if i > 0 {
+            s.push(';');
+        }
+        let _ = write!(s, "{},{}", a, b);
+    }
+    s
+}
+
 pub fn format_tracepoints(data: &TracepointData) -> String {
     match data {
-        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => tps
-            .iter()
-            .map(|(a, b)| format!("{},{}", a, b))
-            .collect::<Vec<String>>()
-            .join(";"),
+        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => format_ab_tracepoints(tps),
         TracepointData::FastgaNoDiff(tps) => tps
             .iter()
             .map(|v| v.to_string())
@@ -401,6 +431,7 @@ fn compress_per_record(
     complexity_metric: ComplexityMetric,
     max_complexity: u32,
     distance: Distance,
+    contig_table: Option<&HashMap<String, Vec<(usize, usize)>>>,
 ) -> io::Result<()> {
     let mut output = File::create(output_path).map_err(|e| {
         io::Error::new(
@@ -470,19 +501,37 @@ fn compress_per_record(
         if chunk.is_empty() {
             continue;
         }
-        let packed: Vec<Option<Vec<u8>>> = chunk
+        // Each line yields one or more records (contig-aware fastga splits into several). Pack each
+        // into its own buffer; the serial write below flattens them in order so the index stays exact.
+        let packed: Vec<Vec<Vec<u8>>> = chunk
             .par_iter()
             .map(|(cur, line)| {
-                match parse_paf_readonly(line, table, tp_type, max_complexity, complexity_metric) {
-                    Ok(r) => {
-                        let mut b = Vec::new();
-                        r.write(&mut b, chosen_first, chosen_second, first_layer, second_layer)
+                match parse_paf_readonly(
+                    line,
+                    table,
+                    tp_type,
+                    max_complexity,
+                    complexity_metric,
+                    contig_table,
+                ) {
+                    Ok(records) => records
+                        .iter()
+                        .map(|r| {
+                            let mut b = Vec::new();
+                            r.write(
+                                &mut b,
+                                chosen_first,
+                                chosen_second,
+                                first_layer,
+                                second_layer,
+                            )
                             .expect("writing a record to an in-memory buffer is infallible");
-                        Some(b)
-                    }
+                            b
+                        })
+                        .collect(),
                     Err(e) => {
                         warn!("Skipping malformed line {}: {}", cur + 1, e);
-                        None
+                        Vec::new()
                     }
                 }
             })
@@ -534,6 +583,7 @@ fn compress_all_records(
     max_complexity: u32,
     distance: Distance,
     compression_level: u32,
+    contig_table: Option<&HashMap<String, Vec<(usize, usize)>>>,
 ) -> io::Result<()> {
     use noodles::bgzf;
 
@@ -584,12 +634,13 @@ fn compress_all_records(
             continue;
         }
 
-        let record = match parse_paf(
+        let records = match parse_paf(
             &line,
             string_table,
             tp_type,
             max_complexity,
             complexity_metric,
+            contig_table,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -598,23 +649,26 @@ fn compress_all_records(
             }
         };
 
-        // Capture virtual position before writing record
-        // Adjust to absolute virtual positions (block_offset includes bgzf_section_start)
-        let relative_vpos = u64::from(bgzf_writer.virtual_position());
-        let block_offset = relative_vpos >> 16;
-        let uncompressed_offset = relative_vpos & 0xFFFF;
-        let absolute_block_offset = block_offset + bgzf_section_start;
-        let absolute_vpos = (absolute_block_offset << 16) | uncompressed_offset;
-        virtual_positions.push(absolute_vpos);
+        // One input line may yield several records (contig-aware fastga); write each with its own vpos.
+        for record in &records {
+            // Capture virtual position before writing record
+            // Adjust to absolute virtual positions (block_offset includes bgzf_section_start)
+            let relative_vpos = u64::from(bgzf_writer.virtual_position());
+            let block_offset = relative_vpos >> 16;
+            let uncompressed_offset = relative_vpos & 0xFFFF;
+            let absolute_block_offset = block_offset + bgzf_section_start;
+            let absolute_vpos = (absolute_block_offset << 16) | uncompressed_offset;
+            virtual_positions.push(absolute_vpos);
 
-        // Write with strategy encoding but no per-record compression layer since BGZF handles compression
-        record.write(
-            &mut bgzf_writer,
-            chosen_first,
-            chosen_second,
-            format::CompressionLayer::Nocomp,
-            format::CompressionLayer::Nocomp,
-        )?;
+            // Write with strategy encoding but no per-record compression layer since BGZF handles compression
+            record.write(
+                &mut bgzf_writer,
+                chosen_first,
+                chosen_second,
+                format::CompressionLayer::Nocomp,
+                format::CompressionLayer::Nocomp,
+            )?;
+        }
     }
 
     // Finalize BGZF (flushes and writes EOF marker)
@@ -706,10 +760,16 @@ fn parse_paf(
     tp_type: TracepointType,
     max_complexity: u32,
     complexity_metric: ComplexityMetric,
-) -> io::Result<CompactRecord> {
-    parse_paf_with(line, tp_type, max_complexity, complexity_metric, |s, len| {
-        Ok(string_table.get_or_insert_id(s, len))
-    })
+    contig_table: Option<&HashMap<String, Vec<(usize, usize)>>>,
+) -> io::Result<Vec<CompactRecord>> {
+    parse_paf_with(
+        line,
+        tp_type,
+        max_complexity,
+        complexity_metric,
+        contig_table,
+        |s, len| Ok(string_table.get_or_insert_id(s, len)),
+    )
 }
 
 // Read-only parse (names already interned in pass 1). Takes &StringTable, so it runs on many threads.
@@ -719,26 +779,36 @@ fn parse_paf_readonly(
     tp_type: TracepointType,
     max_complexity: u32,
     complexity_metric: ComplexityMetric,
-) -> io::Result<CompactRecord> {
-    parse_paf_with(line, tp_type, max_complexity, complexity_metric, |s, _len| {
-        string_table.get_id(s).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("name '{}' not interned in pass 1", s),
-            )
-        })
-    })
+    contig_table: Option<&HashMap<String, Vec<(usize, usize)>>>,
+) -> io::Result<Vec<CompactRecord>> {
+    parse_paf_with(
+        line,
+        tp_type,
+        max_complexity,
+        complexity_metric,
+        contig_table,
+        |s, _len| {
+            string_table.get_id(s).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("name '{}' not interned in pass 1", s),
+                )
+            })
+        },
+    )
 }
 
 // Shared parse body. `resolve(name, len) -> id` either interns (pass 1) or looks up (pass 2).
-// Called query first, then target.
+// Called query first, then target. Returns one record per input line, except contig-aware fastga
+// (contig_table set), which emits one record per contig/overflow segment.
 fn parse_paf_with<F: FnMut(&str, u64) -> io::Result<u64>>(
     line: &str,
     tp_type: TracepointType,
     max_complexity: u32,
     complexity_metric: ComplexityMetric,
+    contig_table: Option<&HashMap<String, Vec<(usize, usize)>>>,
     mut resolve: F,
-) -> io::Result<CompactRecord> {
+) -> io::Result<Vec<CompactRecord>> {
     let fields: Vec<&str> = line.split('\t').collect();
     if fields.len() < 12 {
         return Err(io::Error::new(
@@ -808,6 +878,61 @@ fn parse_paf_with<F: FnMut(&str, u64) -> io::Result<u64>>(
             }
             TracepointType::Fastga => {
                 let complement = strand == '-';
+                let qcontigs = contig_table.and_then(|t| t.get(query_name));
+                let tcontigs = contig_table.and_then(|t| t.get(target_name));
+                if qcontigs.is_some() || tcontigs.is_some() {
+                    // Contig-aware: emit ONE record per contig/overflow segment (same structure as
+                    // `encode --fastga-contigs`), since the segments have distinct coordinate frames
+                    // (contig-local grids, RC target on '-') and cannot be flattened into one record.
+                    let empty: Vec<(usize, usize)> = Vec::new();
+                    let tlen = target_len as usize;
+                    let segments = cigar_to_tracepoints_fastga_with_contigs(
+                        cigar_str,
+                        max_complexity,
+                        query_start as usize,
+                        query_end as usize,
+                        query_len as usize,
+                        target_start as usize,
+                        target_end as usize,
+                        tlen,
+                        complement,
+                        qcontigs.unwrap_or(&empty),
+                        tcontigs.unwrap_or(&empty),
+                    );
+                    let mut out = Vec::with_capacity(segments.len());
+                    for (i, (seg_tps, (sqs, sqe, sts, ste))) in segments.into_iter().enumerate() {
+                        // _with_contigs returns RC target coords on '-'; store forward (like encode).
+                        let (out_ts, out_te) = if complement {
+                            (tlen - ste, tlen - sts)
+                        } else {
+                            (sts, ste)
+                        };
+                        let seg_diff: usize = seg_tps.iter().map(|(d, _)| *d).sum();
+                        let aln_len = sqe.saturating_sub(sqs);
+                        out.push(CompactRecord {
+                            query_name_id,
+                            query_start: sqs as u64,
+                            query_end: sqe as u64,
+                            strand,
+                            target_name_id,
+                            target_start: out_ts as u64,
+                            target_end: out_te as u64,
+                            residue_matches: aln_len.saturating_sub(seg_diff) as u64,
+                            alignment_block_len: aln_len as u64,
+                            mapping_quality,
+                            tracepoints: TracepointData::Fastga(seg_tps),
+                            // Line-level tags belong to the alignment, not each segment: hand them to the
+                            // first segment (move, no clone) and leave the rest empty. Avoids a per-segment
+                            // Vec alloc + tag copy, and keeps Tag/TagValue Clone-free.
+                            tags: if i == 0 {
+                                std::mem::take(&mut tags)
+                            } else {
+                                Vec::new()
+                            },
+                        });
+                    }
+                    return Ok(out);
+                }
                 let segments = cigar_to_tracepoints_fastga(
                     cigar_str,
                     max_complexity,
@@ -848,7 +973,7 @@ fn parse_paf_with<F: FnMut(&str, u64) -> io::Result<u64>>(
         ));
     };
 
-    Ok(CompactRecord {
+    Ok(vec![CompactRecord {
         query_name_id,
         query_start,
         query_end,
@@ -861,7 +986,7 @@ fn parse_paf_with<F: FnMut(&str, u64) -> io::Result<u64>>(
         mapping_quality,
         tracepoints,
         tags,
-    })
+    }])
 }
 
 fn parse_tracepoint_pair(part: &str, strict: bool) -> io::Result<(usize, usize)> {
