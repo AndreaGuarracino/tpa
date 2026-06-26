@@ -359,9 +359,15 @@ pub(crate) fn automatic_select(
                 nocomp,
             ),
         },
-        TracepointType::Fastga | TracepointType::FastgaNoDiff => (
-            CompressionStrategy::Rice(level),
-            CompressionStrategy::Rice(level),
+        TracepointType::Fastga => (
+            CompressionStrategy::EliasFano(level),
+            CompressionStrategy::Huffman(level),
+            nocomp,
+            nocomp,
+        ),
+        TracepointType::FastgaNoDiff => (
+            CompressionStrategy::Huffman(level),
+            CompressionStrategy::Raw(level),
             nocomp,
             nocomp,
         ),
