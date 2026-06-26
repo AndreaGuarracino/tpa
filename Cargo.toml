@@ -17,7 +17,7 @@ rayon = "1.11"
 noodles = { version = "0.100.0", features = ["bgzf"] }
 
 lib_wfa2 = { git = "https://github.com/AndreaGuarracino/lib_wfa2", rev = "8859b6a214141968f37d9bcb22552408318adda0" }
-tracepoints = { git = "https://github.com/AndreaGuarracino/tracepoints", rev = "9e11140392fe242081a38faa7255ef4775b235fa" }
+tracepoints = { git = "https://github.com/AndreaGuarracino/tracepoints", rev = "c0feb1dfc13ef877171ceae3ac58a14c5a9dfff4" }
 
 [dev-dependencies]
 rand = "0.8"

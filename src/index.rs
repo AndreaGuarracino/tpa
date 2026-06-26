@@ -76,7 +76,9 @@ impl TpaIndex {
 
     /// Save index to .tpa.idx file
     pub fn save(&self, idx_path: &str) -> io::Result<()> {
-        let mut file = File::create(idx_path)?;
+        // Buffer writes: the per-offset varint loop below otherwise issues several write() syscalls
+        // PER record (millions total on large inputs), which dominated compression wall time.
+        let mut file = io::BufWriter::new(File::create(idx_path)?);
 
         file.write_all(Self::INDEX_MAGIC)?;
         file.write_all(&[Self::INDEX_VERSION])?;
@@ -97,6 +99,7 @@ impl TpaIndex {
                 }
             }
         }
+        file.flush()?;
 
         Ok(())
     }

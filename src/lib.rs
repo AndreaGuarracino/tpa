@@ -63,7 +63,8 @@ pub use noodles::bgzf;
 pub use utils::{read_varint, varint_size};
 
 use crate::binary::{
-    automatic_select, decompress_varint, write_paf_line_with_tracepoints, StrategyAnalyzer,
+    automatic_select, decompress_varint, read_record, write_paf_line_with_tracepoints,
+    StrategyAnalyzer,
 };
 
 use crate::utils::open_paf_reader;
@@ -102,6 +103,126 @@ fn intern_names_only(line: &str, string_table: &mut StringTable) -> bool {
     string_table.get_or_insert_id(fields[0], query_len);
     string_table.get_or_insert_id(fields[5], target_len);
     true
+}
+
+/// Intern query+target names reading ONLY the first 7 PAF fields (via splitn), so the (potentially
+/// megabyte-long) CIGAR/tag tail is never scanned. Used by the fast plain path's name pass.
+fn intern_names_prefix(line: &str, table: &mut StringTable) -> bool {
+    let mut it = line.splitn(8, '\t');
+    let q = match it.next() {
+        Some(s) => s,
+        None => return false,
+    };
+    let qlen = match it.next() {
+        Some(s) => s,
+        None => return false,
+    };
+    if it.next().is_none() || it.next().is_none() || it.next().is_none() {
+        return false; // fields 2,3,4
+    }
+    let t = match it.next() {
+        Some(s) => s,
+        None => return false,
+    };
+    let tlen = match it.next() {
+        Some(s) => s,
+        None => return false,
+    };
+    let (Ok(ql), Ok(tl)) = (
+        parse_usize(qlen, "query_len"),
+        parse_usize(tlen, "target_len"),
+    ) else {
+        return false;
+    };
+    table.get_or_insert_id(q, ql);
+    table.get_or_insert_id(t, tl);
+    true
+}
+
+/// Parallel pass 1 for a plain (seekable, uncompressed) PAF file. Splits the file into byte ranges,
+/// one per rayon worker, and parses each range with a thread-local StringTable + record counter,
+/// then merges in file order. Merging earliest-range-first reproduces the exact first-seen id
+/// assignment of the sequential scan, so pass 2 output is byte-identical. Each range resyncs from
+/// `beg-1` to a line boundary so a line starting exactly at `beg` is owned by exactly one range.
+#[allow(clippy::too_many_arguments)]
+fn parallel_pass1_plain(
+    input_path: &str,
+    tp_type: TracepointType,
+    max_complexity: u32,
+    complexity_metric: ComplexityMetric,
+    contig_table: Option<&HashMap<String, Vec<(usize, usize)>>>,
+    multi_record: bool,
+) -> io::Result<(u64, StringTable)> {
+    let size = std::fs::metadata(input_path)?.len();
+    if size == 0 {
+        return Ok((0, StringTable::new()));
+    }
+    let nthreads = (rayon::current_num_threads() as u64).max(1);
+    let ranges: Vec<(u64, u64)> = (0..nthreads)
+        .map(|p| (size * p / nthreads, size * (p + 1) / nthreads))
+        .filter(|(b, e)| b < e)
+        .collect();
+
+    let partials: Vec<io::Result<(u64, StringTable)>> = ranges
+        .par_iter()
+        .map(|&(beg, end)| -> io::Result<(u64, StringTable)> {
+            let mut f = File::open(input_path)?;
+            let start = if beg == 0 { 0 } else { beg - 1 };
+            f.seek(io::SeekFrom::Start(start))?;
+            let mut rdr = BufReader::new(f);
+            let mut buf: Vec<u8> = Vec::new();
+            let mut pos = start;
+            if beg != 0 {
+                // discard bytes up to and including the next newline (resync to a line start)
+                let n = rdr.read_until(b'\n', &mut buf)?;
+                pos += n as u64;
+                buf.clear();
+            }
+            let mut local = StringTable::new();
+            let mut count = 0u64;
+            // own every line whose start byte is < end (read it fully, even past end)
+            while pos < end {
+                buf.clear();
+                let n = rdr.read_until(b'\n', &mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                pos += n as u64;
+                while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
+                    buf.pop();
+                }
+                let line = match std::str::from_utf8(&buf) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                if line.trim().is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if multi_record {
+                    match parse_paf(line, &mut local, tp_type, max_complexity, complexity_metric, contig_table) {
+                        Ok(recs) => count += recs.len() as u64,
+                        Err(_) => continue,
+                    }
+                } else if intern_names_only(line, &mut local) {
+                    count += 1;
+                }
+            }
+            Ok((count, local))
+        })
+        .collect();
+
+    let mut total = 0u64;
+    let mut global = StringTable::new();
+    for r in partials {
+        let (c, local) = r?;
+        total += c;
+        for id in 0..local.len() as u64 {
+            if let Some((name, len)) = local.get_name_and_len(id) {
+                global.get_or_insert_id(name, len);
+            }
+        }
+    }
+    Ok((total, global))
 }
 
 /// Convert a PAF file to TPA format
@@ -145,6 +266,46 @@ pub fn paf_to_tpa(
     // fast path (it must convert to count the segments for the header record_count).
     let multi_record = contig_table.is_some() && matches!(config.tp_type, TracepointType::Fastga);
 
+    // Fast path: known strategy (no benchmark analyzer) + plain seekable input + per-record mode.
+    // Two byte-range-parallel passes: pass 1 interns names only (cheap, no tracepoint compute),
+    // pass 2 parses+encodes once into per-range buffers (tracepoints computed exactly once).
+    let plain_seekable =
+        input_path != "-" && !input_path.ends_with(".gz") && !input_path.ends_with(".bgz");
+    if analyzer.is_none() && plain_seekable && !config.all_records {
+        let (cf, cs, fl, sl) = if uses_automatic {
+            let level = config.first_strategy.zstd_level();
+            let r = automatic_select(config.tp_type, config.complexity_metric, level);
+            info!(
+                "Automatic: {} [{}] → {} [{}]",
+                r.0,
+                r.2.as_str(),
+                r.1,
+                r.3.as_str()
+            );
+            r
+        } else {
+            (
+                config.first_strategy,
+                config.second_strategy,
+                config.first_layer,
+                config.second_layer,
+            )
+        };
+        return compress_fast_plain(
+            input_path,
+            output_path,
+            cf,
+            cs,
+            fl,
+            sl,
+            config.tp_type,
+            config.complexity_metric,
+            config.max_complexity,
+            config.distance,
+            contig_table,
+        );
+    }
+
     let parse_record =
         |line: &str, line_num: usize, table: &mut StringTable| -> Option<Vec<CompactRecord>> {
             match parse_paf(
@@ -163,49 +324,67 @@ pub fn paf_to_tpa(
             }
         };
 
-    let mut input = open_paf_reader(input_path)?;
-    let mut buf: Vec<u8> = Vec::new(); // reused line buffer (avoid a String alloc per line)
-    let mut line_num = 0usize;
-    loop {
-        buf.clear();
-        if input.read_until(b'\n', &mut buf)? == 0 {
-            break;
-        }
-        let cur = line_num;
-        line_num += 1;
-        while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
-            buf.pop();
-        }
-        let line = match std::str::from_utf8(&buf) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        if line.trim().is_empty() || line.starts_with('#') {
-            continue;
-        }
+    // No analyzer (no order-dependent sampling) + plain seekable input => parallel byte-range pass 1.
+    // Gz/bgz/stdin are not seekable into, and the benchmark analyzer samples the first N records in
+    // order, so those keep the sequential scan below.
+    let plain_seekable =
+        input_path != "-" && !input_path.ends_with(".gz") && !input_path.ends_with(".bgz");
+    if analyzer.is_none() && plain_seekable {
+        let (rc, st) = parallel_pass1_plain(
+            input_path,
+            config.tp_type,
+            config.max_complexity,
+            config.complexity_metric,
+            contig_table,
+            multi_record,
+        )?;
+        record_count = rc;
+        string_table = st;
+    } else {
+        let mut input = open_paf_reader(input_path)?;
+        let mut buf: Vec<u8> = Vec::new(); // reused line buffer (avoid a String alloc per line)
+        let mut line_num = 0usize;
+        loop {
+            buf.clear();
+            if input.read_until(b'\n', &mut buf)? == 0 {
+                break;
+            }
+            let cur = line_num;
+            line_num += 1;
+            while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
+                buf.pop();
+            }
+            let line = match std::str::from_utf8(&buf) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if line.trim().is_empty() || line.starts_with('#') {
+                continue;
+            }
 
-        if let Some(an) = analyzer.as_mut() {
-            // The analyzer needs the full record (its tracepoints), so do the full parse.
-            let Some(records) = parse_record(line, cur, &mut string_table) else {
-                continue;
-            };
-            for record in &records {
-                an.analyze_record(record)?;
+            if let Some(an) = analyzer.as_mut() {
+                // The analyzer needs the full record (its tracepoints), so do the full parse.
+                let Some(records) = parse_record(line, cur, &mut string_table) else {
+                    continue;
+                };
+                for record in &records {
+                    an.analyze_record(record)?;
+                }
+                record_count += records.len() as u64;
+            } else if multi_record {
+                // Contig-aware fastga: full parse to count the per-segment records (also interns names).
+                let Some(records) = parse_record(line, cur, &mut string_table) else {
+                    continue;
+                };
+                record_count += records.len() as u64;
+            } else {
+                // No analyzer: pass 1 needs only names + count, so skip the conversion (done in pass 2).
+                if !intern_names_only(line, &mut string_table) {
+                    warn!("Skipping malformed line {}", cur + 1);
+                    continue;
+                }
+                record_count += 1;
             }
-            record_count += records.len() as u64;
-        } else if multi_record {
-            // Contig-aware fastga: full parse to count the per-segment records (also interns names).
-            let Some(records) = parse_record(line, cur, &mut string_table) else {
-                continue;
-            };
-            record_count += records.len() as u64;
-        } else {
-            // No analyzer: pass 1 needs only names + count, so skip the conversion (done in pass 2).
-            if !intern_names_only(line, &mut string_table) {
-                warn!("Skipping malformed line {}", cur + 1);
-                continue;
-            }
-            record_count += 1;
         }
     }
 
@@ -423,6 +602,186 @@ pub fn format_tracepoints(data: &TracepointData) -> String {
 /// Each record is independently compressed with configurable layers (Zstd/Bgzip/Nocomp).
 /// Random access via byte offset index (.tpa.idx file, rebuilt if missing).
 /// Offsets can also be stored externally and used with standalone seek functions.
+/// Two byte-range-parallel passes for plain input with a known strategy.
+/// Pass 1 interns names only (no tracepoint compute). Pass 2 parses + encodes each range ONCE into
+/// a local byte buffer (+ relative offsets). The buffers are concatenated in file order, so the
+/// string-table ids and record order match the sequential path exactly (byte-identical output).
+/// Tracepoints are computed exactly once; there is no serial chunked read and no per-record lseek.
+#[allow(clippy::too_many_arguments)]
+fn compress_fast_plain(
+    input_path: &str,
+    output_path: &str,
+    chosen_first: CompressionStrategy,
+    chosen_second: CompressionStrategy,
+    first_layer: format::CompressionLayer,
+    second_layer: format::CompressionLayer,
+    tp_type: TracepointType,
+    complexity_metric: ComplexityMetric,
+    max_complexity: u32,
+    distance: Distance,
+    contig_table: Option<&HashMap<String, Vec<(usize, usize)>>>,
+) -> io::Result<()> {
+    let size = std::fs::metadata(input_path)?.len();
+    if size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "No records found in PAF file",
+        ));
+    }
+    let nthreads = (rayon::current_num_threads() as u64).max(1);
+    let ranges: Vec<(u64, u64)> = (0..nthreads)
+        .map(|p| (size * p / nthreads, size * (p + 1) / nthreads))
+        .filter(|(b, e)| b < e)
+        .collect();
+
+    // Visit every line whose start byte is in [beg, end); resync from beg-1 so a line starting
+    // exactly at beg is owned by exactly one range. `f` is called with each line.
+    fn for_each_line_in_range<F: FnMut(&str)>(
+        input_path: &str,
+        beg: u64,
+        end: u64,
+        mut f: F,
+    ) -> io::Result<()> {
+        let mut file = File::open(input_path)?;
+        let start = if beg == 0 { 0 } else { beg - 1 };
+        file.seek(io::SeekFrom::Start(start))?;
+        let mut rdr = BufReader::new(file);
+        let mut buf: Vec<u8> = Vec::new();
+        let mut pos = start;
+        if beg != 0 {
+            let n = rdr.read_until(b'\n', &mut buf)?;
+            pos += n as u64;
+            buf.clear();
+        }
+        while pos < end {
+            buf.clear();
+            let n = rdr.read_until(b'\n', &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            pos += n as u64;
+            while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
+                buf.pop();
+            }
+            if let Ok(line) = std::str::from_utf8(&buf) {
+                let t = line.trim();
+                if !t.is_empty() && !t.starts_with('#') {
+                    f(line);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // Pass 1: intern names only (cheap; no tracepoint computation).
+    let name_tables: Vec<StringTable> = ranges
+        .par_iter()
+        .map(|&(beg, end)| -> io::Result<StringTable> {
+            let mut local = StringTable::new();
+            for_each_line_in_range(input_path, beg, end, |line| {
+                intern_names_prefix(line, &mut local);
+            })?;
+            Ok(local)
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut global = StringTable::new();
+    for local in &name_tables {
+        for id in 0..local.len() as u64 {
+            if let Some((name, len)) = local.get_name_and_len(id) {
+                global.get_or_insert_id(name, len);
+            }
+        }
+    }
+    let global_ref = &global;
+
+    // Pass 2: parse + encode each range ONCE into a local buffer with relative offsets.
+    let range_out: Vec<(Vec<u8>, Vec<u64>)> = ranges
+        .par_iter()
+        .map(|&(beg, end)| -> io::Result<(Vec<u8>, Vec<u64>)> {
+            // Pre-size the output buffer (~1/3 of the input range; TPA is smaller than the PAF) to
+            // avoid repeated Vec doubling+copy as it grows to tens of MB.
+            let mut buf: Vec<u8> = Vec::with_capacity(((end - beg) / 3) as usize);
+            let mut offs: Vec<u64> = Vec::new();
+            for_each_line_in_range(input_path, beg, end, |line| {
+                match parse_paf_readonly(
+                    line,
+                    global_ref,
+                    tp_type,
+                    max_complexity,
+                    complexity_metric,
+                    contig_table,
+                ) {
+                    Ok(records) => {
+                        for r in &records {
+                            offs.push(buf.len() as u64);
+                            r.write(&mut buf, chosen_first, chosen_second, first_layer, second_layer)
+                                .expect("writing a record to an in-memory buffer is infallible");
+                        }
+                    }
+                    Err(e) => warn!("Skipping malformed line: {}", e),
+                }
+            })?;
+            Ok((buf, offs))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+
+    let record_count: u64 = range_out.iter().map(|(_, o)| o.len() as u64).sum();
+    if record_count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "No records found in PAF file",
+        ));
+    }
+
+    // Assemble: header -> string table -> concatenated range buffers; index from offsets.
+    let mut output = File::create(output_path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("Failed to create output file '{}': {}", output_path, e),
+        )
+    })?;
+    let header = TpaHeader::new(
+        record_count,
+        global.len() as u64,
+        chosen_first,
+        chosen_second,
+        first_layer,
+        second_layer,
+        tp_type,
+        complexity_metric,
+        max_complexity,
+        distance,
+        false,
+    )?;
+    header.write(&mut output)?;
+    global.write(&mut output)?;
+    let mut base = output.stream_position()?;
+    let mut byte_offsets: Vec<u64> = Vec::with_capacity(record_count as usize);
+    let mut writer = BufWriter::new(&mut output);
+    for (buf, offs) in &range_out {
+        for &o in offs {
+            byte_offsets.push(base + o);
+        }
+        writer.write_all(buf)?;
+        base += buf.len() as u64;
+    }
+    writer.flush()?;
+    drop(writer);
+    let footer = TpaFooter::new(record_count, global.len() as u64);
+    footer.write(&mut output)?;
+    output.sync_all()?;
+    let idx_path = format!("{}.idx", output_path);
+    index::TpaIndex::new_raw(byte_offsets).save(&idx_path)?;
+    info!(
+        "Converted {} records ({} unique sequence names) with strategies {} / {} [per-record mode, fast plain]",
+        record_count,
+        global.len(),
+        chosen_first,
+        chosen_second
+    );
+    Ok(())
+}
+
 fn compress_per_record(
     input_path: &str,
     output_path: &str,
@@ -468,6 +827,7 @@ fn compress_per_record(
     let mut byte_offsets = Vec::with_capacity(record_count as usize);
 
     // Write records with chosen strategy
+    let mut cur_off = output.stream_position()?; // base offset (after header + string table)
     let mut writer = BufWriter::new(&mut output);
     let mut input = open_paf_reader(input_path)?;
     // read_until into a reused buffer instead of lines() (a String alloc per line); records are
@@ -542,7 +902,8 @@ fn compress_per_record(
             })
             .collect();
         for b in packed.into_iter().flatten() {
-            byte_offsets.push(writer.stream_position()?);
+            byte_offsets.push(cur_off);
+            cur_off += b.len() as u64;
             writer.write_all(&b)?;
         }
     }
@@ -702,10 +1063,94 @@ fn compress_all_records(
     Ok(())
 }
 
+/// Parallel decode for a seekable .tpa with a per-record (raw-offset) index. Reads records in
+/// chunks by byte-range, decodes + formats each chunk's records in parallel into ordered buffers,
+/// and writes them in order (byte-identical to the sequential decoder). Returns Ok(false) to fall
+/// back to the sequential stream decoder (stdin, missing/incompatible index).
+fn decompress_per_record_parallel(
+    input_path: &str,
+    output_path: &str,
+    header: &TpaHeader,
+) -> io::Result<bool> {
+    if input_path == "-" {
+        return Ok(false);
+    }
+    let idx_path = format!("{}.idx", input_path);
+    let index = match TpaIndex::load(&idx_path) {
+        Ok(ix)
+            if ix.index_type() == crate::index::IndexType::RawOffset
+                && ix.len() as u64 == header.num_records =>
+        {
+            ix
+        }
+        _ => return Ok(false),
+    };
+    let n = header.num_records as usize;
+    let (first_strategy, second_strategy) = header.strategies()?;
+
+    // Read the string table (right after the header), then seek per chunk via the index.
+    let mut f = File::open(input_path)?;
+    read_header(&mut f)?;
+    let string_table = StringTable::read(&mut f, header.num_strings())?;
+    let file_size = std::fs::metadata(input_path)?.len();
+
+    let output: Box<dyn Write> = if output_path == "-" {
+        Box::new(io::stdout())
+    } else {
+        Box::new(File::create(output_path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("Failed to create output file '{}': {}", output_path, e),
+            )
+        })?)
+    };
+    let mut writer = BufWriter::new(output);
+
+    let tp_type = header.tracepoint_type;
+    let (fl, sl) = (header.first_layer, header.second_layer);
+    let st = &string_table;
+    let index = &index;
+    // CHUNK bounds peak memory to ~CHUNK output lines; records decode independently (read_record
+    // self-delimits, so each record's slice may run past its end into the next record/footer).
+    const CHUNK: usize = 65536;
+    let mut c = 0usize;
+    while c < n {
+        let end = (c + CHUNK).min(n);
+        let base = index.get_position(c as u64).unwrap();
+        let chunk_end = if end < n {
+            index.get_position(end as u64).unwrap()
+        } else {
+            file_size
+        };
+        f.seek(io::SeekFrom::Start(base))?;
+        let mut raw = vec![0u8; (chunk_end - base) as usize];
+        f.read_exact(&mut raw)?;
+        let raw = &raw;
+        let bufs: Vec<Vec<u8>> = (c..end)
+            .into_par_iter()
+            .map(|j| -> io::Result<Vec<u8>> {
+                let rel = (index.get_position(j as u64).unwrap() - base) as usize;
+                let mut cur = io::Cursor::new(&raw[rel..]);
+                let record =
+                    read_record(&mut cur, first_strategy, second_strategy, tp_type, fl, sl)?;
+                let mut b = Vec::with_capacity(4096);
+                write_paf_line_with_tracepoints(&mut b, &record, st)?;
+                Ok(b)
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        for b in &bufs {
+            writer.write_all(b)?;
+        }
+        c = end;
+    }
+    writer.flush()?;
+    info!("Decompressed {} records [per-record mode, parallel]", header.num_records);
+    Ok(true)
+}
+
 fn decompress_per_record(input_path: &str, output_path: &str) -> io::Result<()> {
     let mut file = File::open(input_path)?;
     let header = read_header(&mut file)?;
-    let reader = BufReader::new(file);
 
     let (first_strategy, second_strategy) = header.strategies()?;
     info!(
@@ -713,6 +1158,12 @@ fn decompress_per_record(input_path: &str, output_path: &str) -> io::Result<()> 
         header.num_records, header.num_strings, first_strategy, second_strategy
     );
 
+    // Fast path: seekable file + per-record index => parallel chunked decode.
+    if decompress_per_record_parallel(input_path, output_path, &header)? {
+        return Ok(());
+    }
+
+    let reader = BufReader::new(file);
     decompress_varint(
         reader,
         output_path,

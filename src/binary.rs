@@ -2456,22 +2456,31 @@ impl CompactRecord {
                     _ => encode_tracepoint_values(&second_vals, second_strategy)?,
                 };
 
-                // Use the explicitly passed layer parameter
-                let first_compressed = compress_with_layer(
-                    &first_val_buf[..],
-                    first_layer,
-                    first_strategy.zstd_level(),
-                )?;
-                let second_compressed = compress_with_layer(
-                    &second_val_buf[..],
-                    second_layer,
-                    second_strategy.zstd_level(),
-                )?;
+                // Apply the layer.
+                let first_tmp;
+                let first_compressed: &[u8] = if matches!(first_layer, CompressionLayer::Nocomp) {
+                    &first_val_buf
+                } else {
+                    first_tmp =
+                        compress_with_layer(&first_val_buf[..], first_layer, first_strategy.zstd_level())?;
+                    &first_tmp
+                };
+                let second_tmp;
+                let second_compressed: &[u8] = if matches!(second_layer, CompressionLayer::Nocomp) {
+                    &second_val_buf
+                } else {
+                    second_tmp = compress_with_layer(
+                        &second_val_buf[..],
+                        second_layer,
+                        second_strategy.zstd_level(),
+                    )?;
+                    &second_tmp
+                };
 
                 write_varint(writer, first_compressed.len() as u64)?;
-                writer.write_all(&first_compressed)?;
+                writer.write_all(first_compressed)?;
                 write_varint(writer, second_compressed.len() as u64)?;
-                writer.write_all(&second_compressed)?;
+                writer.write_all(second_compressed)?;
             }
             TracepointData::FastgaNoDiff(tps) => {
                 // Single stream: [num_items][first_len][first_data]

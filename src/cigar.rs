@@ -51,6 +51,23 @@ impl CigarStats {
         stats
     }
 
+    /// Build stats from pre-parsed CIGAR ops, avoiding a second string parse
+    ///
+    /// Equivalent to `from_cigar` but consumes `(len, op)` pairs a caller already parsed.
+    pub fn from_ops(ops: &[(usize, char)]) -> Self {
+        let mut stats = CigarStats::default();
+        for &(len, op) in ops {
+            match op {
+                'M' | '=' => stats.matches += len,
+                'X' => stats.mismatches += len,
+                'I' => stats.insertion_runs.push(len),
+                'D' => stats.deletion_runs.push(len),
+                _ => {}
+            }
+        }
+        stats
+    }
+
     /// Number of insertion events (runs)
     pub fn insertions(&self) -> usize {
         self.insertion_runs.len()
