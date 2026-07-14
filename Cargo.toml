@@ -16,8 +16,8 @@ bgzip = "0.3"
 rayon = "1.11"
 noodles = { version = "0.100.0", features = ["bgzf"] }
 
-lib_wfa2 = { git = "https://github.com/AndreaGuarracino/lib_wfa2", rev = "8859b6a214141968f37d9bcb22552408318adda0" }
-tracepoints = { git = "https://github.com/AndreaGuarracino/tracepoints", rev = "044c710839f71b3f822d0248ba0dd84aa22bd929" }
+lib_wfa2 = { git = "https://github.com/AndreaGuarracino/lib_wfa2", rev = "dac5d8b23aeaf4b76bebd5e4e2e1511fc25d18ac" }
+tracepoints = { git = "https://github.com/AndreaGuarracino/tracepoints", rev = "f6dfb026e558e0398852ffb5376ab4119efe3e7d" }
 
 [dev-dependencies]
 rand = "0.8"
