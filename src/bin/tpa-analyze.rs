@@ -188,7 +188,8 @@ fn analyze_tpa(
     let start_pos = reader.stream_position()?;
     let header = TpaHeader::read(&mut reader)?;
     let header_end_pos = reader.stream_position()?;
-    let header_size = header_end_pos - start_pos;
+    let header_size =
+        (header_end_pos - start_pos) + tpa::HuffmanTables::skip(&mut reader, &header)?;
 
     // Read string table and track position
     let string_table_start = reader.stream_position()?;

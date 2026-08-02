@@ -139,7 +139,28 @@ impl TpaIndex {
         reader.read_exact(&mut bgzf_buf)?;
         let bgzf_section_start = u64::from_le_bytes(bgzf_buf);
 
-        let num_positions = read_varint(&mut reader)? as usize;
+        let position_count = read_varint(&mut reader)?;
+        let num_positions = usize::try_from(position_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "index position count does not fit in memory",
+            )
+        })?;
+        let remaining = reader
+            .get_ref()
+            .metadata()?
+            .len()
+            .saturating_sub(reader.stream_position()?);
+        let min_bytes = match index_type {
+            IndexType::RawOffset => 1,
+            IndexType::VirtualPosition => 8,
+        };
+        if position_count > remaining / min_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "index position count exceeds the file size",
+            ));
+        }
 
         let mut positions = Vec::with_capacity(num_positions);
         match index_type {
@@ -155,6 +176,12 @@ impl TpaIndex {
                     positions.push(u64::from_le_bytes(buf));
                 }
             }
+        }
+        if reader.read(&mut [0])? != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "index has trailing data",
+            ));
         }
 
         Ok(Self {
@@ -181,12 +208,46 @@ impl TpaIndex {
 
     /// Get position for a specific record ID (raw offset or virtual position depending on type)
     pub fn get_position(&self, record_id: u64) -> Option<u64> {
-        self.positions.get(record_id as usize).copied()
+        self.positions
+            .get(usize::try_from(record_id).ok()?)
+            .copied()
     }
 
     /// Get the BGZF section start offset (for all-records mode, 0 for per-record mode)
     pub fn bgzf_section_start(&self) -> u64 {
         self.bgzf_section_start
+    }
+
+    pub(crate) fn validates(
+        &self,
+        expected_type: IndexType,
+        record_count: u64,
+        records_start: u64,
+        file_len: u64,
+    ) -> bool {
+        let first = match expected_type {
+            IndexType::RawOffset => records_start,
+            IndexType::VirtualPosition => match records_start.checked_mul(1 << 16) {
+                Some(position) => position,
+                None => return false,
+            },
+        };
+        self.index_type == expected_type
+            && self.positions.len() as u64 == record_count
+            && self.positions.first().is_none_or(|&p| p == first)
+            && self.positions.windows(2).all(|w| w[0] < w[1])
+            && match expected_type {
+                IndexType::RawOffset => {
+                    self.bgzf_section_start == 0 && self.positions.iter().all(|&p| p < file_len)
+                }
+                IndexType::VirtualPosition => {
+                    self.bgzf_section_start == records_start
+                        && self
+                            .positions
+                            .iter()
+                            .all(|&p| (p >> 16) >= records_start && (p >> 16) < file_len)
+                }
+            }
     }
 }
 

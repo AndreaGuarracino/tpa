@@ -55,6 +55,12 @@ pub fn read_varint<R: Read>(reader: &mut R) -> io::Result<u64> {
         let mut byte_buf = [0u8; 1];
         reader.read_exact(&mut byte_buf)?;
         let byte = byte_buf[0];
+        if shift == 63 && byte & 0xfe != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Varint overflows u64",
+            ));
+        }
         value |= ((byte & 0x7F) as u64) << shift;
         if byte & 0x80 == 0 {
             break;
@@ -233,11 +239,16 @@ pub(crate) fn parse_u8(s: &str, field: &str) -> io::Result<u8> {
     })
 }
 
+/// Whether a PAF path is a compressed stream, so byte ranges into it are meaningless.
+pub(crate) fn is_compressed_paf(input_path: &str) -> bool {
+    input_path.ends_with(".gz") || input_path.ends_with(".bgz")
+}
+
 /// Open PAF reader (supports stdin, plain, and gzipped files)
 pub(crate) fn open_paf_reader(input_path: &str) -> io::Result<Box<dyn BufRead>> {
     if input_path == "-" {
         Ok(Box::new(BufReader::new(io::stdin())))
-    } else if input_path.ends_with(".gz") || input_path.ends_with(".bgz") {
+    } else if is_compressed_paf(input_path) {
         let file = File::open(input_path).map_err(|e| {
             io::Error::new(
                 e.kind(),
@@ -254,5 +265,23 @@ pub(crate) fn open_paf_reader(input_path: &str) -> io::Result<Box<dyn BufRead>> 
             )
         })?;
         Ok(Box::new(BufReader::new(file)))
+    }
+}
+
+#[cfg(test)]
+mod varint_tests {
+    use super::*;
+
+    #[test]
+    fn u64_boundary_and_overflow() {
+        let mut encoded = Vec::new();
+        write_varint(&mut encoded, u64::MAX).unwrap();
+        assert_eq!(read_varint(&mut &encoded[..]).unwrap(), u64::MAX);
+
+        let overflow = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02];
+        assert_eq!(
+            read_varint(&mut &overflow[..]).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }

@@ -39,8 +39,10 @@ fn strategy_to_name(strat: &str) -> String {
         "Simple8bFull" => "simple8b-full",
         "SelectiveRLE" => "selective-rle",
         "Rice" => "rice",
+        "LocalHuffman" => "local-huffman",
         "Huffman" => "huffman",
         "LZ77" => "lz77",
+        "EliasFano" => "elias-fano",
         _ => "unknown",
     }
     .to_string()

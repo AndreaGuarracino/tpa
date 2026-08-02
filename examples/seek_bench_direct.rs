@@ -20,9 +20,9 @@ use std::io::{BufRead, BufReader};
 use std::time::Instant;
 use tpa::{
     bgzf, read_mixed_tracepoints_at_offset, read_mixed_tracepoints_at_vpos,
-    read_standard_tracepoints_at_offset_with_strategies, read_standard_tracepoints_at_vpos,
-    read_variable_tracepoints_at_offset, read_variable_tracepoints_at_vpos, MixedRepresentation,
-    TpaReader,
+    read_standard_tracepoints_at_offset_with_tables, read_standard_tracepoints_at_vpos_with_tables,
+    read_variable_tracepoints_at_offset, read_variable_tracepoints_at_vpos, HuffmanTables,
+    MixedRepresentation, TpaReader,
 };
 
 /// Reference tracepoints parsed from PAF file
@@ -129,6 +129,7 @@ fn main() {
     }
 
     let tpa_path = &args[1];
+    let tables = HuffmanTables::load(tpa_path).expect("failed to read TPA header/tables");
     let num_records: u64 = args[2].parse().unwrap();
     let num_positions: usize = args[3].parse().unwrap();
     let iterations_per_pos: usize = args[4].parse().unwrap();
@@ -201,11 +202,12 @@ fn main() {
             for _ in 0..3 {
                 match tp_type.as_str() {
                     "standard" | "fastga" => {
-                        let _ = read_standard_tracepoints_at_vpos(
+                        let _ = read_standard_tracepoints_at_vpos_with_tables(
                             &mut bgzf_reader,
                             vpos,
-                            first_strategy.clone(),
-                            second_strategy.clone(),
+                            first_strategy,
+                            second_strategy,
+                            &tables,
                             first_layer,
                             second_layer,
                         );
@@ -214,8 +216,8 @@ fn main() {
                         let _ = read_variable_tracepoints_at_vpos(
                             &mut bgzf_reader,
                             vpos,
-                            first_strategy.clone(),
-                            second_strategy.clone(),
+                            first_strategy,
+                            second_strategy,
                             first_layer,
                             second_layer,
                         );
@@ -224,8 +226,8 @@ fn main() {
                         let _ = read_mixed_tracepoints_at_vpos(
                             &mut bgzf_reader,
                             vpos,
-                            first_strategy.clone(),
-                            second_strategy.clone(),
+                            first_strategy,
+                            second_strategy,
                             first_layer,
                             second_layer,
                         );
@@ -239,11 +241,12 @@ fn main() {
                 let start = Instant::now();
                 let (decoded, is_valid) = match tp_type.as_str() {
                     "standard" | "fastga" => {
-                        match read_standard_tracepoints_at_vpos(
+                        match read_standard_tracepoints_at_vpos_with_tables(
                             &mut bgzf_reader,
                             vpos,
-                            first_strategy.clone(),
-                            second_strategy.clone(),
+                            first_strategy,
+                            second_strategy,
+                            &tables,
                             first_layer,
                             second_layer,
                         ) {
@@ -264,8 +267,8 @@ fn main() {
                         match read_variable_tracepoints_at_vpos(
                             &mut bgzf_reader,
                             vpos,
-                            first_strategy.clone(),
-                            second_strategy.clone(),
+                            first_strategy,
+                            second_strategy,
                             first_layer,
                             second_layer,
                         ) {
@@ -286,8 +289,8 @@ fn main() {
                         match read_mixed_tracepoints_at_vpos(
                             &mut bgzf_reader,
                             vpos,
-                            first_strategy.clone(),
-                            second_strategy.clone(),
+                            first_strategy,
+                            second_strategy,
                             first_layer,
                             second_layer,
                         ) {
@@ -326,11 +329,12 @@ fn main() {
             for _ in 0..3 {
                 match tp_type.as_str() {
                     "standard" | "fastga" => {
-                        let _ = read_standard_tracepoints_at_offset_with_strategies(
+                        let _ = read_standard_tracepoints_at_offset_with_tables(
                             &mut file,
                             offset,
-                            first_strategy.clone(),
-                            second_strategy.clone(),
+                            first_strategy,
+                            second_strategy,
+                            &tables,
                             first_layer,
                             second_layer,
                         );
@@ -339,8 +343,8 @@ fn main() {
                         let _ = read_variable_tracepoints_at_offset(
                             &mut file,
                             offset,
-                            first_strategy.clone(),
-                            second_strategy.clone(),
+                            first_strategy,
+                            second_strategy,
                             first_layer,
                             second_layer,
                         );
@@ -349,8 +353,8 @@ fn main() {
                         let _ = read_mixed_tracepoints_at_offset(
                             &mut file,
                             offset,
-                            first_strategy.clone(),
-                            second_strategy.clone(),
+                            first_strategy,
+                            second_strategy,
                             first_layer,
                             second_layer,
                         );
@@ -364,11 +368,12 @@ fn main() {
                 let start = Instant::now();
                 let (decoded, is_valid) = match tp_type.as_str() {
                     "standard" | "fastga" => {
-                        match read_standard_tracepoints_at_offset_with_strategies(
+                        match read_standard_tracepoints_at_offset_with_tables(
                             &mut file,
                             offset,
-                            first_strategy.clone(),
-                            second_strategy.clone(),
+                            first_strategy,
+                            second_strategy,
+                            &tables,
                             first_layer,
                             second_layer,
                         ) {
@@ -389,8 +394,8 @@ fn main() {
                         match read_variable_tracepoints_at_offset(
                             &mut file,
                             offset,
-                            first_strategy.clone(),
-                            second_strategy.clone(),
+                            first_strategy,
+                            second_strategy,
                             first_layer,
                             second_layer,
                         ) {
@@ -411,8 +416,8 @@ fn main() {
                         match read_mixed_tracepoints_at_offset(
                             &mut file,
                             offset,
-                            first_strategy.clone(),
-                            second_strategy.clone(),
+                            first_strategy,
+                            second_strategy,
                             first_layer,
                             second_layer,
                         ) {

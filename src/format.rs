@@ -7,16 +7,21 @@ use std::str::FromStr;
 use tracepoints::{ComplexityMetric, TracepointData, TracepointType};
 
 pub const TPA_VERSION: u8 = 1;
+
+/// Version carrying file-level Huffman tables.
+pub(crate) const TPA_VERSION_HUFFMAN_TABLE: u8 = 2;
+
+const HUFFMAN_CODE: u8 = 19;
 pub const TPA_MAGIC: &[u8; 4] = b"TPA\0";
 
-/// Write the common prefix shared by header and footer: magic, version, record_count, string_count
-fn write_common_prefix<W: Write>(
+fn write_common_prefix_versioned<W: Write>(
     writer: &mut W,
     num_records: u64,
     num_strings: u64,
+    version: u8,
 ) -> io::Result<()> {
     writer.write_all(TPA_MAGIC)?;
-    writer.write_all(&[TPA_VERSION])?;
+    writer.write_all(&[version])?;
     write_varint(writer, num_records)?;
     write_varint(writer, num_strings)?;
     Ok(())
@@ -36,7 +41,7 @@ fn read_common_prefix<R: Read>(reader: &mut R) -> io::Result<(u8, u64, u64)> {
     let mut version_buf = [0u8; 1];
     reader.read_exact(&mut version_buf)?;
     let version = version_buf[0];
-    if version != TPA_VERSION {
+    if version != TPA_VERSION && version != TPA_VERSION_HUFFMAN_TABLE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Unsupported TPA version: {}", version),
@@ -330,6 +335,8 @@ pub enum CompressionStrategy {
     /// - Stores compact code lengths; canonical decoding avoids storing tree
     /// - Byte-aligned output keeps O(1) random access
     /// - Configurable compression level (max 22, default: 3)
+    LocalHuffman(i32),
+    /// Canonical Huffman over raw values using one file-level table. Requires a histogram pass.
     Huffman(i32),
     /// LZ77-style sequence matching
     /// - Finds repeated sequences in sliding window
@@ -347,7 +354,7 @@ pub enum CompressionStrategy {
 }
 
 impl CompressionStrategy {
-    /// Return all encoding strategies (excludes Automatic/Benchmark)
+    /// Record-local benchmark candidates; the file-table Huffman is scored separately.
     pub fn all(level: i32) -> Vec<Self> {
         vec![
             CompressionStrategy::Raw(level),
@@ -366,7 +373,7 @@ impl CompressionStrategy {
             CompressionStrategy::Simple8bFull(level),
             CompressionStrategy::SelectiveRLE(level),
             CompressionStrategy::Rice(level),
-            CompressionStrategy::Huffman(level),
+            CompressionStrategy::LocalHuffman(level),
             CompressionStrategy::LZ77(level),
             CompressionStrategy::EliasFano(level),
         ]
@@ -471,6 +478,7 @@ impl CompressionStrategy {
             "simple8b-full" | "simple8bfull" => Ok(CompressionStrategy::Simple8bFull(level)),
             "selective-rle" | "selectiverle" => Ok(CompressionStrategy::SelectiveRLE(level)),
             "rice" => Ok(CompressionStrategy::Rice(level)),
+            "local-huffman" | "localhuffman" => Ok(CompressionStrategy::LocalHuffman(level)),
             "huffman" => Ok(CompressionStrategy::Huffman(level)),
             "lz77" => Ok(CompressionStrategy::LZ77(level)),
             "elias-fano" | "ef" => Ok(CompressionStrategy::EliasFano(level)),
@@ -502,6 +510,7 @@ impl CompressionStrategy {
             "simple8b-full",
             "selective-rle",
             "rice",
+            "local-huffman",
             "huffman",
             "lz77",
             "elias-fano",
@@ -509,7 +518,7 @@ impl CompressionStrategy {
     }
 
     /// Convert to strategy code for file header
-    /// Strategy codes: 0-17 (18 concrete strategies)
+    /// Strategy codes: 0-19 (20 concrete strategies)
     fn to_code(self) -> io::Result<u8> {
         match self {
             CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _, _) => {
@@ -534,14 +543,15 @@ impl CompressionStrategy {
             CompressionStrategy::Simple8bFull(_) => Ok(13),
             CompressionStrategy::SelectiveRLE(_) => Ok(14),
             CompressionStrategy::Rice(_) => Ok(15),
-            CompressionStrategy::Huffman(_) => Ok(16),
+            CompressionStrategy::LocalHuffman(_) => Ok(16),
             CompressionStrategy::LZ77(_) => Ok(17),
             CompressionStrategy::EliasFano(_) => Ok(18),
+            CompressionStrategy::Huffman(_) => Ok(19),
         }
     }
 
     /// Parse from strategy code
-    /// Strategy codes: 0-17 (18 concrete strategies)
+    /// Strategy codes: 0-19 (20 concrete strategies)
     fn from_code(code: u8) -> io::Result<Self> {
         match code {
             0 => Ok(CompressionStrategy::Raw(3)),
@@ -560,9 +570,10 @@ impl CompressionStrategy {
             13 => Ok(CompressionStrategy::Simple8bFull(3)),
             14 => Ok(CompressionStrategy::SelectiveRLE(3)),
             15 => Ok(CompressionStrategy::Rice(3)),
-            16 => Ok(CompressionStrategy::Huffman(3)),
+            16 => Ok(CompressionStrategy::LocalHuffman(3)),
             17 => Ok(CompressionStrategy::LZ77(3)),
             18 => Ok(CompressionStrategy::EliasFano(3)),
+            19 => Ok(CompressionStrategy::Huffman(3)),
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("Unsupported compression strategy code: {}", code),
@@ -593,10 +604,16 @@ impl CompressionStrategy {
             | CompressionStrategy::Simple8bFull(level)
             | CompressionStrategy::SelectiveRLE(level)
             | CompressionStrategy::Rice(level)
+            | CompressionStrategy::LocalHuffman(level)
             | CompressionStrategy::Huffman(level)
             | CompressionStrategy::LZ77(level)
             | CompressionStrategy::EliasFano(level) => *level,
         }
+    }
+
+    /// Whether this strategy needs file-level tables.
+    pub fn uses_file_table(&self) -> bool {
+        matches!(self, CompressionStrategy::Huffman(_))
     }
 
     /// Get the display name of this strategy
@@ -620,6 +637,7 @@ impl CompressionStrategy {
             CompressionStrategy::Simple8bFull(_) => "Simple8bFull",
             CompressionStrategy::SelectiveRLE(_) => "SelectiveRLE",
             CompressionStrategy::Rice(_) => "Rice",
+            CompressionStrategy::LocalHuffman(_) => "LocalHuffman",
             CompressionStrategy::Huffman(_) => "Huffman",
             CompressionStrategy::LZ77(_) => "LZ77",
             CompressionStrategy::EliasFano(_) => "EliasFano",
@@ -689,21 +707,34 @@ impl TpaHeader {
     pub(crate) fn new(
         num_records: u64,
         num_strings: u64,
-        first_strategy: CompressionStrategy,
-        second_strategy: CompressionStrategy,
-        first_layer: CompressionLayer,
-        second_layer: CompressionLayer,
-        tracepoint_type: TracepointType,
-        complexity_metric: ComplexityMetric,
-        max_complexity: u32,
+        strategies: [(CompressionStrategy, CompressionLayer); 2],
+        tracepoints: (TracepointType, ComplexityMetric, u32),
         distance: Distance,
         all_records: bool,
     ) -> io::Result<Self> {
+        let [(first_strategy, first_layer), (second_strategy, second_layer)] = strategies;
+        let (tracepoint_type, complexity_metric, max_complexity) = tracepoints;
+        if matches!(
+            tracepoint_type,
+            TracepointType::Fastga | TracepointType::FastgaNoDiff
+        ) && max_complexity == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fastga trace spacing must be greater than zero",
+            ));
+        }
         let first_strategy_code = first_strategy.to_code()?;
         let second_strategy_code = second_strategy.to_code()?;
+        let version = if first_strategy_code == HUFFMAN_CODE || second_strategy_code == HUFFMAN_CODE
+        {
+            TPA_VERSION_HUFFMAN_TABLE
+        } else {
+            TPA_VERSION
+        };
 
         Ok(Self {
-            version: TPA_VERSION,
+            version,
             first_strategy_code,
             second_strategy_code,
             first_layer,
@@ -791,9 +822,13 @@ impl TpaHeader {
         self.all_records
     }
 
+    /// Whether either stream uses a file-level table.
+    pub fn uses_file_table(&self) -> bool {
+        self.first_strategy_code == HUFFMAN_CODE || self.second_strategy_code == HUFFMAN_CODE
+    }
+
     pub(crate) fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        // Common prefix (same as footer)
-        write_common_prefix(writer, self.num_records, self.num_strings)?;
+        write_common_prefix_versioned(writer, self.num_records, self.num_strings, self.version)?;
 
         // Header-specific fields
         writer.write_all(&[encode_strategy_with_layer(
@@ -822,6 +857,8 @@ impl TpaHeader {
         reader.read_exact(&mut strategy_bytes)?;
         let (first_layer, first_strategy_code) = decode_strategy_with_layer(strategy_bytes[0])?;
         let (second_layer, second_strategy_code) = decode_strategy_with_layer(strategy_bytes[1])?;
+        CompressionStrategy::from_code(first_strategy_code)?;
+        CompressionStrategy::from_code(second_strategy_code)?;
 
         let mut tp_type_buf = [0u8; 1];
         reader.read_exact(&mut tp_type_buf)?;
@@ -833,14 +870,58 @@ impl TpaHeader {
         let complexity_metric = ComplexityMetric::from_u8(metric_buf[0])
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        let max_complexity = read_varint(reader)? as u32;
+        let max_complexity = read_varint(reader)?.try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "max complexity does not fit in u32",
+            )
+        })?;
+        if matches!(
+            tracepoint_type,
+            TracepointType::Fastga | TracepointType::FastgaNoDiff
+        ) && max_complexity == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fastga trace spacing must be greater than zero",
+            ));
+        }
 
         let distance = read_distance(reader)?;
 
         // All-records mode flag
         let mut all_records_flag = [0u8; 1];
         reader.read_exact(&mut all_records_flag)?;
-        let all_records = all_records_flag[0] != 0;
+        let all_records = match all_records_flag[0] {
+            0 => false,
+            1 => true,
+            value => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid all-records flag: {value}"),
+                ))
+            }
+        };
+
+        let uses_file_table =
+            first_strategy_code == HUFFMAN_CODE || second_strategy_code == HUFFMAN_CODE;
+        if (version == TPA_VERSION_HUFFMAN_TABLE) != uses_file_table {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TPA version and huffman strategy disagree",
+            ));
+        }
+        if uses_file_table
+            && matches!(
+                tracepoint_type,
+                TracepointType::Variable | TracepointType::Mixed
+            )
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "huffman is invalid for this tracepoint type",
+            ));
+        }
 
         Ok(Self {
             version,
@@ -857,25 +938,47 @@ impl TpaHeader {
             all_records,
         })
     }
+
+    pub(crate) fn required_tables(&self) -> [bool; 2] {
+        [
+            self.first_strategy_code == HUFFMAN_CODE,
+            self.second_strategy_code == HUFFMAN_CODE
+                && matches!(
+                    self.tracepoint_type,
+                    TracepointType::Standard | TracepointType::Fastga
+                ),
+        ]
+    }
 }
 
 pub struct TpaFooter {
+    pub(crate) version: u8,
     pub(crate) num_records: u64,
     pub(crate) num_strings: u64,
 }
 
 impl TpaFooter {
+    pub(crate) fn for_header(header: &TpaHeader) -> Self {
+        Self {
+            version: header.version,
+            num_records: header.num_records,
+            num_strings: header.num_strings,
+        }
+    }
+
+    #[cfg(test)]
     pub fn new(num_records: u64, num_strings: u64) -> Self {
         Self {
+            version: TPA_VERSION,
             num_records,
             num_strings,
         }
     }
 
     /// Write footer as: [common_prefix][footer_len_le]
-    pub fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+    pub(crate) fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         let mut buf = Vec::new();
-        write_common_prefix(&mut buf, self.num_records, self.num_strings)?;
+        write_common_prefix_versioned(&mut buf, self.num_records, self.num_strings, self.version)?;
 
         let footer_len: u32 = buf
             .len()
@@ -889,7 +992,7 @@ impl TpaFooter {
 
     /// Read footer from the end of the file, returning an error if the footer
     /// is missing or malformed.
-    pub fn read_from_end<R: Read + Seek>(reader: &mut R) -> io::Result<Self> {
+    pub(crate) fn read_from_end<R: Read + Seek>(reader: &mut R) -> io::Result<Self> {
         let file_len = reader.seek(SeekFrom::End(0))?;
         if file_len < 4 {
             return Err(io::Error::new(
@@ -903,7 +1006,8 @@ impl TpaFooter {
         reader.read_exact(&mut len_buf)?;
         let footer_len = u32::from_le_bytes(len_buf) as u64;
 
-        if footer_len + 4 > file_len {
+        // magic + version + two u64 varints: 7..=25 bytes
+        if !(7..=25).contains(&footer_len) || footer_len + 4 > file_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Invalid TPA footer length",
@@ -922,15 +1026,31 @@ impl TpaFooter {
         reader.read_exact(&mut buf)?;
 
         let mut cursor = std::io::Cursor::new(buf);
-        let (_version, num_records, num_strings) = read_common_prefix(&mut cursor)?;
+        let (version, num_records, num_strings) = read_common_prefix(&mut cursor)?;
+        if cursor.position() != footer_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TPA footer has trailing bytes",
+            ));
+        }
 
         Ok(Self {
+            version,
             num_records,
             num_strings,
         })
     }
 
-    pub fn validate_against(&self, header: &TpaHeader) -> io::Result<()> {
+    pub(crate) fn validate_against(&self, header: &TpaHeader) -> io::Result<()> {
+        if self.version != header.version {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Footer/header version mismatch: header={}, footer={}",
+                    header.version, self.version
+                ),
+            ));
+        }
         if self.num_records != header.num_records {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -967,6 +1087,26 @@ mod footer_tests {
         let read_back = TpaFooter::read_from_end(&mut cursor).unwrap();
         assert_eq!(read_back.num_records, 10);
         assert_eq!(read_back.num_strings, 5);
+    }
+
+    #[test]
+    fn oversized_footer_is_rejected_before_allocation() {
+        let mut data = vec![0; 100];
+        data.extend_from_slice(&100u32.to_le_bytes());
+        assert!(TpaFooter::read_from_end(&mut Cursor::new(data)).is_err());
+    }
+
+    #[test]
+    fn truncated_string_table_is_rejected_without_declared_allocation() {
+        let data = [100, b'a'];
+        assert_eq!(
+            StringTable::read(&mut &data[..], 1).err().unwrap().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            StringTable::skip(&mut &data[..], 1).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 
     #[test]
@@ -1050,16 +1190,19 @@ impl StringTable {
     }
 
     pub fn get(&self, id: u64) -> Option<&str> {
-        self.strings.get(id as usize).map(|s| s.as_str())
+        self.strings
+            .get(usize::try_from(id).ok()?)
+            .map(String::as_str)
     }
 
     pub fn get_length(&self, id: u64) -> Option<u64> {
-        self.lengths.get(id as usize).copied()
+        self.lengths.get(usize::try_from(id).ok()?).copied()
     }
 
     pub fn get_name_and_len(&self, id: u64) -> Option<(&str, u64)> {
-        let name = self.strings.get(id as usize)?;
-        let len = self.lengths.get(id as usize)?;
+        let id = usize::try_from(id).ok()?;
+        let name = self.strings.get(id)?;
+        let len = self.lengths.get(id)?;
         Some((name.as_str(), *len))
     }
 
@@ -1081,15 +1224,26 @@ impl StringTable {
     }
 
     pub fn read<R: Read>(reader: &mut R, num_strings: u64) -> io::Result<Self> {
-        let num_strings = num_strings as usize;
-        let mut strings = Vec::with_capacity(num_strings);
-        let mut lengths = Vec::with_capacity(num_strings);
+        let num_strings = usize::try_from(num_strings).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "string count does not fit in memory",
+            )
+        })?;
+        let mut strings = Vec::new();
+        let mut lengths = Vec::new();
         let mut index = HashMap::new();
 
         for id in 0..num_strings {
-            let len = read_varint(reader)? as usize;
-            let mut buf = vec![0u8; len];
-            reader.read_exact(&mut buf)?;
+            let len = read_varint(reader)?;
+            let mut buf = Vec::new();
+            let got = reader.take(len).read_to_end(&mut buf)? as u64;
+            if got != len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "string table entry is truncated",
+                ));
+            }
             let s = String::from_utf8(buf)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             let seq_len = read_varint(reader)?;
@@ -1108,10 +1262,13 @@ impl StringTable {
     /// Used for all-records mode where we need to find the BGZF section start.
     pub fn skip<R: Read>(reader: &mut R, num_strings: u64) -> io::Result<()> {
         for _ in 0..num_strings {
-            let name_len = read_varint(reader)? as usize;
-            // Skip over the name bytes
-            io::copy(&mut reader.take(name_len as u64), &mut io::sink())?;
-            // Skip the sequence length varint
+            let name_len = read_varint(reader)?;
+            if io::copy(&mut reader.take(name_len), &mut io::sink())? != name_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "string table entry is truncated",
+                ));
+            }
             read_varint(reader)?;
         }
         Ok(())
@@ -1179,8 +1336,13 @@ impl Tag {
             }
             b'Z' => {
                 let len = read_varint(reader)?;
-                let mut buf = vec![0u8; len as usize];
-                reader.read_exact(&mut buf)?;
+                let mut buf = Vec::new();
+                if reader.take(len).read_to_end(&mut buf)? as u64 != len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "string tag is truncated",
+                    ));
+                }
                 TagValue::String(String::from_utf8(buf).map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,

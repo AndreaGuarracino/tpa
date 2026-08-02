@@ -45,12 +45,12 @@ See `examples/seek_demo.rs` and `examples/offset_demo.rs` for runnable demos.
 ## Format
 
 ```
-[Header] → [StringTable] → [Records] → [Footer]
+[Header] → [Huffman tables] → [StringTable] → [Records] → [Footer]
 ```
 
 ### Header
 - Magic: `TPA\0` (4 bytes)
-- Version: `1` (1 byte)
+- Version: `1` or `2` (1 byte)
 - Record count: varint
 - String count: varint
 - First strategy+layer: packed byte, bits 7-6 = layer (`0=Zstd, 1=Bgzip, 2=Nocomp`), bits 5-0 = strategy code

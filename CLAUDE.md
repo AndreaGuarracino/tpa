@@ -92,7 +92,7 @@ rustc scripts/seek_bench.rs --edition 2021 \
 - `build_index()`: Creates `.tpa.idx` files for random access
 
 **src/format.rs** - Data structures and serialization
-- `CompressionStrategy` enum: 19 concrete strategies + 1 meta-strategy (`Automatic(level, sample_size)`)
+- `CompressionStrategy` enum: 20 concrete strategies + meta-strategies (`Automatic`, `Benchmark`)
 - `CompressionLayer` enum: Zstd, Bgzip, Nocomp - passed explicitly through API
 - `TpaHeader`: File metadata (magic, version=1, first/second compression layers, first/second strategy codes, counts, tracepoint type, distance params)
 - `TpaFooter`: Crash-safety footer with record/string counts for validation
@@ -102,7 +102,7 @@ rustc scripts/seek_bench.rs --edition 2021 \
 
 **src/binary.rs** - Binary encoding/decoding
 - `SmartDualAnalyzer`: Tests every concrete strategy × layer per stream (19×3 each) and picks independent winners for first/second values
-- Strategy-specific encode/decode for tracepoints (19 strategies)
+- Strategy-specific encode/decode for tracepoints (20 strategies)
 - Varint encoding with delta/zigzag transforms
 - Compression layer handling (Zstd/Bgzip/Nocomp)
 - Rice and Huffman entropy coding
@@ -167,8 +167,8 @@ rustc scripts/seek_bench.rs --edition 2021 \
 
 Dual encoding (different strategies for 1st/2nd values) is achieved via `CompressionConfig::dual_strategy()`.
 
-### Concrete Strategies (19 total)
-All 19 strategies are considered during automatic analysis:
+### Concrete Strategies 20 total)
+All 20 strategies are considered during automatic analysis:
 
 **High performers:**
 1. **2d-delta**: Best for CIGAR-derived alignments (exploits query/target correlation)
@@ -181,7 +181,7 @@ All 19 strategies are considered during automatic analysis:
 - **raw**: Low-complexity data
 - **selective-rle**: High-repetition blocks
 - **dictionary**: Repeated delta patterns
-- **rice**, **huffman**: Entropy coding alternatives
+- **rice**, **local-huffman** (code table per record), **huffman** (one code table per file, format version 2): entropy coding alternatives
 
 ## Key Implementation Details
 

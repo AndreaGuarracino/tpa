@@ -1,5 +1,6 @@
 use crate::binary::{
-    read_record, read_record_metadata, read_tracepoints, read_tracepoints_at_offset,
+    read_header_and_tables, read_record, read_record_metadata, read_tracepoints,
+    read_tracepoints_at_offset, HuffmanTables,
 };
 use crate::format::{CompactRecord, CompressionLayer, CompressionStrategy, StringTable, TpaHeader};
 use crate::index::{build_index_all_records, build_index_per_record, IndexType, TpaIndex};
@@ -9,7 +10,6 @@ use noodles::bgzf;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::num::NonZeroUsize;
-use std::path::Path;
 use tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 
 /// Helper: create "reader not initialized" error
@@ -70,19 +70,29 @@ pub struct TpaReader {
     tpa_path: Option<String>,
     /// BGZF section start offset (for all-records mode, 0 for per-record mode)
     bgzf_section_start: u64,
+    /// File-level Huffman tables.
+    huffman_tables: HuffmanTables,
 }
 
 impl TpaReader {
+    fn records_start(file: &mut File, header: &TpaHeader) -> io::Result<u64> {
+        let string_table_pos = file.stream_position()?;
+        StringTable::skip(file, header.num_strings())?;
+        let records_start = file.stream_position()?;
+        file.seek(SeekFrom::Start(string_table_pos))?;
+        Ok(records_start)
+    }
+
     /// Full open: reads header, loads/builds index, prepares string table.
     /// Automatically detects compression mode based on header's all_records flag.
     pub fn new(tpa_path: &str) -> io::Result<Self> {
         let mut file = File::open(tpa_path)?;
-        let header = TpaHeader::read(&mut file)?;
+        let (header, huffman_tables) = read_header_and_tables(&mut file)?;
 
         if header.all_records() {
-            Self::open_all_records_mode(tpa_path, file, header)
+            Self::open_all_records_mode(tpa_path, file, header, huffman_tables)
         } else {
-            Self::open_per_record_mode(tpa_path, file, header)
+            Self::open_per_record_mode(tpa_path, file, header, huffman_tables)
         }
     }
 
@@ -93,7 +103,7 @@ impl TpaReader {
     /// Use this when you only need to stream all records sequentially.
     pub fn new_streaming(tpa_path: &str) -> io::Result<Self> {
         let mut file = File::open(tpa_path)?;
-        let header = TpaHeader::read(&mut file)?;
+        let (header, huffman_tables) = read_header_and_tables(&mut file)?;
         let string_table_pos = file.stream_position()?;
 
         // Read string table to advance past it
@@ -112,6 +122,7 @@ impl TpaReader {
                 string_table_pos,
                 tpa_path: Some(tpa_path.to_string()),
                 bgzf_section_start,
+                huffman_tables,
             })
         } else {
             // Per-record mode: first record position is current file position
@@ -127,11 +138,12 @@ impl TpaReader {
                 string_table_pos,
                 tpa_path: Some(tpa_path.to_string()),
                 bgzf_section_start: 0,
+                huffman_tables,
             })
         }
     }
 
-    /// Shallow open: reads header only, no index or string table.
+    /// Shallow open: reads only the header, with no tables, index, or string table.
     /// Use with standalone `read_*_tracepoints_at_offset()` functions when you have external offsets.
     pub fn new_shallow(tpa_path: &str) -> io::Result<Self> {
         let mut file = File::open(tpa_path)?;
@@ -146,38 +158,41 @@ impl TpaReader {
             string_table_pos: 0,
             tpa_path: None,
             bgzf_section_start: 0,
+            huffman_tables: HuffmanTables::default(),
         })
     }
 
     /// Open a per-record compressed TPA file
-    fn open_per_record_mode(tpa_path: &str, mut file: File, header: TpaHeader) -> io::Result<Self> {
+    fn open_per_record_mode(
+        tpa_path: &str,
+        mut file: File,
+        header: TpaHeader,
+        huffman_tables: HuffmanTables,
+    ) -> io::Result<Self> {
         let string_table_pos = file.stream_position()?;
+        let records_start = Self::records_start(&mut file, &header)?;
+        let file_len = file.metadata()?.len();
 
         let idx_path = format!("{}.idx", tpa_path);
 
-        let index = if Path::new(&idx_path).exists() {
-            debug!("Loading existing index: {}", idx_path);
-            let loaded_idx = TpaIndex::load(&idx_path)?;
-            // Validate index matches header record count - rebuild if stale
-            if loaded_idx.len() != header.num_records() as usize {
-                info!(
-                    "Index record count ({}) doesn't match header ({}), rebuilding...",
-                    loaded_idx.len(),
-                    header.num_records()
-                );
-                let idx = build_index_per_record(tpa_path)?;
-                idx.save(&idx_path)?;
-                debug!("Index saved to {}", idx_path);
-                idx
-            } else {
-                loaded_idx
+        let index = match TpaIndex::load(&idx_path) {
+            Ok(index)
+                if index.validates(
+                    IndexType::RawOffset,
+                    header.num_records(),
+                    records_start,
+                    file_len,
+                ) =>
+            {
+                debug!("Loaded index: {}", idx_path);
+                index
             }
-        } else {
-            info!("No index found, building...");
-            let idx = build_index_per_record(tpa_path)?;
-            idx.save(&idx_path)?;
-            debug!("Index saved to {}", idx_path);
-            idx
+            _ => {
+                info!("Missing or invalid index, rebuilding...");
+                let index = build_index_per_record(tpa_path)?;
+                index.save(&idx_path)?;
+                index
+            }
         };
 
         let string_table = StringTable::new();
@@ -191,62 +206,45 @@ impl TpaReader {
             string_table_pos,
             tpa_path: Some(tpa_path.to_string()),
             bgzf_section_start: 0,
+            huffman_tables,
         })
     }
 
     /// Open an all-records mode TPA file
-    /// Format: [Header (plain)] [StringTable (plain)] [BGZF: Records...] [BGZF EOF] [Footer (plain)]
     fn open_all_records_mode(
         tpa_path: &str,
         mut file: File,
         header: TpaHeader,
+        huffman_tables: HuffmanTables,
     ) -> io::Result<Self> {
         // String table position is current position after header
         let string_table_pos = file.stream_position()?;
+        let records_start = Self::records_start(&mut file, &header)?;
+        let file_len = file.metadata()?.len();
 
         // Load or rebuild index
         let idx_path = format!("{}.idx", tpa_path);
-        let index = if Path::new(&idx_path).exists() {
-            debug!("Loading existing index: {}", idx_path);
-            let loaded_idx = TpaIndex::load(&idx_path)?;
-            // Validate index matches header record count - rebuild if stale
-            if loaded_idx.len() != header.num_records() as usize {
-                info!(
-                    "Index record count ({}) doesn't match header ({}), rebuilding...",
-                    loaded_idx.len(),
-                    header.num_records()
-                );
-                drop(file); // Release file handle before rebuilding
-                let idx = build_index_all_records(tpa_path)?;
-                idx.save(&idx_path)?;
-                debug!("Index saved to {}", idx_path);
-                // Reopen file after rebuilding
-                file = File::open(tpa_path)?;
-                idx
-            } else {
-                loaded_idx
+        let index = match TpaIndex::load(&idx_path) {
+            Ok(index)
+                if index.validates(
+                    IndexType::VirtualPosition,
+                    header.num_records(),
+                    records_start,
+                    file_len,
+                ) =>
+            {
+                debug!("Loaded index: {}", idx_path);
+                index
             }
-        } else {
-            info!("No index found, building...");
-            drop(file); // Release file handle before rebuilding
-            let idx = build_index_all_records(tpa_path)?;
-            idx.save(&idx_path)?;
-            debug!("Index saved to {}", idx_path);
-            // Reopen file after rebuilding
-            file = File::open(tpa_path)?;
-            idx
+            _ => {
+                info!("Missing or invalid index, rebuilding...");
+                drop(file);
+                let index = build_index_all_records(tpa_path)?;
+                index.save(&idx_path)?;
+                file = File::open(tpa_path)?;
+                index
+            }
         };
-
-        // Verify index type
-        if index.index_type() != IndexType::VirtualPosition {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "All-records mode requires virtual position index, found {:?}",
-                    index.index_type()
-                ),
-            ));
-        }
 
         let bgzf_start = index.bgzf_section_start();
 
@@ -266,6 +264,7 @@ impl TpaReader {
             string_table_pos,
             tpa_path: Some(tpa_path.to_string()), // Need path to reopen for string table
             bgzf_section_start: bgzf_start,
+            huffman_tables,
         })
     }
 
@@ -338,35 +337,7 @@ impl TpaReader {
             .index
             .get_position(record_id)
             .ok_or_else(|| err_out_of_bounds(record_id))?;
-
-        let (first_strategy, second_strategy) = self.header.strategies()?;
-
-        if let Some(ref mut bgzf) = self.bgzf_reader {
-            // All-records mode: seek to virtual position
-            let vpos = bgzf::VirtualPosition::from(position);
-            bgzf.seek(vpos)?;
-            read_record(
-                bgzf,
-                first_strategy,
-                second_strategy,
-                self.header.tracepoint_type,
-                self.header.first_layer,
-                self.header.second_layer,
-            )
-        } else if let Some(ref mut file) = self.file {
-            // Per-record mode: seek to raw offset
-            file.seek(SeekFrom::Start(position))?;
-            read_record(
-                file,
-                first_strategy,
-                second_strategy,
-                self.header.tracepoint_type,
-                self.header.first_layer,
-                self.header.second_layer,
-            )
-        } else {
-            Err(err_not_initialized())
-        }
+        self.get_compact_record_at_offset(position)
     }
 
     /// Get compact record by file offset/virtual position (for impg compatibility)
@@ -384,6 +355,7 @@ impl TpaReader {
                 self.header.tracepoint_type,
                 self.header.first_layer,
                 self.header.second_layer,
+                &self.huffman_tables,
             )
         } else if let Some(ref mut file) = self.file {
             // Per-record mode: position is raw file offset
@@ -395,6 +367,7 @@ impl TpaReader {
                 self.header.tracepoint_type,
                 self.header.first_layer,
                 self.header.second_layer,
+                &self.huffman_tables,
             )
         } else {
             Err(err_not_initialized())
@@ -451,25 +424,30 @@ impl TpaReader {
             // (BGZF reader doesn't implement std::io::Seek, only bgzf::io::Seek)
             let vpos = bgzf::VirtualPosition::from(tracepoint_position);
             bgzf.seek(vpos)?;
-            crate::binary::read_tracepoints(
+            read_tracepoints(
                 bgzf,
                 tp_type,
                 first_strategy,
                 second_strategy,
+                &self.huffman_tables,
                 self.header.first_layer,
                 self.header.second_layer,
             )?
         } else if let Some(ref mut file) = self.file {
             // Per-record mode
-            read_tracepoints_at_offset(
-                file,
-                tracepoint_position,
-                tp_type,
-                first_strategy,
-                second_strategy,
-                self.header.first_layer,
-                self.header.second_layer,
-            )?
+            {
+                use std::io::Seek as _;
+                file.seek(SeekFrom::Start(tracepoint_position))?;
+                read_tracepoints(
+                    file,
+                    tp_type,
+                    first_strategy,
+                    second_strategy,
+                    &self.huffman_tables,
+                    self.header.first_layer,
+                    self.header.second_layer,
+                )?
+            }
         } else {
             return Err(err_not_initialized());
         };
@@ -596,13 +574,43 @@ impl TpaReader {
 // STANDALONE FUNCTIONS (NO TPAREADER OVERHEAD)
 // ============================================================================
 
-/// Decode standard tracepoints with explicit strategies for first/second streams.
+/// Extract the expected payload from a decoded record, naming the site in the error.
+macro_rules! expect_tracepoints {
+    ($data:expr, $at:literal, $($variant:pat => $value:expr),+ $(,)?) => {
+        match $data {
+            $($variant => Ok($value),)+
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unexpected tracepoint type at {}: {:?}", $at, other),
+            )),
+        }
+    };
+}
+
+fn reject_file_table_strategy(
+    first: CompressionStrategy,
+    second: CompressionStrategy,
+) -> io::Result<()> {
+    if first.uses_file_table() || second.uses_file_table() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file uses the huffman strategy: call the table-aware variant",
+        ));
+    }
+    Ok(())
+}
+
+/// Decode one record's tracepoints at a raw file offset (per-record mode).
+///
+/// Covers Standard and Fastga, which share the two-stream layout. **Not FastgaNoDiff**: it stores a
+/// single stream, so this misreads it (you get an error, not wrong tracepoints); use `TpaReader`.
 #[inline]
-pub fn read_standard_tracepoints_at_offset_with_strategies<R: Read + Seek>(
+pub fn read_standard_tracepoints_at_offset_with_tables<R: Read + Seek>(
     file: &mut R,
     offset: u64,
     first_strategy: CompressionStrategy,
     second_strategy: CompressionStrategy,
+    tables: &HuffmanTables,
     first_layer: CompressionLayer,
     second_layer: CompressionLayer,
 ) -> io::Result<Vec<(usize, usize)>> {
@@ -612,16 +620,34 @@ pub fn read_standard_tracepoints_at_offset_with_strategies<R: Read + Seek>(
         TracepointType::Standard,
         first_strategy,
         second_strategy,
+        tables,
         first_layer,
         second_layer,
     )?;
-    match data {
-        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => Ok(tps),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Unexpected tracepoint type at offset: {:?}", other),
-        )),
-    }
+    expect_tracepoints!(data, "offset", TracepointData::Standard(tps) => tps)
+}
+
+/// Same, for a file with no file-level Huffman tables. A `huffman` file is rejected before
+/// any I/O: pass its tables to [`read_standard_tracepoints_at_offset_with_tables`] instead.
+#[inline]
+pub fn read_standard_tracepoints_at_offset_with_strategies<R: Read + Seek>(
+    file: &mut R,
+    offset: u64,
+    first_strategy: CompressionStrategy,
+    second_strategy: CompressionStrategy,
+    first_layer: CompressionLayer,
+    second_layer: CompressionLayer,
+) -> io::Result<Vec<(usize, usize)>> {
+    reject_file_table_strategy(first_strategy, second_strategy)?;
+    read_standard_tracepoints_at_offset_with_tables(
+        file,
+        offset,
+        first_strategy,
+        second_strategy,
+        &HuffmanTables::default(),
+        first_layer,
+        second_layer,
+    )
 }
 
 /// Fastest access: decode variable tracepoints directly from file at offset.
@@ -635,22 +661,18 @@ pub fn read_variable_tracepoints_at_offset<R: Read + Seek>(
     first_layer: CompressionLayer,
     second_layer: CompressionLayer,
 ) -> io::Result<Vec<(usize, Option<usize>)>> {
+    reject_file_table_strategy(first_strategy, second_strategy)?;
     let data = read_tracepoints_at_offset(
         file,
         offset,
         TracepointType::Variable,
         first_strategy,
         second_strategy,
+        &HuffmanTables::default(),
         first_layer,
         second_layer,
     )?;
-    match data {
-        TracepointData::Variable(tps) => Ok(tps),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Unexpected tracepoint type at offset: {:?}", other),
-        )),
-    }
+    expect_tracepoints!(data, "offset", TracepointData::Variable(tps) => tps)
 }
 
 /// Fastest access: decode mixed tracepoints directly from file at offset.
@@ -664,36 +686,35 @@ pub fn read_mixed_tracepoints_at_offset<R: Read + Seek>(
     first_layer: CompressionLayer,
     second_layer: CompressionLayer,
 ) -> io::Result<Vec<MixedRepresentation>> {
+    reject_file_table_strategy(first_strategy, second_strategy)?;
     let data = read_tracepoints_at_offset(
         file,
         offset,
         TracepointType::Mixed,
         first_strategy,
         second_strategy,
+        &HuffmanTables::default(),
         first_layer,
         second_layer,
     )?;
-    match data {
-        TracepointData::Mixed(items) => Ok(items),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Unexpected tracepoint type at offset: {:?}", other),
-        )),
-    }
+    expect_tracepoints!(data, "offset", TracepointData::Mixed(items) => items)
 }
 
 // ============================================================================
 // BGZF-aware standalone functions for Mode B benchmark with all-records mode
 // ============================================================================
 
-/// Decode standard tracepoints from a BGZF reader at a virtual position.
-/// This is the BGZF equivalent of read_standard_tracepoints_at_offset_with_strategies.
+/// Decode one record's tracepoints at a BGZF virtual position (all-records mode).
+///
+/// Covers Standard and Fastga, which share the two-stream layout. **Not FastgaNoDiff**: it stores a
+/// single stream, so this misreads it (you get an error, not wrong tracepoints); use `TpaReader`.
 #[inline]
-pub fn read_standard_tracepoints_at_vpos(
-    bgzf_reader: &mut bgzf::io::Reader<std::fs::File>,
+pub fn read_standard_tracepoints_at_vpos_with_tables<R: Read + Seek>(
+    bgzf_reader: &mut bgzf::io::Reader<R>,
     vpos: u64,
     first_strategy: CompressionStrategy,
     second_strategy: CompressionStrategy,
+    tables: &HuffmanTables,
     first_layer: CompressionLayer,
     second_layer: CompressionLayer,
 ) -> io::Result<Vec<(usize, usize)>> {
@@ -703,72 +724,82 @@ pub fn read_standard_tracepoints_at_vpos(
         TracepointType::Standard,
         first_strategy,
         second_strategy,
+        tables,
         first_layer,
         second_layer,
     )?;
-    match data {
-        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => Ok(tps),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Unexpected tracepoint type at vpos: {:?}", other),
-        )),
-    }
+    expect_tracepoints!(data, "vpos", TracepointData::Standard(tps) => tps)
+}
+
+/// Same, for a file with no file-level Huffman tables. A `huffman` file is rejected before
+/// any I/O: pass its tables to [`read_standard_tracepoints_at_vpos_with_tables`] instead.
+#[inline]
+pub fn read_standard_tracepoints_at_vpos<R: Read + Seek>(
+    bgzf_reader: &mut bgzf::io::Reader<R>,
+    vpos: u64,
+    first_strategy: CompressionStrategy,
+    second_strategy: CompressionStrategy,
+    first_layer: CompressionLayer,
+    second_layer: CompressionLayer,
+) -> io::Result<Vec<(usize, usize)>> {
+    reject_file_table_strategy(first_strategy, second_strategy)?;
+    read_standard_tracepoints_at_vpos_with_tables(
+        bgzf_reader,
+        vpos,
+        first_strategy,
+        second_strategy,
+        &HuffmanTables::default(),
+        first_layer,
+        second_layer,
+    )
 }
 
 /// Decode variable tracepoints from a BGZF reader at a virtual position.
 #[inline]
-pub fn read_variable_tracepoints_at_vpos(
-    bgzf_reader: &mut bgzf::io::Reader<std::fs::File>,
+pub fn read_variable_tracepoints_at_vpos<R: Read + Seek>(
+    bgzf_reader: &mut bgzf::io::Reader<R>,
     vpos: u64,
     first_strategy: CompressionStrategy,
     second_strategy: CompressionStrategy,
     first_layer: CompressionLayer,
     second_layer: CompressionLayer,
 ) -> io::Result<Vec<(usize, Option<usize>)>> {
+    reject_file_table_strategy(first_strategy, second_strategy)?;
     bgzf_reader.seek(bgzf::VirtualPosition::from(vpos))?;
     let data = read_tracepoints(
         bgzf_reader,
         TracepointType::Variable,
         first_strategy,
         second_strategy,
+        &HuffmanTables::default(),
         first_layer,
         second_layer,
     )?;
-    match data {
-        TracepointData::Variable(tps) => Ok(tps),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Unexpected tracepoint type at vpos: {:?}", other),
-        )),
-    }
+    expect_tracepoints!(data, "vpos", TracepointData::Variable(tps) => tps)
 }
 
 /// Decode mixed tracepoints from a BGZF reader at a virtual position.
 #[inline]
-pub fn read_mixed_tracepoints_at_vpos(
-    bgzf_reader: &mut bgzf::io::Reader<std::fs::File>,
+pub fn read_mixed_tracepoints_at_vpos<R: Read + Seek>(
+    bgzf_reader: &mut bgzf::io::Reader<R>,
     vpos: u64,
     first_strategy: CompressionStrategy,
     second_strategy: CompressionStrategy,
     first_layer: CompressionLayer,
     second_layer: CompressionLayer,
 ) -> io::Result<Vec<MixedRepresentation>> {
+    reject_file_table_strategy(first_strategy, second_strategy)?;
     bgzf_reader.seek(bgzf::VirtualPosition::from(vpos))?;
     let data = read_tracepoints(
         bgzf_reader,
         TracepointType::Mixed,
         first_strategy,
         second_strategy,
+        &HuffmanTables::default(),
         first_layer,
         second_layer,
     )?;
-    match data {
-        TracepointData::Mixed(items) => Ok(items),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Unexpected tracepoint type at vpos: {:?}", other),
-        )),
-    }
+    expect_tracepoints!(data, "vpos", TracepointData::Mixed(items) => items)
 }
 
 pub struct RecordIterator<'a> {

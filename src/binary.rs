@@ -20,14 +20,18 @@ fn compress_with_layer(data: &[u8], layer: CompressionLayer, level: i32) -> io::
             .map_err(|e| io::Error::other(format!("Zstd compression failed: {}", e))),
         CompressionLayer::Bgzip => {
             use bgzip::write::BGZFWriter;
-            let mut compressed = Vec::new();
-            {
-                let compression = bgzip::Compression::new(level as u32).map_err(|e| {
+            let level = u32::try_from(level)
+                .ok()
+                .filter(|l| *l <= 9)
+                .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("Invalid bgzip compression level: {}", e),
+                        "BGZIP compression level must be between 0 and 9",
                     )
                 })?;
+            let compression = bgzip::Compression::new(level).map_err(io::Error::other)?;
+            let mut compressed = Vec::new();
+            {
                 let mut writer = BGZFWriter::new(&mut compressed, compression);
                 writer.write_all(data)?;
             } // BGZFWriter flushes on drop
@@ -100,10 +104,11 @@ fn reconstruct_from_zigzag_deltas(zigzagged: &[u64]) -> Vec<u64> {
 pub(crate) struct StrategyAnalyzer {
     first_states: Vec<StreamState>,
     second_states: Vec<StreamState>,
+    huffman_samples: [HuffmanSamples; 2],
     layers: [CompressionLayer; 3],
+    level: i32,
     sample_limit: usize, // 0 = no limit
     processed_records: usize,
-    processed_tracepoints: usize,
 }
 
 impl StrategyAnalyzer {
@@ -118,9 +123,10 @@ impl StrategyAnalyzer {
     ) -> Self {
         let strategies = CompressionStrategy::all(zstd_level);
         // When a layer is forced, test exactly that one layer (index 0, which select_best reads back).
-        let (layers, num_layers_to_test) = match forced_layer {
-            Some(l) => ([l; 3], 1),
-            None => (CompressionLayer::all(), if test_layers { 3 } else { 1 }),
+        let (layers, num_layers_to_test) = match (test_layers, forced_layer) {
+            (false, _) => ([CompressionLayer::Nocomp; 3], 1),
+            (_, Some(layer)) => ([layer; 3], 1),
+            _ => (CompressionLayer::all(), 3),
         };
         let first_states = strategies
             .iter()
@@ -135,10 +141,11 @@ impl StrategyAnalyzer {
         Self {
             first_states,
             second_states,
+            huffman_samples: Default::default(),
             layers,
+            level: zstd_level,
             sample_limit,
             processed_records: 0,
-            processed_tracepoints: 0,
         }
     }
 
@@ -150,7 +157,6 @@ impl StrategyAnalyzer {
         match &record.tracepoints {
             TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
                 self.processed_records += 1;
-                self.processed_tracepoints += tps.len();
 
                 let mut first_vals = Vec::with_capacity(tps.len());
                 let mut second_vals = Vec::with_capacity(tps.len());
@@ -166,7 +172,7 @@ impl StrategyAnalyzer {
                     &second_vals,
                     "First",
                     |first, _second, strategy| encode_first_stream(first, strategy),
-                );
+                )?;
                 process_stream_states(
                     &mut self.second_states,
                     &self.layers,
@@ -174,11 +180,12 @@ impl StrategyAnalyzer {
                     &second_vals,
                     "Second",
                     encode_second_stream,
-                );
+                )?;
+                self.huffman_samples[0].push(&first_vals)?;
+                self.huffman_samples[1].push(&second_vals)?;
             }
             TracepointData::FastgaNoDiff(tps) => {
                 self.processed_records += 1;
-                self.processed_tracepoints += tps.len();
                 let vals: Vec<u64> = tps.iter().map(|&v| v as u64).collect();
                 process_stream_states(
                     &mut self.first_states,
@@ -187,11 +194,11 @@ impl StrategyAnalyzer {
                     &[],
                     "First",
                     |first, _second, strategy| encode_first_stream(first, strategy),
-                );
+                )?;
+                self.huffman_samples[0].push(&vals)?;
             }
             TracepointData::Variable(tps) => {
                 self.processed_records += 1;
-                self.processed_tracepoints += tps.len();
 
                 // For Variable: first values are always present, second values are optional
                 let first_vals: Vec<u64> = tps.iter().map(|(a, _)| *a as u64).collect();
@@ -208,7 +215,7 @@ impl StrategyAnalyzer {
                     &second_vals,
                     "First",
                     |first, _second, strategy| encode_first_stream(first, strategy),
-                );
+                )?;
                 // Only analyze second stream if there are any second values
                 if !second_vals.is_empty() {
                     process_stream_states(
@@ -218,12 +225,11 @@ impl StrategyAnalyzer {
                         &second_vals,
                         "Second",
                         encode_second_stream,
-                    );
+                    )?;
                 }
             }
             TracepointData::Mixed(items) => {
                 self.processed_records += 1;
-                self.processed_tracepoints += items.len();
 
                 // For Mixed: separate tracepoint values from CIGAR op lengths
                 // First stream: tracepoint first values + CIGAR lengths
@@ -257,7 +263,7 @@ impl StrategyAnalyzer {
                     &tp_second,
                     "First",
                     |first, _second, strategy| encode_first_stream(first, strategy),
-                );
+                )?;
                 // Only analyze second stream if there are tracepoint second values
                 if !tp_second.is_empty() {
                     process_stream_states(
@@ -267,7 +273,7 @@ impl StrategyAnalyzer {
                         &tp_second,
                         "Second",
                         encode_second_stream,
-                    );
+                    )?;
                 }
             }
         }
@@ -275,13 +281,30 @@ impl StrategyAnalyzer {
     }
 
     pub fn select_best(
-        self,
+        mut self,
     ) -> (
         CompressionStrategy,
         CompressionStrategy,
         CompressionLayer,
         CompressionLayer,
     ) {
+        if let Some(state) = huffman_state(
+            &self.huffman_samples[0],
+            &self.layers,
+            self.level,
+            self.first_states[0].totals.len(),
+        ) {
+            self.first_states.push(state);
+        }
+        if let Some(state) = huffman_state(
+            &self.huffman_samples[1],
+            &self.layers,
+            self.level,
+            self.second_states[0].totals.len(),
+        ) {
+            self.second_states.push(state);
+        }
+
         // Collect (strategy, layer, size) for each stream
         let score = |c: &(CompressionStrategy, CompressionLayer, usize)| {
             (c.2, layer_to_rank(c.1), strategy_to_rank(&c.0))
@@ -361,12 +384,12 @@ pub(crate) fn automatic_select(
         },
         TracepointType::Fastga => (
             CompressionStrategy::EliasFano(level),
-            CompressionStrategy::Huffman(level),
+            CompressionStrategy::LocalHuffman(level),
             nocomp,
             nocomp,
         ),
         TracepointType::FastgaNoDiff => (
-            CompressionStrategy::Huffman(level),
+            CompressionStrategy::LocalHuffman(level),
             CompressionStrategy::Raw(level),
             nocomp,
             nocomp,
@@ -383,6 +406,23 @@ pub(crate) fn automatic_select(
 struct StreamState {
     strategy: CompressionStrategy,
     totals: Vec<usize>,
+}
+
+#[derive(Default)]
+struct HuffmanSamples {
+    encoded: Vec<u8>,
+    frequencies: std::collections::HashMap<u64, usize>,
+}
+
+impl HuffmanSamples {
+    fn push(&mut self, values: &[u64]) -> io::Result<()> {
+        write_varint(&mut self.encoded, values.len() as u64)?;
+        for &value in values {
+            write_varint(&mut self.encoded, value)?;
+            *self.frequencies.entry(value).or_insert(0) += 1;
+        }
+        Ok(())
+    }
 }
 
 #[inline]
@@ -402,12 +442,13 @@ fn strategy_to_rank(strategy: &CompressionStrategy) -> u8 {
         CompressionStrategy::StreamVByte(_) => 10,
         CompressionStrategy::Dictionary(_) => 11,
         CompressionStrategy::Rice(_) => 12,
-        CompressionStrategy::Huffman(_) => 13,
+        CompressionStrategy::LocalHuffman(_) => 13,
         CompressionStrategy::FastPFOR(_) => 14,
         CompressionStrategy::Cascaded(_) => 15,
         CompressionStrategy::SelectiveRLE(_) => 16,
         CompressionStrategy::LZ77(_) => 17,
         CompressionStrategy::EliasFano(_) => 18,
+        CompressionStrategy::Huffman(_) => 19,
         CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _, _) => 255,
     }
 }
@@ -437,30 +478,76 @@ impl StreamState {
         second_vals: &[u64],
         encode_fn: &F,
         stream_label: &str,
-    ) where
+    ) -> io::Result<()>
+    where
         F: Fn(&[u64], &[u64], &CompressionStrategy) -> io::Result<Vec<u8>>,
     {
-        let encoded = encode_fn(first_vals, second_vals, &self.strategy).unwrap_or_else(|err| {
-            panic!(
-                "{}-stream strategy {} failed to encode sample: {}",
-                stream_label, self.strategy, err
+        let encoded = encode_fn(first_vals, second_vals, &self.strategy).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "{stream_label}-stream strategy {} failed to encode sample: {err}",
+                    self.strategy
+                ),
             )
-        });
-
-        let level = self.strategy.zstd_level();
-        for (idx, layer) in layers.iter().take(self.totals.len()).enumerate() {
-            let compressed =
-                compress_with_layer(&encoded[..], *layer, level).unwrap_or_else(|err| {
-                    panic!(
-                        "{}-stream strategy {} with layer {:?} failed to compress sample: {}",
-                        stream_label, self.strategy, layer, err
-                    )
-                });
-            let len = compressed.len();
-            let var_len = varint_size(len as u64) as usize;
-            self.totals[idx] += len + var_len;
-        }
+        })?;
+        self.add_encoded(layers, &encoded, stream_label)
     }
+
+    fn add_encoded(
+        &mut self,
+        layers: &[CompressionLayer; 3],
+        encoded: &[u8],
+        stream_label: &str,
+    ) -> io::Result<()> {
+        let level = self.strategy.zstd_level();
+        for (total, layer) in self.totals.iter_mut().zip(layers) {
+            let compressed = compress_with_layer(encoded, *layer, level).map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!(
+                        "{stream_label}-stream strategy {} with layer {layer:?} failed: {err}",
+                        self.strategy
+                    ),
+                )
+            })?;
+            let len = compressed.len();
+            *total = total
+                .checked_add(len + varint_size(len as u64) as usize)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "sample size overflow")
+                })?;
+        }
+        Ok(())
+    }
+}
+
+fn huffman_state(
+    samples: &HuffmanSamples,
+    layers: &[CompressionLayer; 3],
+    level: i32,
+    layer_count: usize,
+) -> Option<StreamState> {
+    let table = HuffmanTable::from_frequencies(&samples.frequencies).ok()?;
+    let mut state = StreamState::new(CompressionStrategy::Huffman(level), layer_count);
+    let mut table_bytes = Vec::new();
+    table.write(&mut table_bytes).ok()?;
+    state
+        .totals
+        .iter_mut()
+        .for_each(|n| *n += table_bytes.len());
+    let mut input = samples.encoded.as_slice();
+    while !input.is_empty() {
+        let len = usize::try_from(read_varint(&mut input).ok()?).ok()?;
+        let values = (0..len)
+            .map(|_| read_varint(&mut input))
+            .collect::<io::Result<Vec<_>>>()
+            .ok()?;
+        state
+            .add_encoded(layers, &table.encode(&values).ok()?, "Huffman")
+            .ok()?;
+    }
+    Some(state)
 }
 
 fn process_stream_states<F>(
@@ -470,12 +557,13 @@ fn process_stream_states<F>(
     second_vals: &[u64],
     stream_label: &'static str,
     encode_fn: F,
-) where
+) -> io::Result<()>
+where
     F: Fn(&[u64], &[u64], &CompressionStrategy) -> io::Result<Vec<u8>> + Sync,
 {
-    states.par_iter_mut().for_each(|state| {
-        state.process_sample(layers, first_vals, second_vals, &encode_fn, stream_label);
-    });
+    states.par_iter_mut().try_for_each(|state| {
+        state.process_sample(layers, first_vals, second_vals, &encode_fn, stream_label)
+    })
 }
 
 fn encode_first_stream(values: &[u64], strategy: &CompressionStrategy) -> io::Result<Vec<u8>> {
@@ -572,8 +660,8 @@ pub(crate) fn decompress_varint<R: Read>(
     header: &TpaHeader,
     first_strategy: CompressionStrategy,
     second_strategy: CompressionStrategy,
+    tables: &HuffmanTables,
 ) -> io::Result<()> {
-    // Read string table
     let string_table = StringTable::read(&mut reader, header.num_strings())?;
 
     // Stream write records
@@ -598,6 +686,7 @@ pub(crate) fn decompress_varint<R: Read>(
             header.tracepoint_type,
             header.first_layer,
             header.second_layer,
+            tables,
         )?;
         write_paf_line_with_tracepoints(&mut writer, &record, &string_table)?;
     }
@@ -607,6 +696,110 @@ pub(crate) fn decompress_varint<R: Read>(
     Ok(())
 }
 
+fn encode_stream(
+    vals: &[u64],
+    strategy: CompressionStrategy,
+    table: Option<&HuffmanTable>,
+) -> io::Result<Vec<u8>> {
+    match table {
+        Some(t) if strategy.uses_file_table() => t.encode(vals),
+        _ => encode_tracepoint_values(vals, strategy),
+    }
+}
+
+fn decode_stream(
+    buf: &[u8],
+    num_items: usize,
+    strategy: CompressionStrategy,
+    table: Option<&HuffmanTable>,
+) -> io::Result<Vec<u64>> {
+    match table {
+        Some(t) if strategy.uses_file_table() => t.decode(buf, num_items),
+        _ => decode_tracepoint_values(buf, num_items, strategy),
+    }
+}
+
+/// The pair of file-level Huffman tables (one per stream). Empty for version-1 files.
+#[derive(Default)]
+pub struct HuffmanTables {
+    first: Option<HuffmanTable>,
+    second: Option<HuffmanTable>,
+}
+
+impl HuffmanTables {
+    fn validate_presence(header: &TpaHeader, present: [bool; 2]) -> io::Result<()> {
+        if present != header.required_tables() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Huffman table blocks do not match the declared strategies",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn new(first: Option<HuffmanTable>, second: Option<HuffmanTable>) -> Self {
+        Self { first, second }
+    }
+
+    /// Symbol counts of the two tables (0 when absent)
+    pub fn symbol_counts(&self) -> (usize, usize) {
+        (
+            self.first.as_ref().map_or(0, |t| t.lengths.len()),
+            self.second.as_ref().map_or(0, |t| t.lengths.len()),
+        )
+    }
+
+    pub(crate) fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        for t in [&self.first, &self.second] {
+            match t {
+                Some(t) => t.write(writer)?,
+                None => {
+                    write_varint(writer, 0)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read<R: Read>(reader: &mut R, header: &TpaHeader) -> io::Result<Self> {
+        if header.version() != crate::format::TPA_VERSION_HUFFMAN_TABLE {
+            return Ok(Self::default());
+        }
+        let first = HuffmanTable::read(reader)?;
+        let second = HuffmanTable::read(reader)?;
+        Self::validate_presence(header, [first.is_some(), second.is_some()])?;
+        Ok(Self { first, second })
+    }
+
+    /// Skip the section and return its byte length.
+    pub fn skip<R: Read + Seek>(reader: &mut R, header: &TpaHeader) -> io::Result<u64> {
+        if header.version() != crate::format::TPA_VERSION_HUFFMAN_TABLE {
+            return Ok(0);
+        }
+        let start = reader.stream_position()?;
+        let mut present = [false; 2];
+        for item in &mut present {
+            let len = read_varint(reader)?;
+            *item = len != 0;
+            let copied = io::copy(&mut reader.by_ref().take(len), &mut io::sink())?;
+            if copied != len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("Huffman table section truncated: wanted {len} bytes, got {copied}"),
+                ));
+            }
+        }
+        Self::validate_presence(header, present)?;
+        Ok(reader.stream_position()? - start)
+    }
+
+    /// Load the tables of a TPA file once, for reuse across standalone random-access calls.
+    pub fn load(path: &str) -> io::Result<Self> {
+        let mut file = File::open(path)?;
+        Ok(read_header_and_tables(&mut file)?.1)
+    }
+}
+
 pub(crate) fn read_record<R: Read>(
     reader: &mut R,
     first_strategy: CompressionStrategy,
@@ -614,6 +807,7 @@ pub(crate) fn read_record<R: Read>(
     tp_type: TracepointType,
     first_layer: CompressionLayer,
     second_layer: CompressionLayer,
+    tables: &HuffmanTables,
 ) -> io::Result<CompactRecord> {
     let query_name_id = read_varint(reader)?;
     let query_start = read_varint(reader)?;
@@ -635,13 +829,13 @@ pub(crate) fn read_record<R: Read>(
         tp_type,
         first_strategy,
         second_strategy,
+        tables,
         first_layer,
         second_layer,
     )?;
 
-    let num_tags = read_varint(reader)? as usize;
-    let mut tags = Vec::with_capacity(num_tags);
-    for _ in 0..num_tags {
+    let mut tags = Vec::new();
+    for _ in 0..read_varint(reader)? {
         tags.push(Tag::read(reader)?);
     }
 
@@ -661,11 +855,13 @@ pub(crate) fn read_record<R: Read>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn read_tracepoints<R: Read>(
     reader: &mut R,
     tp_type: TracepointType,
     first_strategy: CompressionStrategy,
     second_strategy: CompressionStrategy,
+    tables: &HuffmanTables,
     first_layer: CompressionLayer,
     second_layer: CompressionLayer,
 ) -> io::Result<TracepointData> {
@@ -683,6 +879,7 @@ pub(crate) fn read_tracepoints<R: Read>(
                 num_items,
                 first_strategy,
                 second_strategy,
+                tables,
                 first_layer,
                 second_layer,
             )?;
@@ -697,7 +894,7 @@ pub(crate) fn read_tracepoints<R: Read>(
             let mut first_compressed = vec![0u8; first_len];
             reader.read_exact(&mut first_compressed)?;
             let first_buf = decompress_with_layer(&first_compressed[..], first_layer)?;
-            let vals = decode_tracepoint_values(&first_buf, num_items, first_strategy)?;
+            let vals = decode_stream(&first_buf, num_items, first_strategy, tables.first.as_ref())?;
             Ok(TracepointData::FastgaNoDiff(
                 vals.into_iter().map(|v| v as usize).collect(),
             ))
@@ -731,16 +928,24 @@ pub(crate) fn read_tracepoints<R: Read>(
 // SHARED HELPERS (HEADER/FOOTER, TRACEPOINTS, SKIPS)
 // ============================================================================
 
-/// Read and validate header (checks footer for crash-safety), positions reader after header.
+/// Read a validated header and leave the reader at the string table.
 pub(crate) fn read_header<R: Read + Seek>(reader: &mut R) -> io::Result<TpaHeader> {
-    let header = TpaHeader::read(reader)?;
-    if header.version != TPA_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Unsupported format version: {}", header.version),
-        ));
-    }
+    let header = read_validated_header(reader)?;
+    HuffmanTables::skip(reader, &header)?;
+    Ok(header)
+}
 
+/// Read a validated header and its file-level tables.
+pub(crate) fn read_header_and_tables<R: Read + Seek>(
+    reader: &mut R,
+) -> io::Result<(TpaHeader, HuffmanTables)> {
+    let header = read_validated_header(reader)?;
+    let tables = HuffmanTables::read(reader, &header)?;
+    Ok((header, tables))
+}
+
+fn read_validated_header<R: Read + Seek>(reader: &mut R) -> io::Result<TpaHeader> {
+    let header = TpaHeader::read(reader)?;
     let after_header = reader.stream_position()?;
     let footer = TpaFooter::read_from_end(reader)?;
     footer.validate_against(&header)?;
@@ -749,12 +954,14 @@ pub(crate) fn read_header<R: Read + Seek>(reader: &mut R) -> io::Result<TpaHeade
 }
 
 /// Decode tracepoints from a known offset (seeks before reading).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn read_tracepoints_at_offset<R: Read + Seek>(
     reader: &mut R,
     offset: u64,
     tp_type: TracepointType,
     first_strategy: CompressionStrategy,
     second_strategy: CompressionStrategy,
+    tables: &HuffmanTables,
     first_layer: CompressionLayer,
     second_layer: CompressionLayer,
 ) -> io::Result<TracepointData> {
@@ -764,97 +971,53 @@ pub(crate) fn read_tracepoints_at_offset<R: Read + Seek>(
         tp_type,
         first_strategy,
         second_strategy,
+        tables,
         first_layer,
         second_layer,
     )
 }
 
-/// Skip over a record without allocating.
-pub(crate) fn skip_record<R: Read + Seek>(
-    reader: &mut R,
-    tp_type: TracepointType,
-) -> io::Result<()> {
-    read_varint(reader)?; // query_name_id
-    read_varint(reader)?; // query_start
-    read_varint(reader)?; // query_end
-    reader.seek(SeekFrom::Current(1))?; // strand
-    read_varint(reader)?; // target_name_id
-    read_varint(reader)?; // target_start
-    read_varint(reader)?; // target_end
-    read_varint(reader)?; // residue_matches
-    read_varint(reader)?; // alignment_block_len
-    reader.seek(SeekFrom::Current(1))?; // mapping_quality
-
-    skip_tracepoints(reader, tp_type)?;
-
-    // Skip tags
-    let num_tags = read_varint(reader)? as usize;
-    for _ in 0..num_tags {
-        reader.seek(SeekFrom::Current(2))?; // key
-        let mut tag_type = [0u8; 1];
-        reader.read_exact(&mut tag_type)?;
-        match tag_type[0] {
-            b'i' => reader.seek(SeekFrom::Current(4))?,
-            b'f' => reader.seek(SeekFrom::Current(4))?,
-            b'Z' => {
-                let len = read_varint(reader)? as usize;
-                reader.seek(SeekFrom::Current(len as i64))?
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Invalid tag type: '{}' (byte: {})",
-                        tag_type[0] as char, tag_type[0]
-                    ),
-                ))
-            }
-        };
+fn skip_exact<R: Read>(reader: &mut R, len: u64) -> io::Result<()> {
+    if io::copy(&mut reader.take(len), &mut io::sink())? == len {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "length-prefixed field is truncated",
+        ))
     }
-
-    Ok(())
 }
 
-fn skip_tracepoints<R: Read + Seek>(reader: &mut R, tp_type: TracepointType) -> io::Result<()> {
-    let _num_items = read_varint(reader)?;
+fn skip_block<R: Read>(reader: &mut R) -> io::Result<()> {
+    let len = read_varint(reader)?;
+    skip_exact(reader, len)
+}
 
-    // Helper to read length and skip that many bytes
-    let skip_block = |reader: &mut R| -> io::Result<()> {
-        let len = read_varint(reader)?;
-        let len = i64::try_from(len).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Compressed block too large to skip",
-            )
-        })?;
-        reader.seek(SeekFrom::Current(len))?;
-        Ok(())
+fn skip_tracepoints_and_tags<R: Read>(reader: &mut R, tp_type: TracepointType) -> io::Result<()> {
+    read_varint(reader)?; // tracepoint count
+    let blocks = match tp_type {
+        TracepointType::Standard | TracepointType::Fastga => 2,
+        TracepointType::FastgaNoDiff => 1,
+        TracepointType::Variable => 3,
+        TracepointType::Mixed => 5,
     };
+    for _ in 0..blocks {
+        skip_block(reader)?;
+    }
 
-    match tp_type {
-        TracepointType::Standard | TracepointType::Fastga => {
-            // Format: [first_len][first_data][second_len][second_data]
-            skip_block(reader)?;
-            skip_block(reader)?;
-        }
-        TracepointType::FastgaNoDiff => {
-            // Format: [first_len][first_data]
-            skip_block(reader)?;
-        }
-        TracepointType::Variable => {
-            // Format: [presence_bitmap_len][presence_bitmap][first_len][first_data][second_len][second_data]
-            skip_block(reader)?; // presence bitmap
-            skip_block(reader)?; // first values
-            skip_block(reader)?; // second values
-        }
-        TracepointType::Mixed => {
-            // Format: [type_bitmap_len][type_bitmap][tp_first_len][tp_first][tp_second_len][tp_second]
-            //         [cigar_lens_len][cigar_lens][cigar_ops_len][cigar_ops]
-            skip_block(reader)?; // type bitmap
-            skip_block(reader)?; // tp first values
-            skip_block(reader)?; // tp second values
-            skip_block(reader)?; // cigar lengths
-            skip_block(reader)?; // cigar ops
+    for _ in 0..read_varint(reader)? {
+        skip_exact(reader, 2)?; // tag key
+        let mut tag_type = [0];
+        reader.read_exact(&mut tag_type)?;
+        match tag_type[0] {
+            b'i' | b'f' => skip_exact(reader, 4)?,
+            b'Z' => skip_block(reader)?,
+            value => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid tag type: '{}' (byte: {value})", value as char),
+                ))
+            }
         }
     }
     Ok(())
@@ -865,78 +1028,17 @@ pub(crate) fn skip_record_sequential<R: Read>(
     reader: &mut R,
     tp_type: TracepointType,
 ) -> io::Result<()> {
-    // Helper to skip n bytes by reading into a buffer
-    fn skip_bytes<R: Read>(reader: &mut R, n: usize) -> io::Result<()> {
-        io::copy(&mut reader.take(n as u64), &mut io::sink())?;
-        Ok(())
-    }
-
-    // Helper to read length-prefixed block and skip its data
-    fn skip_block<R: Read>(reader: &mut R) -> io::Result<()> {
-        let len = read_varint(reader)? as usize;
-        skip_bytes(reader, len)
-    }
-
     read_varint(reader)?; // query_name_id
     read_varint(reader)?; // query_start
     read_varint(reader)?; // query_end
-    skip_bytes(reader, 1)?; // strand
+    skip_exact(reader, 1)?; // strand
     read_varint(reader)?; // target_name_id
     read_varint(reader)?; // target_start
     read_varint(reader)?; // target_end
     read_varint(reader)?; // residue_matches
     read_varint(reader)?; // alignment_block_len
-    skip_bytes(reader, 1)?; // mapping_quality
-
-    // Skip tracepoints
-    let _num_items = read_varint(reader)?;
-    match tp_type {
-        TracepointType::Standard | TracepointType::Fastga => {
-            skip_block(reader)?;
-            skip_block(reader)?;
-        }
-        TracepointType::FastgaNoDiff => {
-            skip_block(reader)?;
-        }
-        TracepointType::Variable => {
-            skip_block(reader)?; // presence bitmap
-            skip_block(reader)?; // first values
-            skip_block(reader)?; // second values
-        }
-        TracepointType::Mixed => {
-            skip_block(reader)?; // type bitmap
-            skip_block(reader)?; // tp first values
-            skip_block(reader)?; // tp second values
-            skip_block(reader)?; // cigar lengths
-            skip_block(reader)?; // cigar ops
-        }
-    }
-
-    // Skip tags
-    let num_tags = read_varint(reader)? as usize;
-    for _ in 0..num_tags {
-        skip_bytes(reader, 2)?; // key
-        let mut tag_type = [0u8; 1];
-        reader.read_exact(&mut tag_type)?;
-        match tag_type[0] {
-            b'i' | b'f' => skip_bytes(reader, 4)?,
-            b'Z' => {
-                let len = read_varint(reader)? as usize;
-                skip_bytes(reader, len)?;
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Invalid tag type: '{}' (byte: {})",
-                        tag_type[0] as char, tag_type[0]
-                    ),
-                ))
-            }
-        }
-    }
-
-    Ok(())
+    skip_exact(reader, 1)?; // mapping_quality
+    skip_tracepoints_and_tags(reader, tp_type)
 }
 
 /// Read record header fields (coordinates, strand, mapq) and skip tracepoints+tags.
@@ -946,18 +1048,6 @@ pub(crate) fn read_record_metadata<R: Read>(
     reader: &mut R,
     tp_type: TracepointType,
 ) -> io::Result<CompactRecord> {
-    // Helper to skip n bytes by reading into sink
-    fn skip_bytes<R: Read>(reader: &mut R, n: usize) -> io::Result<()> {
-        io::copy(&mut reader.take(n as u64), &mut io::sink())?;
-        Ok(())
-    }
-
-    // Helper to read length-prefixed block and skip its data
-    fn skip_block<R: Read>(reader: &mut R) -> io::Result<()> {
-        let len = read_varint(reader)? as usize;
-        skip_bytes(reader, len)
-    }
-
     // READ header fields
     let query_name_id = read_varint(reader)?;
     let query_start = read_varint(reader)?;
@@ -974,53 +1064,7 @@ pub(crate) fn read_record_metadata<R: Read>(
     reader.read_exact(&mut mapq_buf)?;
     let mapping_quality = mapq_buf[0];
 
-    // SKIP tracepoints (same logic as skip_record_sequential)
-    let _num_items = read_varint(reader)?;
-    match tp_type {
-        TracepointType::Standard | TracepointType::Fastga => {
-            skip_block(reader)?;
-            skip_block(reader)?;
-        }
-        TracepointType::FastgaNoDiff => {
-            skip_block(reader)?;
-        }
-        TracepointType::Variable => {
-            skip_block(reader)?; // presence bitmap
-            skip_block(reader)?; // first values
-            skip_block(reader)?; // second values
-        }
-        TracepointType::Mixed => {
-            skip_block(reader)?; // type bitmap
-            skip_block(reader)?; // tp first values
-            skip_block(reader)?; // tp second values
-            skip_block(reader)?; // cigar lengths
-            skip_block(reader)?; // cigar ops
-        }
-    }
-
-    // SKIP tags
-    let num_tags = read_varint(reader)? as usize;
-    for _ in 0..num_tags {
-        skip_bytes(reader, 2)?; // key
-        let mut tag_type = [0u8; 1];
-        reader.read_exact(&mut tag_type)?;
-        match tag_type[0] {
-            b'i' | b'f' => skip_bytes(reader, 4)?,
-            b'Z' => {
-                let len = read_varint(reader)? as usize;
-                skip_bytes(reader, len)?;
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Invalid tag type: '{}' (byte: {})",
-                        tag_type[0] as char, tag_type[0]
-                    ),
-                ))
-            }
-        }
-    }
+    skip_tracepoints_and_tags(reader, tp_type)?;
 
     Ok(CompactRecord {
         query_name_id,
@@ -1142,6 +1186,14 @@ impl<'a> BitReader<'a> {
             }
         }
         Ok(count)
+    }
+
+    fn has_only_padding(&self) -> bool {
+        if self.bits_left == 0 {
+            return self.byte_idx == self.data.len();
+        }
+        let padding_mask = (1u8 << self.bits_left) - 1;
+        self.byte_idx + 1 == self.data.len() && self.data[self.byte_idx] & padding_mask == 0
     }
 }
 
@@ -1295,46 +1347,56 @@ struct HuffmanCode {
     code: u64,
 }
 
-#[derive(Clone)]
-enum HuffmanNode {
-    Leaf(u64),
-    Internal(Box<HuffmanNode>, Box<HuffmanNode>),
-}
+/// O(n log n) Huffman lengths with deterministic symbol-based tie-breaking.
+fn huffman_code_lengths(freqs: &[(u64, usize)]) -> Vec<(u64, u8)> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
 
-fn build_huffman_tree(freqs: &[(u64, usize)]) -> HuffmanNode {
-    let mut nodes: Vec<(usize, HuffmanNode)> = freqs
-        .iter()
-        .map(|(v, f)| (*f, HuffmanNode::Leaf(*v)))
-        .collect();
-    while nodes.len() > 1 {
-        nodes.sort_by_key(|(f, _)| *f);
-        let (f1, n1) = nodes.remove(0);
-        let (f2, n2) = nodes.remove(0);
-        nodes.push((f1 + f2, HuffmanNode::Internal(Box::new(n1), Box::new(n2))));
+    if freqs.is_empty() {
+        return Vec::new();
     }
-    nodes.pop().map(|(_, n)| n).unwrap()
-}
+    if freqs.len() == 1 {
+        return vec![(freqs[0].0, 1)];
+    }
 
-fn gather_lengths(node: &HuffmanNode, depth: u8, lens: &mut Vec<(u64, u8)>) {
-    match node {
-        HuffmanNode::Leaf(v) => {
-            // Ensure single-symbol trees still get a length of 1
-            lens.push((*v, depth.max(1)));
-        }
-        HuffmanNode::Internal(left, right) => {
-            gather_lengths(left, depth + 1, lens);
-            gather_lengths(right, depth + 1, lens);
+    enum Node {
+        Leaf(u64),
+        Internal(usize, usize),
+    }
+    let mut nodes: Vec<Node> = Vec::with_capacity(freqs.len() * 2);
+    let mut heap: BinaryHeap<Reverse<(usize, u64, usize)>> = BinaryHeap::with_capacity(freqs.len());
+    for &(value, count) in freqs {
+        nodes.push(Node::Leaf(value));
+        heap.push(Reverse((count, value, nodes.len() - 1)));
+    }
+    while heap.len() > 1 {
+        let Reverse((c1, v1, i1)) = heap.pop().unwrap();
+        let Reverse((c2, v2, i2)) = heap.pop().unwrap();
+        nodes.push(Node::Internal(i1, i2));
+        heap.push(Reverse((c1 + c2, v1.min(v2), nodes.len() - 1)));
+    }
+
+    let root = heap.pop().unwrap().0 .2;
+    let mut lengths = Vec::with_capacity(freqs.len());
+    let mut stack = vec![(root, 0u8)];
+    while let Some((idx, depth)) = stack.pop() {
+        match nodes[idx] {
+            Node::Leaf(value) => lengths.push((value, depth.max(1))),
+            Node::Internal(l, r) => {
+                stack.push((l, depth + 1));
+                stack.push((r, depth + 1));
+            }
         }
     }
+    lengths
 }
 
-fn build_canonical_codes(lengths: &[(u64, u8)]) -> io::Result<Vec<HuffmanCode>> {
-    let mut entries = lengths.to_vec();
-    entries.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-    let mut codes = Vec::with_capacity(entries.len());
+fn build_canonical_codes(lengths: &mut [(u64, u8)]) -> io::Result<Vec<HuffmanCode>> {
+    lengths.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    let mut codes = Vec::with_capacity(lengths.len());
     let mut code = 0u64;
     let mut prev_len = 0u8;
-    for (value, len) in entries {
+    for &(value, len) in lengths.iter() {
         if len == 0 || len > 63 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1344,6 +1406,13 @@ fn build_canonical_codes(lengths: &[(u64, u8)]) -> io::Result<Vec<HuffmanCode>> 
         if prev_len > 0 {
             code <<= (len - prev_len) as u32;
         }
+        // Enforce the Kraft bound.
+        if code >= (1u64 << len) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("oversubscribed Huffman code lengths at value {value} (len {len})"),
+            ));
+        }
         codes.push(HuffmanCode { value, len, code });
         code += 1;
         prev_len = len;
@@ -1351,126 +1420,271 @@ fn build_canonical_codes(lengths: &[(u64, u8)]) -> io::Result<Vec<HuffmanCode>> 
     Ok(codes)
 }
 
-fn huffman_encode(values: &[u64]) -> io::Result<Vec<u8>> {
-    if values.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    use std::collections::HashMap;
-    let mut freq: HashMap<u64, usize> = HashMap::new();
-    for &v in values {
-        *freq.entry(v).or_insert(0) += 1;
-    }
-    let mut freq_vec: Vec<(u64, usize)> = freq.into_iter().collect();
-    freq_vec.sort_by_key(|(_, c)| *c);
-
-    let tree = build_huffman_tree(&freq_vec);
-    let mut lengths = Vec::with_capacity(freq_vec.len());
-    gather_lengths(&tree, 0, &mut lengths);
-    let codes = build_canonical_codes(&lengths)?;
-
-    let mut code_lookup = std::collections::HashMap::new();
-    for c in &codes {
-        code_lookup.insert(c.value, (c.code, c.len));
-    }
-
-    // Serialize header: symbol count + (value, length) pairs in canonical order
-    let mut out = Vec::new();
-    write_varint(&mut out, codes.len() as u64)?;
-    let mut lengths_sorted: Vec<(u64, u8)> = codes.iter().map(|c| (c.value, c.len)).collect();
-    lengths_sorted.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-    for (value, len) in lengths_sorted.iter() {
-        write_varint(&mut out, *value)?;
-        out.push(*len);
-    }
-
-    // Encode payload
-    let mut writer = BitWriter::default();
-    for &v in values {
-        let (code, len) = code_lookup[&v];
-        writer.write_bits(code, len);
-    }
-    out.extend_from_slice(&writer.finish());
-    Ok(out)
+#[derive(Clone, Copy, Default)]
+struct DecodeRange {
+    first_code: u64,
+    first_symbol: usize,
+    count: usize,
 }
 
-fn huffman_decode(buf: &[u8], num_items: usize) -> io::Result<Vec<u64>> {
-    if num_items == 0 {
-        return Ok(Vec::new());
+struct HuffmanDecoder {
+    ranges: Vec<DecodeRange>,
+    symbols: Vec<u64>,
+    max_len: u8,
+}
+
+impl HuffmanDecoder {
+    fn new(codes: &[HuffmanCode]) -> Self {
+        let max_len = codes.last().map_or(0, |code| code.len);
+        let mut ranges = vec![DecodeRange::default(); max_len as usize + 1];
+        for (index, code) in codes.iter().enumerate() {
+            let range = &mut ranges[code.len as usize];
+            if range.count == 0 {
+                range.first_code = code.code;
+                range.first_symbol = index;
+            }
+            range.count += 1;
+        }
+        Self {
+            ranges,
+            symbols: codes.iter().map(|code| code.value).collect(),
+            max_len,
+        }
     }
-    let mut reader = buf;
-    let symbol_count = read_varint(&mut reader)? as usize;
+}
+
+fn build_encode_lookup(codes: &[HuffmanCode]) -> std::collections::HashMap<u64, (u64, u8)> {
+    codes.iter().map(|c| (c.value, (c.code, c.len))).collect()
+}
+
+fn huffman_lengths(freq: &std::collections::HashMap<u64, usize>) -> Vec<(u64, u8)> {
+    let freq_vec: Vec<(u64, usize)> = freq.iter().map(|(v, c)| (*v, *c)).collect();
+    huffman_code_lengths(&freq_vec)
+}
+
+fn write_code_lengths(out: &mut Vec<u8>, lengths: &[(u64, u8)]) -> io::Result<()> {
+    write_varint(out, lengths.len() as u64)?;
+    for (value, len) in lengths {
+        write_varint(out, *value)?;
+        out.push(*len);
+    }
+    Ok(())
+}
+
+fn read_code_lengths<R: Read>(reader: &mut R, available: u64) -> io::Result<Vec<(u64, u8)>> {
+    let symbol_count = usize::try_from(read_varint(reader)?).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Huffman symbol count does not fit in memory",
+        )
+    })?;
     if symbol_count == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Huffman stream has zero symbols",
         ));
     }
+    // Every entry needs at least a one-byte value and length.
+    if symbol_count as u64 > available / 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Huffman table claims {symbol_count} symbols but only {available} bytes remain"
+            ),
+        ));
+    }
     let mut lengths: Vec<(u64, u8)> = Vec::with_capacity(symbol_count);
+    let mut symbols = std::collections::HashSet::with_capacity(symbol_count);
     for _ in 0..symbol_count {
-        let value = read_varint(&mut reader)?;
-        if reader.is_empty() {
+        let value = read_varint(reader)?;
+        if !symbols.insert(value) {
             return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "Huffman header truncated",
+                io::ErrorKind::InvalidData,
+                format!("duplicate Huffman symbol: {value}"),
             ));
         }
-        let len = reader[0];
-        reader = &reader[1..];
-        lengths.push((value, len));
+        let mut len = [0];
+        reader.read_exact(&mut len)?;
+        lengths.push((value, len[0]));
     }
-    let codes = build_canonical_codes(&lengths)?;
+    Ok(lengths)
+}
 
-    #[derive(Default)]
-    struct DecodeNode {
-        left: Option<Box<DecodeNode>>,
-        right: Option<Box<DecodeNode>>,
-        value: Option<u64>,
+fn huffman_encode_payload(
+    values: &[u64],
+    lookup: &std::collections::HashMap<u64, (u64, u8)>,
+) -> io::Result<Vec<u8>> {
+    let mut writer = BitWriter::default();
+    for v in values {
+        let (code, len) = *lookup.get(v).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("value {} is missing from the Huffman table", v),
+            )
+        })?;
+        writer.write_bits(code, len);
     }
+    Ok(writer.finish())
+}
 
-    let mut root = DecodeNode::default();
-    for c in &codes {
-        let mut node = &mut root;
-        for shift in (0..c.len).rev() {
-            let bit = (c.code >> (shift as u32)) & 1;
-            if bit == 0 {
-                if node.left.is_none() {
-                    node.left = Some(Box::new(DecodeNode::default()));
-                }
-                node = node.left.as_mut().unwrap();
-            } else {
-                if node.right.is_none() {
-                    node.right = Some(Box::new(DecodeNode::default()));
-                }
-                node = node.right.as_mut().unwrap();
-            }
-        }
-        node.value = Some(c.value);
+fn huffman_decode_payload(
+    buf: &[u8],
+    num_items: usize,
+    decoder: &HuffmanDecoder,
+) -> io::Result<Vec<u64>> {
+    if num_items > buf.len().saturating_mul(8) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Huffman item count exceeds the payload capacity",
+        ));
     }
-
-    let mut bit_reader = BitReader::new(reader);
+    let mut bit_reader = BitReader::new(buf);
     let mut output = Vec::with_capacity(num_items);
     for _ in 0..num_items {
-        let mut node = &root;
-        loop {
-            if let Some(v) = node.value {
-                output.push(v);
+        let mut code = 0u64;
+        let mut symbol = None;
+        for len in 1..=decoder.max_len {
+            code = (code << 1) | bit_reader.read_bit()? as u64;
+            let range = decoder.ranges[len as usize];
+            if code >= range.first_code && code - range.first_code < range.count as u64 {
+                let index = range.first_symbol + (code - range.first_code) as usize;
+                symbol = Some(decoder.symbols[index]);
                 break;
             }
-            let bit = bit_reader.read_bit()?;
-            node = if !bit {
-                node.left.as_deref().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "invalid Huffman bitstream")
-                })?
+        }
+        output.push(symbol.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid Huffman bitstream")
+        })?);
+    }
+    if !bit_reader.has_only_padding() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Huffman payload has trailing data",
+        ));
+    }
+    Ok(output)
+}
+
+/// Per-record Huffman: [code lengths][payload]
+fn local_huffman_encode(values: &[u64]) -> io::Result<Vec<u8>> {
+    if values.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut freq: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for &v in values {
+        *freq.entry(v).or_insert(0) += 1;
+    }
+    let mut lengths = huffman_lengths(&freq);
+    let codes = build_canonical_codes(&mut lengths)?;
+    let lookup = build_encode_lookup(&codes);
+
+    let mut out = Vec::new();
+    write_code_lengths(&mut out, &lengths)?;
+    out.extend_from_slice(&huffman_encode_payload(values, &lookup)?);
+    Ok(out)
+}
+
+fn local_huffman_decode(buf: &[u8], num_items: usize) -> io::Result<Vec<u64>> {
+    if num_items == 0 {
+        return Ok(Vec::new());
+    }
+    let mut reader = buf;
+    let mut lengths = read_code_lengths(&mut reader, buf.len() as u64)?;
+    let codes = build_canonical_codes(&mut lengths)?;
+    let decoder = HuffmanDecoder::new(&codes);
+    huffman_decode_payload(reader, num_items, &decoder)
+}
+
+// ============================================================================
+// GLOBAL (FILE-LEVEL) HUFFMAN CODEBOOK
+// ============================================================================
+
+/// A Huffman code table stored once per file instead of once per record.
+///
+/// Records still decode independently: the table is read at open time and shared, so
+/// random access is preserved while short records stop paying for their own table.
+enum HuffmanCodec {
+    Encoder(std::collections::HashMap<u64, (u64, u8)>),
+    Decoder(HuffmanDecoder),
+}
+
+pub(crate) struct HuffmanTable {
+    lengths: Vec<(u64, u8)>,
+    codec: HuffmanCodec,
+}
+
+impl HuffmanTable {
+    pub(crate) fn from_frequencies(
+        freq: &std::collections::HashMap<u64, usize>,
+    ) -> io::Result<Self> {
+        if freq.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot build a Huffman table from an empty histogram",
+            ));
+        }
+        let mut lengths = huffman_lengths(freq);
+        let codes = build_canonical_codes(&mut lengths)?;
+        Ok(Self {
+            lengths,
+            codec: HuffmanCodec::Encoder(build_encode_lookup(&codes)),
+        })
+    }
+
+    fn from_lengths(mut lengths: Vec<(u64, u8)>) -> io::Result<Self> {
+        let codes = build_canonical_codes(&mut lengths)?;
+        Ok(Self {
+            lengths,
+            codec: HuffmanCodec::Decoder(HuffmanDecoder::new(&codes)),
+        })
+    }
+
+    pub(crate) fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        let mut buf = Vec::new();
+        write_code_lengths(&mut buf, &self.lengths)?;
+        write_varint(writer, buf.len() as u64)?;
+        writer.write_all(&buf)?;
+        Ok(())
+    }
+
+    pub(crate) fn read<R: Read>(reader: &mut R) -> io::Result<Option<Self>> {
+        let len = read_varint(reader)?;
+        if len == 0 {
+            return Ok(None);
+        }
+        // Buffered: the table is parsed varint by varint, and an unbuffered File would cost one
+        // syscall per byte (110 ms for a 42k-symbol table). take() still bounds what we read.
+        let mut section = io::BufReader::new(reader.take(len));
+        let lengths = read_code_lengths(&mut section, len)?;
+        if section.get_ref().limit() != 0 || !section.buffer().is_empty() {
+            let remaining = section.get_ref().limit() + section.buffer().len() as u64;
+            let mut byte = [0];
+            let kind = if section.read(&mut byte)? == 0 {
+                io::ErrorKind::UnexpectedEof
             } else {
-                node.right.as_deref().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "invalid Huffman bitstream")
-                })?
+                io::ErrorKind::InvalidData
             };
+            return Err(io::Error::new(
+                kind,
+                format!("Huffman table has {remaining} unparsed bytes"),
+            ));
+        }
+        Ok(Some(Self::from_lengths(lengths)?))
+    }
+
+    fn encode(&self, values: &[u64]) -> io::Result<Vec<u8>> {
+        match &self.codec {
+            HuffmanCodec::Encoder(lookup) => huffman_encode_payload(values, lookup),
+            HuffmanCodec::Decoder(_) => Err(io::Error::other("Huffman table is decode-only")),
         }
     }
 
-    Ok(output)
+    fn decode(&self, buf: &[u8], num_items: usize) -> io::Result<Vec<u64>> {
+        match &self.codec {
+            HuffmanCodec::Decoder(decoder) => huffman_decode_payload(buf, num_items, decoder),
+            HuffmanCodec::Encoder(_) => Err(io::Error::other("Huffman table is encode-only")),
+        }
+    }
 }
 
 // ============================================================================
@@ -1803,11 +2017,18 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
             let zigzagged: Vec<u64> = deltas.iter().map(|&v| encode_zigzag(v)).collect();
             buf = encode_rice_values(&zigzagged)?;
         }
-        CompressionStrategy::Huffman(_) => {
-            // ANS (rANS) on zigzagged deltas - replaces Huffman for better compression
+        CompressionStrategy::LocalHuffman(_) => {
+            // Canonical Huffman on zigzagged deltas
             let deltas = delta_encode(vals);
             let zigzagged: Vec<u64> = deltas.iter().map(|&v| encode_zigzag(v)).collect();
-            buf = huffman_encode(&zigzagged)?;
+            buf = local_huffman_encode(&zigzagged)?;
+        }
+        CompressionStrategy::Huffman(_) => {
+            // Handled by the caller, which owns the file-level table
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "huffman requires a file-level table",
+            ));
         }
         CompressionStrategy::LZ77(_) => {
             // LZ77-style sequence matching: find repeated sequences
@@ -2120,10 +2341,14 @@ fn decode_tracepoint_values(
             let zigzagged = decode_rice_values(buf, num_items)?;
             Ok(reconstruct_from_zigzag_deltas(&zigzagged))
         }
-        CompressionStrategy::Huffman(_) => {
-            let zigzagged = huffman_decode(buf, num_items)?;
+        CompressionStrategy::LocalHuffman(_) => {
+            let zigzagged = local_huffman_decode(buf, num_items)?;
             Ok(reconstruct_from_zigzag_deltas(&zigzagged))
         }
+        CompressionStrategy::Huffman(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "huffman requires a file-level table",
+        )),
         CompressionStrategy::LZ77(_) => {
             // LZ77-style sequence matching decode
             lz77_decode(buf, num_items)
@@ -2182,11 +2407,13 @@ fn safe_signed_add(base: i64, delta: i64) -> io::Result<i64> {
 
 /// Standard/Fastga tracepoint decoding
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_standard_tracepoints<R: Read>(
     reader: &mut R,
     num_items: usize,
     first_strategy: CompressionStrategy,
     second_strategy: CompressionStrategy,
+    tables: &HuffmanTables,
     first_layer: CompressionLayer,
     second_layer: CompressionLayer,
 ) -> io::Result<Vec<(usize, usize)>> {
@@ -2206,7 +2433,8 @@ pub(crate) fn decode_standard_tracepoints<R: Read>(
     // Decode directly to (usize, usize) tuples
     let mut tps = Vec::with_capacity(num_items);
 
-    let first_vals_u64 = decode_tracepoint_values(&first_buf, num_items, first_strategy)?;
+    let first_vals_u64 =
+        decode_stream(&first_buf, num_items, first_strategy, tables.first.as_ref())?;
     let first_vals: Vec<usize> = first_vals_u64.iter().map(|v| *v as usize).collect();
 
     let second_vals_u64: Vec<u64> = match second_strategy {
@@ -2250,7 +2478,7 @@ pub(crate) fn decode_standard_tracepoints<R: Read>(
                 "Automatic/Benchmark must be resolved before decoding",
             ))
         }
-        other => decode_tracepoint_values(&second_buf, num_items, other)?,
+        other => decode_stream(&second_buf, num_items, other, tables.second.as_ref())?,
     };
 
     if second_vals_u64.len() != num_items || first_vals.len() != num_items {
@@ -2260,7 +2488,7 @@ pub(crate) fn decode_standard_tracepoints<R: Read>(
         ));
     }
 
-    for (a, b) in first_vals.into_iter().zip(second_vals_u64.into_iter()) {
+    for (a, b) in first_vals.into_iter().zip(second_vals_u64) {
         tps.push((a, b as usize));
     }
 
@@ -2407,6 +2635,7 @@ pub(crate) fn decode_mixed_tracepoints<R: Read>(
 // ============================================================================
 
 impl CompactRecord {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn write<W: Write>(
         &self,
         writer: &mut W,
@@ -2414,6 +2643,7 @@ impl CompactRecord {
         second_strategy: CompressionStrategy,
         first_layer: CompressionLayer,
         second_layer: CompressionLayer,
+        tables: &HuffmanTables,
     ) -> io::Result<()> {
         write_varint(writer, self.query_name_id)?;
         write_varint(writer, self.query_start)?;
@@ -2431,6 +2661,7 @@ impl CompactRecord {
             second_strategy,
             first_layer,
             second_layer,
+            tables,
         )?;
         write_varint(writer, self.tags.len() as u64)?;
         for tag in &self.tags {
@@ -2439,6 +2670,7 @@ impl CompactRecord {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_tracepoints<W: Write>(
         &self,
         writer: &mut W,
@@ -2446,6 +2678,7 @@ impl CompactRecord {
         second_strategy: CompressionStrategy,
         first_layer: CompressionLayer,
         second_layer: CompressionLayer,
+        tables: &HuffmanTables,
     ) -> io::Result<()> {
         match &self.tracepoints {
             TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
@@ -2453,13 +2686,14 @@ impl CompactRecord {
                 let (first_vals, second_vals): (Vec<u64>, Vec<u64>) =
                     tps.iter().map(|(a, b)| (*a as u64, *b as u64)).unzip();
 
-                let first_val_buf = encode_tracepoint_values(&first_vals, first_strategy)?;
+                let first_val_buf =
+                    encode_stream(&first_vals, first_strategy, tables.first.as_ref())?;
                 let second_val_buf = match &second_strategy {
                     CompressionStrategy::TwoDimDelta(_) => {
                         encode_2d_delta_second_values(&first_vals, &second_vals)?
                     }
                     CompressionStrategy::HybridRLE(_) => encode_rle_values(&second_vals)?,
-                    _ => encode_tracepoint_values(&second_vals, second_strategy)?,
+                    _ => encode_stream(&second_vals, second_strategy, tables.second.as_ref())?,
                 };
 
                 // Apply the layer.
@@ -2467,8 +2701,11 @@ impl CompactRecord {
                 let first_compressed: &[u8] = if matches!(first_layer, CompressionLayer::Nocomp) {
                     &first_val_buf
                 } else {
-                    first_tmp =
-                        compress_with_layer(&first_val_buf[..], first_layer, first_strategy.zstd_level())?;
+                    first_tmp = compress_with_layer(
+                        &first_val_buf[..],
+                        first_layer,
+                        first_strategy.zstd_level(),
+                    )?;
                     &first_tmp
                 };
                 let second_tmp;
@@ -2492,7 +2729,7 @@ impl CompactRecord {
                 // Single stream: [num_items][first_len][first_data]
                 write_varint(writer, tps.len() as u64)?;
                 let vals: Vec<u64> = tps.iter().map(|&v| v as u64).collect();
-                let first_val_buf = encode_tracepoint_values(&vals, first_strategy)?;
+                let first_val_buf = encode_stream(&vals, first_strategy, tables.first.as_ref())?;
                 let first_compressed = compress_with_layer(
                     &first_val_buf[..],
                     first_layer,
@@ -2638,10 +2875,197 @@ mod compression_tests {
     #[test]
     fn huffman_roundtrip_non_monotonic() {
         let vals = vec![10u64, 8, 8, 12, 8, 10, 9, 20, 18, 18, 18];
-        let buf = encode_tracepoint_values(&vals, CompressionStrategy::Huffman(3)).unwrap();
+        let buf = encode_tracepoint_values(&vals, CompressionStrategy::LocalHuffman(3)).unwrap();
         let decoded =
-            decode_tracepoint_values(&buf, vals.len(), CompressionStrategy::Huffman(3)).unwrap();
+            decode_tracepoint_values(&buf, vals.len(), CompressionStrategy::LocalHuffman(3))
+                .unwrap();
         assert_eq!(vals, decoded);
+    }
+
+    #[test]
+    fn file_table_roundtrip_and_size() {
+        // FASTGA trace advances: near-constant, so a single file-level table beats a
+        // per-record one, which is the whole point of the file-level table.
+        let vals: Vec<u64> = (0..5_000)
+            .map(|i| match i % 7 {
+                0 => 97,
+                1 => 109,
+                2 => 92,
+                _ => 100,
+            })
+            .collect();
+        let mut freq = std::collections::HashMap::new();
+        for &v in &vals {
+            *freq.entry(v).or_insert(0) += 1;
+        }
+        let cb = HuffmanTable::from_frequencies(&freq).unwrap();
+        assert_eq!(cb.lengths.len(), 4);
+
+        let payload = cb.encode(&vals).unwrap();
+
+        // the payload carries no table, so it must be smaller than the per-record encoding
+        let per_record =
+            encode_tracepoint_values(&vals, CompressionStrategy::LocalHuffman(3)).unwrap();
+        assert!(payload.len() < per_record.len());
+
+        // serialization round-trip
+        let mut buf = Vec::new();
+        cb.write(&mut buf).unwrap();
+        let mut slice = &buf[..];
+        let back = HuffmanTable::read(&mut slice).unwrap().unwrap();
+        assert_eq!(back.decode(&payload, vals.len()).unwrap(), vals);
+    }
+
+    #[test]
+    fn benchmark_samples_are_compact() {
+        let values = vec![7; 10_000];
+        let mut samples = HuffmanSamples::default();
+        samples.push(&values).unwrap();
+        assert!(samples.encoded.len() < values.len() * size_of::<u64>());
+        assert!(huffman_state(&samples, &[CompressionLayer::Nocomp; 3], 3, 1).is_some());
+    }
+
+    #[test]
+    fn code_lengths_ignore_input_order() {
+        // the heap key must be a total order, so the order entries arrive in cannot matter
+        let base: Vec<(u64, usize)> = vec![
+            (5, 7),
+            (9, 7),
+            (2, 7),
+            (11, 3),
+            (4, 3),
+            (8, 12),
+            (1, 1),
+            (3, 1),
+            (6, 1),
+        ];
+        let mut expected = huffman_code_lengths(&base);
+        expected.sort();
+        for rot in 1..base.len() {
+            let mut permuted = base.clone();
+            permuted.rotate_left(rot);
+            let mut got = huffman_code_lengths(&permuted);
+            got.sort();
+            assert_eq!(got, expected, "rotation by {rot} changed the code lengths");
+        }
+    }
+
+    #[test]
+    fn code_lengths_are_deterministic_and_optimal() {
+        use std::collections::HashMap;
+        // equal frequencies: HashMap iteration order must not leak into the code lengths
+        let freq: HashMap<u64, usize> = (0..6u64).map(|v| (v, 10)).collect();
+        let mut first = huffman_lengths(&freq);
+        for _ in 0..20 {
+            let again: HashMap<u64, usize> = (0..6u64).map(|v| (v, 10)).collect();
+            assert_eq!(
+                huffman_lengths(&again),
+                first,
+                "code lengths must be reproducible"
+            );
+        }
+        // and still a valid, non-oversubscribed code
+        assert!(build_canonical_codes(&mut first).is_ok());
+
+        // skewed distribution: the frequent symbol must get the shortest code
+        let skewed: HashMap<u64, usize> = HashMap::from([(7, 1000), (8, 5), (9, 3), (10, 2)]);
+        let mut lens = huffman_lengths(&skewed);
+        let len_of = |v: u64| lens.iter().find(|(x, _)| *x == v).unwrap().1;
+        assert!(len_of(7) < len_of(9), "frequent symbol should be shorter");
+        assert!(build_canonical_codes(&mut lens).is_ok());
+    }
+
+    #[test]
+    fn oversubscribed_code_lengths_are_rejected() {
+        // three symbols cannot all have 1-bit codes
+        let err = build_canonical_codes(&mut [(10, 1), (20, 1), (30, 1)])
+            .err()
+            .expect("oversubscribed lengths must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // the valid shape for three symbols still works
+        assert!(build_canonical_codes(&mut [(10, 1), (20, 2), (30, 2)]).is_ok());
+    }
+
+    #[test]
+    fn canonical_decoder_rejects_unused_codes() {
+        let codes = build_canonical_codes(&mut [(7, 2)]).unwrap();
+        let decoder = HuffmanDecoder::new(&codes);
+        assert!(huffman_decode_payload(&[0b1000_0000], 1, &decoder).is_err());
+        assert!(huffman_decode_payload(&[0, 0], 1, &decoder).is_err());
+        assert!(huffman_decode_payload(&[1], 1, &decoder).is_err());
+        assert!(huffman_decode_payload(&[0], usize::MAX, &decoder).is_err());
+    }
+
+    #[test]
+    fn malformed_table_length_is_rejected() {
+        // outer length claims a terabyte, only three bytes follow
+        let mut buf = Vec::new();
+        write_varint(&mut buf, 1u64 << 40).unwrap();
+        buf.extend_from_slice(&[1, 2, 3]);
+        let mut slice = &buf[..];
+        let err = match HuffmanTable::read(&mut slice) {
+            Err(e) => e,
+            Ok(_) => panic!("a bogus table length must not parse"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn exact_skip_rejects_short_input() {
+        let mut input = &b"abc"[..];
+        assert_eq!(
+            skip_exact(&mut input, 4).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn malformed_symbol_count_is_rejected() {
+        // outer length is honest, but the symbol count is far larger than the bytes allow
+        let mut inner = Vec::new();
+        write_varint(&mut inner, 1_000_000u64).unwrap();
+        inner.extend_from_slice(&[0u8; 8]);
+        let mut buf = Vec::new();
+        write_varint(&mut buf, inner.len() as u64).unwrap();
+        buf.extend_from_slice(&inner);
+        let mut slice = &buf[..];
+        let err = match HuffmanTable::read(&mut slice) {
+            Err(e) => e,
+            Ok(_) => panic!("a bogus symbol count must not parse"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn malformed_table_contents_are_rejected() {
+        for inner in [
+            vec![2, 7, 1, 7, 2], // duplicate symbol
+            vec![1, 7, 1, 0],    // trailing byte
+        ] {
+            let mut buf = Vec::new();
+            write_varint(&mut buf, inner.len() as u64).unwrap();
+            buf.extend_from_slice(&inner);
+            let err = match HuffmanTable::read(&mut &buf[..]) {
+                Err(e) => e,
+                Ok(_) => panic!("malformed table contents must not parse"),
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn absent_table_marker() {
+        let mut buf = Vec::new();
+        write_varint(&mut buf, 0).unwrap();
+        let mut slice = &buf[..];
+        assert!(HuffmanTable::read(&mut slice).unwrap().is_none());
+    }
+
+    #[test]
+    fn huffman_without_table_is_an_error() {
+        let vals = vec![1u64, 2, 3];
+        assert!(encode_tracepoint_values(&vals, CompressionStrategy::Huffman(3)).is_err());
+        assert!(decode_tracepoint_values(&[0u8; 4], 3, CompressionStrategy::Huffman(3)).is_err());
     }
 
     #[test]
@@ -2848,7 +3272,7 @@ mod compression_tests {
         println!("{}", "-".repeat(55));
 
         for (name, vals) in test_cases {
-            let huffman = encode_tracepoint_values(&vals, CompressionStrategy::Huffman(3))
+            let huffman = encode_tracepoint_values(&vals, CompressionStrategy::LocalHuffman(3))
                 .unwrap()
                 .len();
             let rice = encode_tracepoint_values(&vals, CompressionStrategy::Rice(3))
