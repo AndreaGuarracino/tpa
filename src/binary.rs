@@ -377,9 +377,11 @@ pub(crate) fn automatic_select(
             nocomp,
             nocomp,
         ),
+        // No-diff writes only the first stream; the second must not request a file-level
+        // table, or the pre-pass would look for values that are never emitted.
         TracepointType::FastgaNoDiff => (
             CompressionStrategy::Huffman(level),
-            CompressionStrategy::Huffman(level),
+            CompressionStrategy::Raw(level),
             nocomp,
             nocomp,
         ),
@@ -3341,7 +3343,7 @@ mod automatic_defaults_tests {
             (TracepointType::Standard, ComplexityMetric::EditDistance, "Huffman", "TwoDimDelta"),
             (TracepointType::Standard, ComplexityMetric::DiagonalDistance, "Huffman", "TwoDimDelta"),
             (TracepointType::Fastga, ComplexityMetric::EditDistance, "Huffman", "Huffman"),
-            (TracepointType::FastgaNoDiff, ComplexityMetric::EditDistance, "Huffman", "Huffman"),
+            (TracepointType::FastgaNoDiff, ComplexityMetric::EditDistance, "Huffman", "Raw"),
         ];
         for (tp, cm, w1, w2) in cases {
             let (s1, s2, l1, l2) = automatic_select(tp, cm, 0);

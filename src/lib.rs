@@ -457,10 +457,21 @@ pub fn paf_to_tpa(
     };
 
     // Variable and mixed layouts do not expose the two file-table streams.
-    let requested_huffman_streams = [
-        config.first_strategy.uses_file_table(),
-        config.second_strategy.uses_file_table(),
-    ];
+    // Resolve Automatic here: the histogram pre-pass below must know whether the strategy
+    // it will end up choosing needs a file-level table, otherwise the table is never built.
+    let requested_huffman_streams = if uses_automatic {
+        let (a, b, _, _) = binary::automatic_select(
+            config.tp_type,
+            config.complexity_metric,
+            config.first_strategy.zstd_level(),
+        );
+        [a.uses_file_table(), b.uses_file_table()]
+    } else {
+        [
+            config.first_strategy.uses_file_table(),
+            config.second_strategy.uses_file_table(),
+        ]
+    };
     let uses_file_table = requested_huffman_streams[0] || requested_huffman_streams[1];
     if uses_file_table
         && matches!(
@@ -504,7 +515,7 @@ pub fn paf_to_tpa(
     } else {
         [false; 2]
     };
-    let collect_huffman_histogram = histogram_streams.contains(&true) && !uses_automatic;
+    let collect_huffman_histogram = histogram_streams.contains(&true);
     let mut huffman_histogram = [HashMap::new(), HashMap::new()];
 
     let contig_table = config.contig_table.as_ref();
