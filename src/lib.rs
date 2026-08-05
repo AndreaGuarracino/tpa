@@ -63,7 +63,7 @@ pub use noodles::bgzf;
 // Re-export utility functions for external tools
 pub use utils::{read_varint, varint_size};
 
-pub use binary::HuffmanTables;
+pub use binary::{encode_two_dim_delta, HuffmanStreamCodec, HuffmanTables};
 
 use crate::binary::{
     automatic_select, decompress_varint, read_header_and_tables, read_record,

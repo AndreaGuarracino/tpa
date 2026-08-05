@@ -351,11 +351,6 @@ impl StrategyAnalyzer {
 /// Automatic strategy selection based on tracepoint type and complexity metric.
 ///
 /// Returns (first_strategy, first_layer, second_strategy, second_layer).
-/// The choices follow from structural properties of each segmentation algorithm:
-/// - Edit-distance: right-skewed segment lengths → Rice coding for first stream
-/// - Diagonal-distance: fewer segments per record → Raw varint (Rice overhead too high)
-/// - Fastga (FL-TP): many segments per record amortizes Rice overhead
-/// - Second stream: query/target advances are correlated → TwoDimDelta (except FL-TP)
 pub(crate) fn automatic_select(
     tp_type: TracepointType,
     complexity_metric: ComplexityMetric,
@@ -369,28 +364,22 @@ pub(crate) fn automatic_select(
     let nocomp = CompressionLayer::Nocomp;
     match tp_type {
         TracepointType::Standard => match complexity_metric {
-            ComplexityMetric::DiagonalDistance => (
-                CompressionStrategy::Raw(level),
-                CompressionStrategy::TwoDimDelta(level),
-                nocomp,
-                nocomp,
-            ),
-            ComplexityMetric::EditDistance => (
-                CompressionStrategy::Rice(level),
+            ComplexityMetric::DiagonalDistance | ComplexityMetric::EditDistance => (
+                CompressionStrategy::Huffman(level),
                 CompressionStrategy::TwoDimDelta(level),
                 nocomp,
                 nocomp,
             ),
         },
         TracepointType::Fastga => (
-            CompressionStrategy::EliasFano(level),
-            CompressionStrategy::LocalHuffman(level),
+            CompressionStrategy::Huffman(level),
+            CompressionStrategy::Huffman(level),
             nocomp,
             nocomp,
         ),
         TracepointType::FastgaNoDiff => (
-            CompressionStrategy::LocalHuffman(level),
-            CompressionStrategy::Raw(level),
+            CompressionStrategy::Huffman(level),
+            CompressionStrategy::Huffman(level),
             nocomp,
             nocomp,
         ),
@@ -596,6 +585,49 @@ fn encode_second_stream(
         CompressionStrategy::HybridRLE(_) => encode_rle_values(second_vals),
         _ => encode_tracepoint_values(second_vals, *strategy),
     }
+}
+
+// ============================================================================
+// PAYLOAD-LEVEL STREAM ENCODING (public)
+// ============================================================================
+
+/// A file-level Huffman table plus its payload encoder.
+///
+/// Exposed so a benchmark can measure the stream encodings on their own. A whole TPA file also
+/// stores PAF fields, a string table and tags, which would swamp a payload-to-payload comparison
+/// against a format that stores nothing but the alignment.
+pub struct HuffmanStreamCodec {
+    table: HuffmanTable,
+}
+
+impl HuffmanStreamCodec {
+    /// Build the table from every value the stream carries, exactly as `compress` does per file.
+    pub fn build(values: &[u64]) -> io::Result<Self> {
+        let mut freq: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        for v in values {
+            *freq.entry(*v).or_insert(0) += 1;
+        }
+        Ok(Self {
+            table: HuffmanTable::from_frequencies(&freq)?,
+        })
+    }
+
+    /// Serialized size of the table in bytes, paid once for the whole file.
+    pub fn table_bytes(&self) -> io::Result<usize> {
+        let mut buf = Vec::new();
+        self.table.write(&mut buf)?;
+        Ok(buf.len())
+    }
+
+    /// Huffman-coded payload for `values`.
+    pub fn encode(&self, values: &[u64]) -> io::Result<Vec<u8>> {
+        self.table.encode(values)
+    }
+}
+
+/// 2D-delta: each second-stream value stored as the zigzag varint of `second - first`.
+pub fn encode_two_dim_delta(first: &[u64], second: &[u64]) -> io::Result<Vec<u8>> {
+    encode_2d_delta_second_values(first, second)
 }
 
 // ============================================================================
@@ -3294,6 +3326,29 @@ mod compression_tests {
                 "{:<15} {:>8} {:>8} {:>8} {:>10}",
                 name, huffman, rice, zigzag, best
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod automatic_defaults_tests {
+    use super::*;
+    /// `automatic` must equal the strategies the paper passes explicitly
+    /// (code.md: huffman-nocomp;2d-delta-nocomp for EB/DB, huffman-nocomp;huffman-nocomp for FL-TP).
+    #[test]
+    fn automatic_matches_paper_defaults() {
+        let cases = [
+            (TracepointType::Standard, ComplexityMetric::EditDistance, "Huffman", "TwoDimDelta"),
+            (TracepointType::Standard, ComplexityMetric::DiagonalDistance, "Huffman", "TwoDimDelta"),
+            (TracepointType::Fastga, ComplexityMetric::EditDistance, "Huffman", "Huffman"),
+            (TracepointType::FastgaNoDiff, ComplexityMetric::EditDistance, "Huffman", "Huffman"),
+        ];
+        for (tp, cm, w1, w2) in cases {
+            let (s1, s2, l1, l2) = automatic_select(tp, cm, 0);
+            assert_eq!(format!("{:?}", s1).split('(').next().unwrap(), w1);
+            assert_eq!(format!("{:?}", s2).split('(').next().unwrap(), w2);
+            assert_eq!(l1, CompressionLayer::Nocomp);
+            assert_eq!(l2, CompressionLayer::Nocomp);
         }
     }
 }
