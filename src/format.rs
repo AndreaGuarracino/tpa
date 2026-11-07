@@ -12,6 +12,12 @@ pub const TPA_VERSION: u8 = 1;
 pub(crate) const TPA_VERSION_HUFFMAN_TABLE: u8 = 2;
 
 const HUFFMAN_CODE: u8 = 19;
+const TWO_DIM_DELTA_HUFFMAN_CODE: u8 = 20;
+
+/// Strategy codes whose stream is coded with a file-level Huffman table.
+fn code_uses_table(code: u8) -> bool {
+    code == HUFFMAN_CODE || code == TWO_DIM_DELTA_HUFFMAN_CODE
+}
 pub const TPA_MAGIC: &[u8; 4] = b"TPA\0";
 
 fn write_common_prefix_versioned<W: Write>(
@@ -255,6 +261,9 @@ pub enum CompressionStrategy {
     /// - Optimal for CIGAR-derived alignments (6-20% better)
     /// - Configurable compression level (max 22, default: 3)
     TwoDimDelta(i32),
+    /// 2D-Delta + file-level Huffman: target advance stored as zigzag(target - query),
+    /// coded with the file's second-stream Huffman table
+    TwoDimDeltaHuffman(i32),
     /// Run-Length Encoding + optional delta + Zstd
     /// - Encodes (value, run_length) pairs
     /// - Optimal for high-repetition data (30-40% better)
@@ -465,6 +474,7 @@ impl CompressionStrategy {
             "raw" => Ok(CompressionStrategy::Raw(level)),
             "zigzag-delta" => Ok(CompressionStrategy::ZigzagDelta(level)),
             "2d-delta" => Ok(CompressionStrategy::TwoDimDelta(level)),
+            "2d-delta-huffman" => Ok(CompressionStrategy::TwoDimDeltaHuffman(level)),
             "rle" => Ok(CompressionStrategy::RunLength(level)),
             "bit-packed" => Ok(CompressionStrategy::BitPacked(level)),
             "delta-of-delta" => Ok(CompressionStrategy::DeltaOfDelta(level)),
@@ -497,6 +507,7 @@ impl CompressionStrategy {
             "raw",
             "zigzag-delta",
             "2d-delta",
+            "2d-delta-huffman",
             "rle",
             "bit-packed",
             "delta-of-delta",
@@ -518,7 +529,7 @@ impl CompressionStrategy {
     }
 
     /// Convert to strategy code for file header
-    /// Strategy codes: 0-19 (20 concrete strategies)
+    /// Strategy codes: 0-20 (21 concrete strategies)
     fn to_code(self) -> io::Result<u8> {
         match self {
             CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _, _) => {
@@ -547,11 +558,12 @@ impl CompressionStrategy {
             CompressionStrategy::LZ77(_) => Ok(17),
             CompressionStrategy::EliasFano(_) => Ok(18),
             CompressionStrategy::Huffman(_) => Ok(19),
+            CompressionStrategy::TwoDimDeltaHuffman(_) => Ok(TWO_DIM_DELTA_HUFFMAN_CODE),
         }
     }
 
     /// Parse from strategy code
-    /// Strategy codes: 0-19 (20 concrete strategies)
+    /// Strategy codes: 0-20 (21 concrete strategies)
     fn from_code(code: u8) -> io::Result<Self> {
         match code {
             0 => Ok(CompressionStrategy::Raw(3)),
@@ -574,6 +586,7 @@ impl CompressionStrategy {
             17 => Ok(CompressionStrategy::LZ77(3)),
             18 => Ok(CompressionStrategy::EliasFano(3)),
             19 => Ok(CompressionStrategy::Huffman(3)),
+            TWO_DIM_DELTA_HUFFMAN_CODE => Ok(CompressionStrategy::TwoDimDeltaHuffman(3)),
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("Unsupported compression strategy code: {}", code),
@@ -591,6 +604,7 @@ impl CompressionStrategy {
             | CompressionStrategy::Raw(level)
             | CompressionStrategy::ZigzagDelta(level)
             | CompressionStrategy::TwoDimDelta(level)
+            | CompressionStrategy::TwoDimDeltaHuffman(level)
             | CompressionStrategy::RunLength(level)
             | CompressionStrategy::BitPacked(level)
             | CompressionStrategy::DeltaOfDelta(level)
@@ -613,7 +627,10 @@ impl CompressionStrategy {
 
     /// Whether this strategy needs file-level tables.
     pub fn uses_file_table(&self) -> bool {
-        matches!(self, CompressionStrategy::Huffman(_))
+        matches!(
+            self,
+            CompressionStrategy::Huffman(_) | CompressionStrategy::TwoDimDeltaHuffman(_)
+        )
     }
 
     /// Get the display name of this strategy
@@ -624,6 +641,7 @@ impl CompressionStrategy {
             CompressionStrategy::Raw(_) => "Raw",
             CompressionStrategy::ZigzagDelta(_) => "ZigzagDelta",
             CompressionStrategy::TwoDimDelta(_) => "TwoDimDelta",
+            CompressionStrategy::TwoDimDeltaHuffman(_) => "TwoDimDeltaHuffman",
             CompressionStrategy::RunLength(_) => "RunLength",
             CompressionStrategy::BitPacked(_) => "BitPacked",
             CompressionStrategy::DeltaOfDelta(_) => "DeltaOfDelta",
@@ -726,12 +744,12 @@ impl TpaHeader {
         }
         let first_strategy_code = first_strategy.to_code()?;
         let second_strategy_code = second_strategy.to_code()?;
-        let version = if first_strategy_code == HUFFMAN_CODE || second_strategy_code == HUFFMAN_CODE
-        {
-            TPA_VERSION_HUFFMAN_TABLE
-        } else {
-            TPA_VERSION
-        };
+        let version =
+            if code_uses_table(first_strategy_code) || code_uses_table(second_strategy_code) {
+                TPA_VERSION_HUFFMAN_TABLE
+            } else {
+                TPA_VERSION
+            };
 
         Ok(Self {
             version,
@@ -824,7 +842,7 @@ impl TpaHeader {
 
     /// Whether either stream uses a file-level table.
     pub fn uses_file_table(&self) -> bool {
-        self.first_strategy_code == HUFFMAN_CODE || self.second_strategy_code == HUFFMAN_CODE
+        code_uses_table(self.first_strategy_code) || code_uses_table(self.second_strategy_code)
     }
 
     pub(crate) fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
@@ -904,7 +922,7 @@ impl TpaHeader {
         };
 
         let uses_file_table =
-            first_strategy_code == HUFFMAN_CODE || second_strategy_code == HUFFMAN_CODE;
+            code_uses_table(first_strategy_code) || code_uses_table(second_strategy_code);
         if (version == TPA_VERSION_HUFFMAN_TABLE) != uses_file_table {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -941,8 +959,8 @@ impl TpaHeader {
 
     pub(crate) fn required_tables(&self) -> [bool; 2] {
         [
-            self.first_strategy_code == HUFFMAN_CODE,
-            self.second_strategy_code == HUFFMAN_CODE
+            code_uses_table(self.first_strategy_code),
+            code_uses_table(self.second_strategy_code)
                 && matches!(
                     self.tracepoint_type,
                     TracepointType::Standard | TracepointType::Fastga

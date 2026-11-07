@@ -104,7 +104,7 @@ fn reconstruct_from_zigzag_deltas(zigzagged: &[u64]) -> Vec<u64> {
 pub(crate) struct StrategyAnalyzer {
     first_states: Vec<StreamState>,
     second_states: Vec<StreamState>,
-    huffman_samples: [HuffmanSamples; 2],
+    huffman_samples: [HuffmanSamples; 3], // first, second, zigzag(second - first)
     layers: [CompressionLayer; 3],
     level: i32,
     sample_limit: usize, // 0 = no limit
@@ -183,6 +183,7 @@ impl StrategyAnalyzer {
                 )?;
                 self.huffman_samples[0].push(&first_vals)?;
                 self.huffman_samples[1].push(&second_vals)?;
+                self.huffman_samples[2].push(&zigzag_target_deltas(&first_vals, &second_vals))?;
             }
             TracepointData::FastgaNoDiff(tps) => {
                 self.processed_records += 1;
@@ -304,6 +305,15 @@ impl StrategyAnalyzer {
         ) {
             self.second_states.push(state);
         }
+        if let Some(mut state) = huffman_state(
+            &self.huffman_samples[2],
+            &self.layers,
+            self.level,
+            self.second_states[0].totals.len(),
+        ) {
+            state.strategy = CompressionStrategy::TwoDimDeltaHuffman(self.level);
+            self.second_states.push(state);
+        }
 
         // Collect (strategy, layer, size) for each stream
         let score = |c: &(CompressionStrategy, CompressionLayer, usize)| {
@@ -366,7 +376,7 @@ pub(crate) fn automatic_select(
         TracepointType::Standard => match complexity_metric {
             ComplexityMetric::DiagonalDistance | ComplexityMetric::EditDistance => (
                 CompressionStrategy::Huffman(level),
-                CompressionStrategy::TwoDimDelta(level),
+                CompressionStrategy::TwoDimDeltaHuffman(level),
                 nocomp,
                 nocomp,
             ),
@@ -440,6 +450,7 @@ fn strategy_to_rank(strategy: &CompressionStrategy) -> u8 {
         CompressionStrategy::LZ77(_) => 17,
         CompressionStrategy::EliasFano(_) => 18,
         CompressionStrategy::Huffman(_) => 19,
+        CompressionStrategy::TwoDimDeltaHuffman(_) => 20,
         CompressionStrategy::Automatic(_) | CompressionStrategy::Benchmark(_, _, _) => 255,
     }
 }
@@ -2057,7 +2068,7 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
             let zigzagged: Vec<u64> = deltas.iter().map(|&v| encode_zigzag(v)).collect();
             buf = local_huffman_encode(&zigzagged)?;
         }
-        CompressionStrategy::Huffman(_) => {
+        CompressionStrategy::Huffman(_) | CompressionStrategy::TwoDimDeltaHuffman(_) => {
             // Handled by the caller, which owns the file-level table
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2107,6 +2118,33 @@ fn encode_rle_values(vals: &[u64]) -> io::Result<Vec<u8>> {
 
 /// Encode second values for 2D-Delta strategy (as delta from first values)
 #[inline]
+/// Second-stream symbols of 2d-delta-huffman: zigzag(target - query) per tracepoint.
+pub(crate) fn zigzag_target_deltas(first_vals: &[u64], second_vals: &[u64]) -> Vec<u64> {
+    first_vals
+        .iter()
+        .zip(second_vals)
+        .map(|(&f, &s)| encode_zigzag(s as i64 - f as i64))
+        .collect()
+}
+
+/// Inverse of `zigzag_target_deltas`: target = query + delta, which must not be negative.
+fn add_target_deltas(zigzagged: &[u64], first_vals: &[u64]) -> io::Result<Vec<u64>> {
+    zigzagged
+        .iter()
+        .zip(first_vals)
+        .map(|(&z, &f)| {
+            let target = f as i64 + decode_zigzag(z);
+            if target < 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("2d-delta-huffman: negative target advance {target} (query {f})"),
+                ));
+            }
+            Ok(target as u64)
+        })
+        .collect()
+}
+
 fn encode_2d_delta_second_values(first_vals: &[u64], second_vals: &[u64]) -> io::Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(second_vals.len() * 2);
     for (f, s) in first_vals.iter().zip(second_vals.iter()) {
@@ -2379,10 +2417,12 @@ fn decode_tracepoint_values(
             let zigzagged = local_huffman_decode(buf, num_items)?;
             Ok(reconstruct_from_zigzag_deltas(&zigzagged))
         }
-        CompressionStrategy::Huffman(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "huffman requires a file-level table",
-        )),
+        CompressionStrategy::Huffman(_) | CompressionStrategy::TwoDimDeltaHuffman(_) => {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "huffman requires a file-level table",
+            ))
+        }
         CompressionStrategy::LZ77(_) => {
             // LZ77-style sequence matching decode
             lz77_decode(buf, num_items)
@@ -2474,6 +2514,15 @@ pub(crate) fn decode_standard_tracepoints<R: Read>(
     let second_vals_u64: Vec<u64> = match second_strategy {
         CompressionStrategy::TwoDimDelta(_) => {
             decode_2d_delta_second_values(&second_buf, &first_vals_u64)?
+        }
+        CompressionStrategy::TwoDimDeltaHuffman(_) => {
+            let zigzagged = decode_stream(
+                &second_buf,
+                num_items,
+                second_strategy,
+                tables.second.as_ref(),
+            )?;
+            add_target_deltas(&zigzagged, &first_vals_u64)?
         }
         CompressionStrategy::HybridRLE(_) => {
             let mut reader = &second_buf[..];
@@ -2726,6 +2775,11 @@ impl CompactRecord {
                     CompressionStrategy::TwoDimDelta(_) => {
                         encode_2d_delta_second_values(&first_vals, &second_vals)?
                     }
+                    CompressionStrategy::TwoDimDeltaHuffman(_) => encode_stream(
+                        &zigzag_target_deltas(&first_vals, &second_vals),
+                        second_strategy,
+                        tables.second.as_ref(),
+                    )?,
                     CompressionStrategy::HybridRLE(_) => encode_rle_values(&second_vals)?,
                     _ => encode_stream(&second_vals, second_strategy, tables.second.as_ref())?,
                 };
@@ -3336,14 +3390,34 @@ mod compression_tests {
 mod automatic_defaults_tests {
     use super::*;
     /// `automatic` must equal the strategies the paper passes explicitly
-    /// (code.md: huffman-nocomp;2d-delta-nocomp for EB/DB, huffman-nocomp;huffman-nocomp for FL-TP).
+    /// (code.md: huffman-nocomp;2d-delta-huffman-nocomp for EB/DB, huffman-nocomp;huffman-nocomp for FL-TP).
     #[test]
     fn automatic_matches_paper_defaults() {
         let cases = [
-            (TracepointType::Standard, ComplexityMetric::EditDistance, "Huffman", "TwoDimDelta"),
-            (TracepointType::Standard, ComplexityMetric::DiagonalDistance, "Huffman", "TwoDimDelta"),
-            (TracepointType::Fastga, ComplexityMetric::EditDistance, "Huffman", "Huffman"),
-            (TracepointType::FastgaNoDiff, ComplexityMetric::EditDistance, "Huffman", "Raw"),
+            (
+                TracepointType::Standard,
+                ComplexityMetric::EditDistance,
+                "Huffman",
+                "TwoDimDeltaHuffman",
+            ),
+            (
+                TracepointType::Standard,
+                ComplexityMetric::DiagonalDistance,
+                "Huffman",
+                "TwoDimDeltaHuffman",
+            ),
+            (
+                TracepointType::Fastga,
+                ComplexityMetric::EditDistance,
+                "Huffman",
+                "Huffman",
+            ),
+            (
+                TracepointType::FastgaNoDiff,
+                ComplexityMetric::EditDistance,
+                "Huffman",
+                "Raw",
+            ),
         ];
         for (tp, cm, w1, w2) in cases {
             let (s1, s2, l1, l2) = automatic_select(tp, cm, 0);
