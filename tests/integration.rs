@@ -169,6 +169,47 @@ fn benchmark_can_select_huffman_from_first_n_rows() {
 }
 
 #[test]
+fn benchmark_can_select_2d_delta_huffman() {
+    let dir = tmpdir("benchmark_2dhuff");
+    let paf = dir.join("in.paf");
+    make_paf(&paf, 300, true);
+    // EB-TP-like pairs: spread query advances, target = query - 1, query, or query + 1
+    let text: String = fs::read_to_string(&paf)
+        .unwrap()
+        .lines()
+        .enumerate()
+        .map(|(i, l)| {
+            let (head, _) = l.split_once("tp:Z:").unwrap();
+            let pairs: Vec<String> = (0..50)
+                .map(|j| {
+                    let a = 60 + (i * 7 + j * 13) % 81;
+                    format!("{a},{}", a - 1 + (i + j) % 3)
+                })
+                .collect();
+            format!("{head}tp:Z:{}\n", pairs.join(";"))
+        })
+        .collect();
+    fs::write(&paf, text).unwrap();
+
+    let tpa = dir.join("out.tpa");
+    let rt = dir.join("roundtrip.paf");
+    let cfg = config("benchmark-nocomp", TracepointType::Standard);
+    paf_to_tpa(paf.to_str().unwrap(), tpa.to_str().unwrap(), cfg).unwrap();
+    let reader = TpaReader::new(tpa.to_str().unwrap()).unwrap();
+    let strategies = reader.header().strategies().unwrap();
+    assert!(
+        matches!(strategies.1, CompressionStrategy::TwoDimDeltaHuffman(_)),
+        "selected {strategies:?}"
+    );
+    tpa_to_paf(tpa.to_str().unwrap(), rt.to_str().unwrap()).unwrap();
+    assert_eq!(
+        tp_tags(&fs::read_to_string(rt).unwrap()),
+        tp_tags(&fs::read_to_string(&paf).unwrap())
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn valid_cigar_converts_for_every_tracepoint_type() {
     let dir = tmpdir("cigar");
     let paf = dir.join("in.paf");
@@ -441,6 +482,66 @@ fn version2_standard_uses_both_tables() {
         tp_tags(&fs::read_to_string(&paf).unwrap())
     );
 
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn two_dim_delta_huffman_round_trips() {
+    let dir = tmpdir("2dhuff");
+    let paf = dir.join("in.paf");
+    make_paf(&paf, 300, true);
+    // Swapped pairs: target < query, so negative deltas too
+    let swapped = dir.join("swapped.paf");
+    let text: String = fs::read_to_string(&paf)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let (head, tp) = l.split_once("tp:Z:").unwrap();
+            let pairs: Vec<String> = tp
+                .split(';')
+                .map(|p| {
+                    let (a, b) = p.split_once(',').unwrap();
+                    format!("{b},{a}")
+                })
+                .collect();
+            format!("{head}tp:Z:{}\n", pairs.join(";"))
+        })
+        .collect();
+    fs::write(&swapped, text).unwrap();
+
+    for input in [&paf, &swapped] {
+        let tpa = dir.join("x.tpa");
+        let mut cfg = config("huffman-nocomp", TracepointType::Standard);
+        cfg.second_strategy = CompressionStrategy::from_str_with_layer("2d-delta-huffman-nocomp")
+            .unwrap()
+            .0;
+        paf_to_tpa(input.to_str().unwrap(), tpa.to_str().unwrap(), cfg).unwrap();
+        let (first, second) = HuffmanTables::load(tpa.to_str().unwrap())
+            .unwrap()
+            .symbol_counts();
+        assert!(
+            first > 0 && second > 0,
+            "both tables expected, got {first}/{second}"
+        );
+        // automatic picks the same coding for EB-TP/DB-TP
+        let auto = dir.join("auto.tpa");
+        let cfg = config("automatic", TracepointType::Standard);
+        paf_to_tpa(input.to_str().unwrap(), auto.to_str().unwrap(), cfg).unwrap();
+        assert_eq!(fs::read(&auto).unwrap(), fs::read(&tpa).unwrap());
+
+        let rt = dir.join("x.rt.paf");
+        tpa_to_paf(tpa.to_str().unwrap(), rt.to_str().unwrap()).unwrap();
+        let expected = tp_tags(&fs::read_to_string(input).unwrap());
+        assert_eq!(tp_tags(&fs::read_to_string(&rt).unwrap()), expected);
+
+        // Random access reader decodes the same record
+        let mut reader = TpaReader::new(tpa.to_str().unwrap()).unwrap();
+        let got = format!(
+            "tp:Z:{}",
+            tpa::format_tracepoints(&reader.get_compact_record(5).unwrap().tracepoints)
+        );
+        assert_eq!(got, expected[5]);
+    }
     fs::remove_dir_all(&dir).ok();
 }
 

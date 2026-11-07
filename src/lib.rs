@@ -36,7 +36,7 @@ pub use format::{
 pub use tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 
 use crate::format::{parse_tag, CompactRecord, TpaFooter};
-use crate::utils::{parse_u8, parse_usize};
+use crate::utils::{encode_zigzag, parse_u8, parse_usize};
 
 pub use index::{build_index_all_records, build_index_per_record, TpaIndex};
 pub use reader::{
@@ -343,6 +343,7 @@ fn parallel_pass1_plain(
     complexity_metric: ComplexityMetric,
     contig_table: Option<&HashMap<String, Vec<(usize, usize)>>>,
     huffman_streams: [bool; 2],
+    second_delta: bool,
 ) -> io::Result<(u64, StringTable, HuffmanHistograms)> {
     let size = std::fs::metadata(input_path)?.len();
     if size == 0 {
@@ -370,7 +371,12 @@ fn parallel_pass1_plain(
                             contig_table,
                         ) {
                             count += records.len() as u64;
-                            accumulate_huffman_histograms(&mut hist, &records, huffman_streams);
+                            accumulate_huffman_histograms(
+                                &mut hist,
+                                &records,
+                                huffman_streams,
+                                second_delta,
+                            );
                         }
                     } else if intern_valid_paf_names(line, &mut local, tp_type).is_ok() {
                         count += 1;
@@ -459,19 +465,20 @@ pub fn paf_to_tpa(
     // Variable and mixed layouts do not expose the two file-table streams.
     // Resolve Automatic here: the histogram pre-pass below must know whether the strategy
     // it will end up choosing needs a file-level table, otherwise the table is never built.
-    let requested_huffman_streams = if uses_automatic {
+    let (first_strategy, second_strategy) = if uses_automatic {
         let (a, b, _, _) = binary::automatic_select(
             config.tp_type,
             config.complexity_metric,
             config.first_strategy.zstd_level(),
         );
-        [a.uses_file_table(), b.uses_file_table()]
+        (a, b)
     } else {
-        [
-            config.first_strategy.uses_file_table(),
-            config.second_strategy.uses_file_table(),
-        ]
+        (config.first_strategy, config.second_strategy)
     };
+    let requested_huffman_streams = [
+        first_strategy.uses_file_table(),
+        second_strategy.uses_file_table(),
+    ];
     let uses_file_table = requested_huffman_streams[0] || requested_huffman_streams[1];
     if uses_file_table
         && matches!(
@@ -516,7 +523,12 @@ pub fn paf_to_tpa(
         [false; 2]
     };
     let collect_huffman_histogram = histogram_streams.contains(&true);
+    // 2d-delta-huffman: second-stream symbols are zigzag(target - query)
+    let second_delta = matches!(second_strategy, CompressionStrategy::TwoDimDeltaHuffman(_));
     let mut huffman_histogram = [HashMap::new(), HashMap::new()];
+    // Benchmark may pick 2d-delta-huffman: also count zigzag(target - query)
+    let collect_delta_histogram = benchmark.is_some() && histogram_streams[1] && !second_delta;
+    let mut delta_histogram = [HashMap::new(), HashMap::new()];
 
     let contig_table = config.contig_table.as_ref();
     let multi_record = contig_table.is_some() && config.tp_type == TracepointType::Fastga;
@@ -555,6 +567,7 @@ pub fn paf_to_tpa(
             } else {
                 [false; 2]
             },
+            second_delta,
         )?;
         record_count = rc;
         string_table = st;
@@ -593,7 +606,15 @@ pub fn paf_to_tpa(
                 continue;
             };
             if collect_huffman_histogram {
-                accumulate_huffman_histograms(&mut huffman_histogram, &records, histogram_streams);
+                accumulate_huffman_histograms(
+                    &mut huffman_histogram,
+                    &records,
+                    histogram_streams,
+                    second_delta,
+                );
+            }
+            if collect_delta_histogram {
+                accumulate_huffman_histograms(&mut delta_histogram, &records, [false, true], true);
             }
             if let Some(an) = analyzer.as_mut() {
                 for record in &records {
@@ -639,6 +660,11 @@ pub fn paf_to_tpa(
         chosen_first.uses_file_table(),
         chosen_second.uses_file_table(),
     ];
+    if collect_delta_histogram
+        && matches!(chosen_second, CompressionStrategy::TwoDimDeltaHuffman(_))
+    {
+        huffman_histogram[1] = std::mem::take(&mut delta_histogram[1]);
+    }
     let tables = if chosen_huffman_streams[0] || chosen_huffman_streams[1] {
         finish_huffman_tables(
             huffman_histogram,
@@ -830,6 +856,7 @@ fn accumulate_huffman_histograms(
     hist: &mut HuffmanHistograms,
     records: &[CompactRecord],
     streams: [bool; 2],
+    second_delta: bool,
 ) {
     for record in records {
         match &record.tracepoints {
@@ -839,7 +866,12 @@ fn accumulate_huffman_histograms(
                         *hist[0].entry(first as u64).or_insert(0) += 1;
                     }
                     if streams[1] {
-                        *hist[1].entry(second as u64).or_insert(0) += 1;
+                        let symbol = if second_delta {
+                            encode_zigzag(second as i64 - first as i64)
+                        } else {
+                            second as u64
+                        };
+                        *hist[1].entry(symbol).or_insert(0) += 1;
                     }
                 }
             }
