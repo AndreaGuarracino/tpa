@@ -1,6 +1,6 @@
 # tpa
 
-TracePoint Alignment (TPA) binary format for compact storage and O(1) random access of sequence alignments encoded with [tracepoints](https://github.com/AndreaGuarracino/tracepoints).
+TracePoint Alignment (TPA) binary format for compact storage and O(1) random access of sequence alignments encoded with [tracepoints](https://github.com/GuarracinoLab/tracepoints).
 
 ## Overview
 
@@ -87,7 +87,7 @@ Positions:      varint[] (per-record mode) or u64 LE[] (all-records mode)
 
 ## Related repositories
 
-- **[tracepoints](https://github.com/AndreaGuarracino/tracepoints)**: the core library implementing tracepoint sampling and reconstruction.
+- **[tracepoints](https://github.com/GuarracinoLab/tracepoints)**: the core library implementing tracepoint sampling and reconstruction.
 - **[cigzip](https://github.com/AndreaGuarracino/cigzip)**: the command-line tool that writes and reads `.tpa` files.
 
 ## License
